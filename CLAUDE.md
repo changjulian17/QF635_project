@@ -6,9 +6,12 @@ Real-time microstructure analysis and paper-trading system for BTCUSDT on the Bi
 
 ```
 main.py          — asyncio orchestrator (entry point)
-dashboard.py     — Streamlit UI (entry point)
+dashboard.py     — Streamlit UI main page (entry point)
 config.py        — pydantic settings loaded from .env
 models.py        — shared dataclasses and enums
+
+pages/           — Streamlit multi-page app pages
+  health.py      — system health checker (auto-refreshes every 10 s)
 
 engine/          — all real-time processing components
   websocket_consumer.py  — aggTrade + kline_1s + depth@100ms WS streams
@@ -23,7 +26,7 @@ scripts/
   test_connection.py  — verify Binance testnet connectivity and auth
   test_orders.py      — BUY + SELL round-trip execution test
 
-tests/           — pytest unit tests (27 tests)
+tests/           — pytest unit tests (65 tests)
 ```
 
 ## Quick actions

@@ -11,9 +11,12 @@ Streams live order book depth, trade flow, and 1-second klines from Binance WebS
 ```
 CryptoSentinel/
 ├── main.py              # asyncio TaskGroup orchestrator (entry point)
-├── dashboard.py         # Streamlit UI (entry point)
+├── dashboard.py         # Streamlit UI main page (entry point)
 ├── config.py            # Pydantic V2 settings — all params loaded from .env
 ├── models.py            # Shared dataclasses and enums
+│
+├── pages/               # Streamlit multi-page app
+│   └── health.py        # System health checker dashboard
 │
 ├── engine/              # All real-time processing components
 │   ├── websocket_consumer.py   # Combined WS stream consumer
@@ -144,9 +147,23 @@ Built with Streamlit 1.57+, uses `@st.fragment(run_every=30)` for flicker-free 3
 |---|---|
 | Portfolio metrics | SQLite `portfolio` table |
 | Microstructure bar | SQLite `microstructure_bars` (latest row) |
-| Liquidity heatmap | Bid/ask depth grid with volume bubbles and signal overlays |
-| OBI / CVD / Spread | Rolling time-series charts |
+| Liquidity heatmap + OBI / CVD / Spread | Single shared-x-axis chart (4 rows): heatmap with volume bubbles and signal overlays, then OBI, CVD, and Spread panels below |
 | Price + pattern signals | Candlestick chart with LONG ▲ / SHORT ▼ markers |
+
+### Health checker (`pages/health.py`)
+Separate Streamlit page at `/health`, auto-refreshes every 10 seconds. Accessible from the sidebar or the link below the main dashboard title.
+
+| Check | Method |
+|---|---|
+| Trading engine (`main.py`) | psutil process scan |
+| Dashboard (Streamlit) | psutil process scan |
+| Binance REST (testnet) | REST ping with measured latency |
+| SQLite database | File open + table existence check |
+| WebSocket + Microstructure feed | `microstructure_bars` row freshness (≤ 10 s) |
+| Candle stream | `candles` row freshness (≤ 5 s) + count vs 20-candle minimum |
+| Pattern detector | Signal count and candle readiness |
+| Risk engine / DB writer | `portfolio` row freshness (≤ 15 s) |
+| Order manager | DRY_RUN flag state |
 
 ---
 

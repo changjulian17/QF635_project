@@ -11,6 +11,7 @@ from config import settings
 
 st.set_page_config(page_title="CryptoSentinel", layout="wide", page_icon="📈")
 st.title("📈 CryptoSentinel — BTCUSDT Testnet")
+st.caption("[🩺 System Health](/health) · use the sidebar to navigate between pages")
 
 # Sidebar stays static — only re-renders on user interaction, not on fragment refresh
 with st.sidebar:
@@ -82,135 +83,135 @@ def live_dashboard() -> None:
         except Exception:
             ms = pd.DataFrame()
 
-        # ── Layout: heatmap left, OBI/CVD right ───────────────────────────
-        left, right = st.columns([3, 2])
+        # ── Heatmap + OBI / CVD / Spread — shared x-axis ─────────────────
+        st.subheader("Liquidity Heatmap + OBI / CVD / Spread")
+        if not ms.empty:
+            # Use the wider of the two windows so each panel shows its full history
+            obi_df = ms.tail(obi_window).copy()
+            hm_df  = ms.tail(heatmap_bars).copy()
 
-        with left:
-            st.subheader("Liquidity Heatmap + Volume Bubbles")
-            if not ms.empty:
-                hm_df = ms.tail(heatmap_bars).copy()
-                current_mid = float(hm_df["mid_price"].iloc[-1])
-                price_lo = current_mid - heatmap_tick_range
-                price_hi = current_mid + heatmap_tick_range
-                tick_size = 1.0
-                price_ticks = np.arange(price_lo, price_hi + tick_size, tick_size)
-                n_times, n_prices = len(hm_df), len(price_ticks)
+            fig = make_subplots(
+                rows=4, cols=1, shared_xaxes=True,
+                row_heights=[0.50, 0.17, 0.17, 0.16],
+                vertical_spacing=0.03,
+                subplot_titles=("Liquidity Heatmap", "OBI", "CVD", "Spread"),
+            )
 
-                bid_matrix = np.zeros((n_prices, n_times))
-                ask_matrix = np.zeros((n_prices, n_times))
+            # ── Row 1: heatmap ────────────────────────────────────────────
+            current_mid = float(hm_df["mid_price"].iloc[-1])
+            price_lo = current_mid - heatmap_tick_range
+            price_hi = current_mid + heatmap_tick_range
+            tick_size = 1.0
+            price_ticks = np.arange(price_lo, price_hi + tick_size, tick_size)
+            n_times, n_prices = len(hm_df), len(price_ticks)
 
-                for col_idx, (_, row) in enumerate(hm_df.iterrows()):
-                    try:
-                        for p, q in json.loads(row["bid_levels"]):
-                            ri = int(round((p - price_lo) / tick_size))
-                            if 0 <= ri < n_prices:
-                                bid_matrix[ri, col_idx] += q
-                    except Exception:
-                        pass
-                    try:
-                        for p, q in json.loads(row["ask_levels"]):
-                            ri = int(round((p - price_lo) / tick_size))
-                            if 0 <= ri < n_prices:
-                                ask_matrix[ri, col_idx] += q
-                    except Exception:
-                        pass
+            bid_matrix = np.zeros((n_prices, n_times))
+            ask_matrix = np.zeros((n_prices, n_times))
+            for col_idx, (_, row) in enumerate(hm_df.iterrows()):
+                try:
+                    for p, q in json.loads(row["bid_levels"]):
+                        ri = int(round((p - price_lo) / tick_size))
+                        if 0 <= ri < n_prices:
+                            bid_matrix[ri, col_idx] += q
+                except Exception:
+                    pass
+                try:
+                    for p, q in json.loads(row["ask_levels"]):
+                        ri = int(round((p - price_lo) / tick_size))
+                        if 0 <= ri < n_prices:
+                            ask_matrix[ri, col_idx] += q
+                except Exception:
+                    pass
 
-                fig_hm = go.Figure(go.Heatmap(
-                    z=ask_matrix - bid_matrix,
-                    x=hm_df["ts"], y=price_ticks,
-                    colorscale=[
-                        [0.0, "rgba(0,180,80,0.9)"],
-                        [0.5, "rgba(10,10,30,0.3)"],
-                        [1.0, "rgba(220,30,30,0.9)"],
-                    ],
-                    zmid=0, showscale=False,
-                    hovertemplate="Time: %{x}<br>Price: %{y}<br>Net qty: %{z:.4f}<extra></extra>",
-                ))
-                fig_hm.add_trace(go.Scatter(
-                    x=hm_df["ts"], y=hm_df["mid_price"], mode="lines",
-                    line=dict(color="white", width=1.5), name="Mid price", hoverinfo="skip",
-                ))
+            fig.add_trace(go.Heatmap(
+                z=ask_matrix - bid_matrix,
+                x=hm_df["ts"], y=price_ticks,
+                colorscale=[
+                    [0.0, "rgba(0,180,80,0.9)"],
+                    [0.5, "rgba(10,10,30,0.3)"],
+                    [1.0, "rgba(220,30,30,0.9)"],
+                ],
+                zmid=0, showscale=False,
+                hovertemplate="Time: %{x}<br>Price: %{y}<br>Net qty: %{z:.4f}<extra></extra>",
+            ), row=1, col=1)
 
-                for vol_col, color, label in [
-                    ("buy_volume",  "rgba(0,255,100,0.6)",  "Buy aggression"),
-                    ("sell_volume", "rgba(255,60,60,0.6)",  "Sell aggression"),
-                ]:
-                    mask = hm_df[vol_col] > 0
-                    if mask.any():
-                        fig_hm.add_trace(go.Scatter(
-                            x=hm_df.loc[mask, "ts"], y=hm_df.loc[mask, "mid_price"],
-                            mode="markers",
-                            marker=dict(size=np.clip(hm_df.loc[mask, vol_col] * 40, 4, 24),
-                                        color=color, line=dict(width=0)),
-                            name=label,
-                            hovertemplate=f"{label}: %{{text}}<extra></extra>",
-                            text=hm_df.loc[mask, vol_col].round(4).astype(str),
-                        ))
+            fig.add_trace(go.Scatter(
+                x=hm_df["ts"], y=hm_df["mid_price"], mode="lines",
+                line=dict(color="white", width=1.5), name="Mid price", hoverinfo="skip",
+            ), row=1, col=1)
 
-                for col_name, label, sym, clr, sz in [
-                    ("sweep_up",            "↑ Sweep",  "triangle-up",   "cyan",    5),
-                    ("sweep_down",          "↓ Sweep",  "triangle-down", "orange",  5),
-                    ("iceberg_bid",         "Iceberg↑", "diamond",       "lime",    6),
-                    ("iceberg_ask",         "Iceberg↓", "diamond",       "red",     6),
-                    ("book_flip_bid",       "Flip↑",    "x",             "yellow",  8),
-                    ("book_flip_ask",       "Flip↓",    "x",             "magenta", 8),
-                    ("break_protect_long",  "B+P↑",     "star",          "white",  10),
-                    ("break_protect_short", "B+P↓",     "star",          "silver", 10),
-                ]:
-                    mask = hm_df[col_name].astype(bool)
-                    if mask.any():
-                        fig_hm.add_trace(go.Scatter(
-                            x=hm_df.loc[mask, "ts"], y=hm_df.loc[mask, "mid_price"],
-                            mode="markers",
-                            marker=dict(symbol=sym, size=sz, color=clr,
-                                        line=dict(width=1, color="black")),
-                            name=label,
-                        ))
+            for vol_col, color, label in [
+                ("buy_volume",  "rgba(0,255,100,0.6)",  "Buy aggression"),
+                ("sell_volume", "rgba(255,60,60,0.6)",  "Sell aggression"),
+            ]:
+                mask = hm_df[vol_col] > 0
+                if mask.any():
+                    fig.add_trace(go.Scatter(
+                        x=hm_df.loc[mask, "ts"], y=hm_df.loc[mask, "mid_price"],
+                        mode="markers",
+                        marker=dict(size=np.clip(hm_df.loc[mask, vol_col] * 40, 4, 24),
+                                    color=color, line=dict(width=0)),
+                        name=label,
+                        hovertemplate=f"{label}: %{{text}}<extra></extra>",
+                        text=hm_df.loc[mask, vol_col].round(4).astype(str),
+                    ), row=1, col=1)
 
-                fig_hm.update_layout(
-                    height=480, template="plotly_dark",
-                    xaxis_title="Time", yaxis_title="Price (USDT)",
-                    legend=dict(orientation="h", y=-0.15, font=dict(size=10)),
-                    margin=dict(t=20, b=40),
-                )
-                st.plotly_chart(fig_hm, width="stretch")
-            else:
-                st.info("Waiting for microstructure data…")
+            for col_name, label, sym, clr, sz in [
+                ("sweep_up",            "↑ Sweep",  "triangle-up",   "cyan",    5),
+                ("sweep_down",          "↓ Sweep",  "triangle-down", "orange",  5),
+                ("iceberg_bid",         "Iceberg↑", "diamond",       "lime",    6),
+                ("iceberg_ask",         "Iceberg↓", "diamond",       "red",     6),
+                ("book_flip_bid",       "Flip↑",    "x",             "yellow",  8),
+                ("book_flip_ask",       "Flip↓",    "x",             "magenta", 8),
+                ("break_protect_long",  "B+P↑",     "star",          "white",  10),
+                ("break_protect_short", "B+P↓",     "star",          "silver", 10),
+            ]:
+                mask = hm_df[col_name].astype(bool)
+                if mask.any():
+                    fig.add_trace(go.Scatter(
+                        x=hm_df.loc[mask, "ts"], y=hm_df.loc[mask, "mid_price"],
+                        mode="markers",
+                        marker=dict(symbol=sym, size=sz, color=clr,
+                                    line=dict(width=1, color="black")),
+                        name=label,
+                    ), row=1, col=1)
 
-        with right:
-            if not ms.empty:
-                obi_df = ms.tail(obi_window).copy()
-                fig_sub = make_subplots(
-                    rows=3, cols=1, shared_xaxes=True,
-                    row_heights=[0.35, 0.35, 0.30], vertical_spacing=0.04,
-                    subplot_titles=("OBI", "CVD", "Spread"),
-                )
-                fig_sub.add_trace(go.Scatter(
-                    x=obi_df["ts"], y=obi_df["obi"], mode="lines",
-                    line=dict(color="cyan", width=1.2), name="OBI",
-                    fill="tozeroy", fillcolor="rgba(0,200,200,0.15)",
-                ), row=1, col=1)
-                fig_sub.add_hline(y=settings.OBI_BREAK_THRESH,  line=dict(dash="dot", color="lime", width=1), row=1, col=1)
-                fig_sub.add_hline(y=-settings.OBI_BREAK_THRESH, line=dict(dash="dot", color="red",  width=1), row=1, col=1)
-                fig_sub.add_hline(y=0, line=dict(color="white", width=0.5), row=1, col=1)
+            # ── Rows 2-4: OBI / CVD / Spread ─────────────────────────────
+            fig.add_trace(go.Scatter(
+                x=obi_df["ts"], y=obi_df["obi"], mode="lines",
+                line=dict(color="cyan", width=1.2), name="OBI",
+                fill="tozeroy", fillcolor="rgba(0,200,200,0.15)",
+            ), row=2, col=1)
+            fig.add_hline(y=settings.OBI_BREAK_THRESH,  line=dict(dash="dot", color="lime", width=1), row=2, col=1)
+            fig.add_hline(y=-settings.OBI_BREAK_THRESH, line=dict(dash="dot", color="red",  width=1), row=2, col=1)
+            fig.add_hline(y=0, line=dict(color="white", width=0.5), row=2, col=1)
 
-                fig_sub.add_trace(go.Scatter(
-                    x=obi_df["ts"], y=obi_df["cvd"], mode="lines",
-                    line=dict(color="orange", width=1.2), name="CVD",
-                    fill="tozeroy", fillcolor="rgba(255,165,0,0.12)",
-                ), row=2, col=1)
-                fig_sub.add_hline(y=0, line=dict(color="white", width=0.5), row=2, col=1)
+            fig.add_trace(go.Scatter(
+                x=obi_df["ts"], y=obi_df["cvd"], mode="lines",
+                line=dict(color="orange", width=1.2), name="CVD",
+                fill="tozeroy", fillcolor="rgba(255,165,0,0.12)",
+            ), row=3, col=1)
+            fig.add_hline(y=0, line=dict(color="white", width=0.5), row=3, col=1)
 
-                fig_sub.add_trace(go.Scatter(
-                    x=obi_df["ts"], y=obi_df["spread"], mode="lines",
-                    line=dict(color="violet", width=1), name="Spread",
-                ), row=3, col=1)
+            fig.add_trace(go.Scatter(
+                x=obi_df["ts"], y=obi_df["spread"], mode="lines",
+                line=dict(color="violet", width=1), name="Spread",
+            ), row=4, col=1)
 
-                fig_sub.update_layout(
-                    height=480, template="plotly_dark",
-                    showlegend=False, margin=dict(t=40, b=20),
-                )
-                st.plotly_chart(fig_sub, width="stretch")
+            fig.update_layout(
+                height=860, template="plotly_dark",
+                yaxis_title="Price (USDT)",
+                legend=dict(orientation="h", y=-0.06, font=dict(size=10)),
+                margin=dict(t=40, b=20),
+                showlegend=True,
+            )
+            fig.update_xaxes(showticklabels=False, row=1, col=1)
+            fig.update_xaxes(showticklabels=False, row=2, col=1)
+            fig.update_xaxes(showticklabels=False, row=3, col=1)
+            fig.update_xaxes(title_text="Time", row=4, col=1)
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("Waiting for microstructure data…")
 
         # ── Price chart + pattern signals ─────────────────────────────────
         st.subheader("Price + Pattern Signals")

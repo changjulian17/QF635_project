@@ -187,7 +187,11 @@ STATUS_COLOR = {"ok": "green", "warn": "orange", "err": "red"}
 def health_panel() -> None:
     st.button("Refresh now")
 
-    checks = run_checks()
+    try:
+        checks = run_checks()
+    except Exception as exc:
+        st.error(f"run_checks() failed: {exc}")
+        return
 
     n_ok   = sum(1 for c in checks if c["status"] == "ok")
     n_warn = sum(1 for c in checks if c["status"] == "warn")
