@@ -1,6 +1,14 @@
 python-binance==1.0.36
-requests==2.34.0
+websockets==10.4
 pandas==3.0.3
 numpy==2.4.4
-websockets==16.0
-pycryptodome==3.23.0
+scipy==1.11.3
+TA-Lib==0.4.28
+pandas-ta==0.3.14b
+pydantic-settings==2.3.4
+streamlit==1.35.0
+plotly==5.22.0
+loguru==0.7.2
+python-dotenv==1.0.1
+pytest==8.2.2
+pytest-asyncio==0.23.7
