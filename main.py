@@ -1,8 +1,11 @@
 import asyncio
 import logging
+from collections import deque
 
 from config import settings
 from db_writer import DBWriter, init_db
+from lob_engine import LocalOrderBook
+from microstructure_engine import MicrostructureEngine
 from models import PortfolioState
 from order_manager import OrderManager
 from pattern_detector import PatternDetector
@@ -34,14 +37,22 @@ async def main() -> None:
         peak_equity=STARTING_EQUITY,
     )
 
-    raw_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+    # Queues
     candle_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
     candle_db_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    trade_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+    depth_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
     signal_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
     signal_db_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
     order_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
-    ws_consumer = BinanceWebSocketConsumer(raw_queue, candle_queue, candle_db_queue)
+    # Shared in-memory metrics store (newest bar first); also consumed by future scalper
+    metrics_store: deque = deque(maxlen=settings.LOB_HISTORY)
+
+    # Components
+    ws_consumer = BinanceWebSocketConsumer(candle_queue, candle_db_queue, trade_queue, depth_queue)
+    lob = LocalOrderBook()
+    ms_engine = MicrostructureEngine(lob, trade_queue, depth_queue, metrics_store)
     detector = PatternDetector(candle_queue, signal_queue, signal_db_queue)
     risk = RiskEngine(signal_queue, order_queue, portfolio)
     executor = OrderManager(order_queue, portfolio)
@@ -49,11 +60,11 @@ async def main() -> None:
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(ws_consumer.start(), name="ws_consumer")
+        tg.create_task(ms_engine.run(), name="microstructure_engine")
         tg.create_task(detector.run(), name="pattern_detector")
         tg.create_task(risk.run(), name="risk_engine")
         tg.create_task(executor.start(), name="order_manager")
         tg.create_task(db_writer.run(), name="db_writer")
-        tg.create_task(_drain(raw_queue), name="raw_queue_drain")
 
 
 if __name__ == "__main__":
