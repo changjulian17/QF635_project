@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 """
 End-to-end order execution test against Binance Spot Testnet.
 Places a small market BUY then market SELL for BTCUSDT.

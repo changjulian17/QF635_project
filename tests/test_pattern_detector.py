@@ -3,7 +3,7 @@ import asyncio
 import numpy as np
 import pytest
 
-from pattern_detector import PatternDetector
+from engine.pattern_detector import PatternDetector
 
 
 def make_detector() -> PatternDetector:

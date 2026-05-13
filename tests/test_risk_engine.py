@@ -8,7 +8,7 @@ from models import (
     PatternType,
     PortfolioState,
 )
-from risk_engine import RiskEngine
+from engine.risk_engine import RiskEngine
 
 
 def make_portfolio(**kwargs) -> PortfolioState:

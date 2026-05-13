@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Connectivity check for Binance Spot Testnet. Reads credentials from .env via config.py."""
+import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from binance.client import Client
 from config import settings
