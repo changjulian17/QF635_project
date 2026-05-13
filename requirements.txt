@@ -1,0 +1,6 @@
+python-binance==1.0.36
+requests==2.34.0
+pandas==3.0.3
+numpy==2.4.4
+websockets==16.0
+pycryptodome==3.23.0
