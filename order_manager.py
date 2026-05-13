@@ -36,6 +36,13 @@ class OrderManager:
         sig = req.signal
         side = "BUY" if sig.direction == Direction.LONG else "SELL"
 
+        if settings.DRY_RUN:
+            logger.info(
+                f"[Exec] DRY RUN — would place {side} MARKET {req.quantity} {settings.SYMBOL} "
+                f"| entry={sig.entry_price:.2f} SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}"
+            )
+            return
+
         try:
             resp = await self._client.create_order(
                 symbol=settings.SYMBOL,

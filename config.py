@@ -1,17 +1,19 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import ConfigDict
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8")
+
     # Binance Testnet
-    BINANCE_API_KEY: str = Field("", env="BINANCE_API_KEY")
-    BINANCE_API_SECRET: str = Field("", env="BINANCE_API_SECRET")
+    BINANCE_API_KEY: str = ""
+    BINANCE_API_SECRET: str = ""
     BINANCE_TESTNET: bool = True
-    WS_BASE: str = "wss://stream.testnet.binance.vision/ws"
+    WS_BASE: str = "wss://stream.testnet.binance.vision"
     REST_BASE: str = "https://testnet.binance.vision"
 
     # Strategy
     SYMBOL: str = "BTCUSDT"
-    CANDLE_INTERVAL: str = "1m"
+    CANDLE_INTERVAL: str = "1s"
     PATTERN_LOOKBACK: int = 50
     SWING_WINDOW: int = 5
     BREAKOUT_VOL_MULT: float = 1.5
@@ -26,11 +28,10 @@ class Settings(BaseSettings):
     ATR_MULTIPLIER_SL: float = 1.5
     ATR_MULTIPLIER_TP: float = 3.0
 
+    # Execution
+    DRY_RUN: bool = True
+
     # UI
     UI_REFRESH_INTERVAL: float = 1.0
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
 settings = Settings()

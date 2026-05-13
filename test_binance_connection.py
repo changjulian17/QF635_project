@@ -1,50 +1,46 @@
 #!/usr/bin/env python3
-"""
-Test script to verify Binance testnet connection
-"""
+"""Connectivity check for Binance Spot Testnet. Reads credentials from .env via config.py."""
 
 from binance.client import Client
+from config import settings
 
-# Binance testnet configuration
-testnet_api_key = "YOUR_API_KEY"
-testnet_api_secret = "YOUR_API_SECRET"
-testnet_url = "https://testnet.binance.vision/api"
 
-def test_binance_connection():
-    """Test connection to Binance testnet"""
+def test_binance_connection() -> bool:
+    print(f"API key loaded: {'yes' if settings.BINANCE_API_KEY else 'NO — check .env'}")
+    print(f"API secret loaded: {'yes' if settings.BINANCE_API_SECRET else 'NO — check .env'}")
+    print(f"Testnet mode: {settings.BINANCE_TESTNET}")
+    print("-" * 50)
+
     try:
-        # Initialize client pointing to testnet
         client = Client(
-            api_key=testnet_api_key,
-            api_secret=testnet_api_secret,
-            testnet=True  # Use testnet
+            api_key=settings.BINANCE_API_KEY,
+            api_secret=settings.BINANCE_API_SECRET,
+            testnet=settings.BINANCE_TESTNET,
         )
-        
-        # Test API connection - get server time
+
         server_time = client.get_server_time()
-        print(f"✓ Connected to Binance testnet successfully!")
+        print(f"✓ Connected to Binance testnet")
         print(f"✓ Server time: {server_time}")
-        
-        # Get account info (only works with valid API keys)
-        try:
-            account = client.get_account()
-            print(f"✓ Account retrieved successfully")
-            print(f"✓ Number of balances: {len(account['balances'])}")
-        except Exception as e:
-            print(f"✗ Account retrieval failed (API keys may be invalid): {e}")
-        
+
+        account = client.get_account()
+        balances = [b for b in account["balances"] if float(b["free"]) > 0 or float(b["locked"]) > 0]
+        print(f"✓ Account authenticated — {len(balances)} non-zero balance(s):")
+        for b in balances:
+            print(f"    {b['asset']:>6}: free={b['free']}, locked={b['locked']}")
+
+        ticker = client.get_symbol_ticker(symbol=settings.SYMBOL)
+        print(f"✓ {settings.SYMBOL} last price: {ticker['price']}")
+
         return True
-        
-    except Exception as e:
-        print(f"✗ Connection failed: {e}")
+
+    except Exception as exc:
+        print(f"✗ Connection failed: {exc}")
         return False
+
 
 if __name__ == "__main__":
     print("Testing Binance testnet connection...")
     print("-" * 50)
-    test_binance_connection()
+    ok = test_binance_connection()
     print("-" * 50)
-    print("To use with real API keys:")
-    print("1. Get testnet API keys from: https://testnet.binance.vision/")
-    print("2. Replace YOUR_API_KEY and YOUR_API_SECRET above")
-    print("3. Run this script with: source venv/bin/activate && python test_binance_connection.py")
+    print("PASSED" if ok else "FAILED")

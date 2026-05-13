@@ -13,9 +13,15 @@ logger = logging.getLogger(__name__)
 
 
 class PatternDetector:
-    def __init__(self, candle_queue: asyncio.Queue, signal_queue: asyncio.Queue) -> None:
+    def __init__(
+        self,
+        candle_queue: asyncio.Queue,
+        signal_queue: asyncio.Queue,
+        signal_db_queue: asyncio.Queue | None = None,
+    ) -> None:
         self._candle_queue = candle_queue
         self._signal_queue = signal_queue
+        self._signal_db_queue = signal_db_queue
         self._candles: deque[Candle] = deque(maxlen=settings.PATTERN_LOOKBACK)
 
     async def run(self) -> None:
@@ -31,6 +37,8 @@ class PatternDetector:
             for sig in signals:
                 logger.info(f"[Detector] Signal: {sig.pattern.name} {sig.direction.name} conf={sig.confidence:.2f}")
                 await self._signal_queue.put(sig)
+                if self._signal_db_queue is not None:
+                    await self._signal_db_queue.put(sig)
 
     def _detect_all(self) -> list[PatternSignal]:
         candles = list(self._candles)

@@ -22,9 +22,11 @@ class BinanceWebSocketConsumer:
         self,
         raw_queue: asyncio.Queue,
         candle_queue: asyncio.Queue,
+        candle_db_queue: asyncio.Queue | None = None,
     ) -> None:
         self._raw_queue = raw_queue
         self._candle_queue = candle_queue
+        self._candle_db_queue = candle_db_queue
         self._running = False
         self._reconnect_delay = 1.0
         self._max_delay = 60.0
@@ -38,7 +40,7 @@ class BinanceWebSocketConsumer:
 
     async def _connect_loop(self) -> None:
         stream_path = "/".join(self.STREAMS)
-        uri = f"{settings.WS_BASE}/{stream_path}"
+        uri = f"{settings.WS_BASE}/stream?streams={stream_path}"
         attempt = 0
 
         while self._running:
@@ -73,7 +75,9 @@ class BinanceWebSocketConsumer:
             if not self._running:
                 break
             try:
-                msg = json.loads(raw_msg)
+                outer = json.loads(raw_msg)
+                # Combined stream messages are wrapped: {"stream": "...", "data": {...}}
+                msg = outer.get("data", outer)
                 event_type = msg.get("e")
 
                 if event_type == "aggTrade":
@@ -92,7 +96,9 @@ class BinanceWebSocketConsumer:
                             is_closed=True,
                         )
                         await self._candle_queue.put(candle)
-                        logger.debug(f"[WS] Closed candle: {candle}")
+                        if self._candle_db_queue is not None:
+                            await self._candle_db_queue.put(candle)
+                        logger.info(f"[WS] Candle close — O={candle.open:.2f} H={candle.high:.2f} L={candle.low:.2f} C={candle.close:.2f} V={candle.volume:.3f}")
 
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning(f"[WS] Malformed message: {exc}")

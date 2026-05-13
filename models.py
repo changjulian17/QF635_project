@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from datetime import datetime
+from datetime import datetime, timezone
 
 class PatternType(Enum):
     RISING_WEDGE = auto()
@@ -37,7 +37,7 @@ class PatternSignal:
     entry_price: float
     stop_loss: float
     take_profit: float
-    detected_at: datetime = field(default_factory=datetime.utcnow)
+    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     r2: float = 0.0
     volume_ratio: float = 1.0
 
@@ -56,7 +56,7 @@ class Position:
     quantity: float
     stop_loss: float
     take_profit: float
-    opened_at: datetime = field(default_factory=datetime.utcnow)
+    opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     unrealised_pnl: float = 0.0
 
 @dataclass
