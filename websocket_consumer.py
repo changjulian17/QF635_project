@@ -7,24 +7,30 @@ import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config import settings
-from models import Candle
+from models import AggTrade, Candle
 
 logger = logging.getLogger(__name__)
+
+# 24-hour hard reconnect (Binance enforces a 24 h connection lifetime)
+_MAX_CONNECTION_SECONDS = 86_000  # reconnect 400 s before the 24 h limit
 
 
 class BinanceWebSocketConsumer:
     STREAMS = [
         f"{settings.SYMBOL.lower()}@aggTrade",
         f"{settings.SYMBOL.lower()}@kline_{settings.CANDLE_INTERVAL}",
+        f"{settings.SYMBOL.lower()}@depth@100ms",
     ]
 
     def __init__(
         self,
-        raw_queue: asyncio.Queue,
         candle_queue: asyncio.Queue,
+        trade_queue: asyncio.Queue,
+        depth_queue: asyncio.Queue,
     ) -> None:
-        self._raw_queue = raw_queue
         self._candle_queue = candle_queue
+        self._trade_queue = trade_queue
+        self._depth_queue = depth_queue
         self._running = False
         self._reconnect_delay = 1.0
         self._max_delay = 60.0
@@ -50,7 +56,7 @@ class BinanceWebSocketConsumer:
                     ping_timeout=60,
                     close_timeout=10,
                 ) as ws:
-                    logger.info("[WS] Connected successfully.")
+                    logger.info("[WS] Connected.")
                     self._reconnect_delay = 1.0
                     attempt = 0
                     await self._receive_loop(ws)
@@ -69,15 +75,30 @@ class BinanceWebSocketConsumer:
             self._reconnect_delay = min(self._reconnect_delay * 2, self._max_delay)
 
     async def _receive_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
+        conn_start = asyncio.get_event_loop().time()
+
         async for raw_msg in ws:
             if not self._running:
                 break
+
+            # Proactive 24-hour reconnect: close cleanly before Binance kills us
+            if asyncio.get_event_loop().time() - conn_start > _MAX_CONNECTION_SECONDS:
+                logger.info("[WS] Approaching 24 h limit — reconnecting proactively.")
+                await ws.close()
+                break
+
             try:
                 msg = json.loads(raw_msg)
                 event_type = msg.get("e")
 
                 if event_type == "aggTrade":
-                    await self._raw_queue.put(msg)
+                    trade = AggTrade(
+                        timestamp=datetime.fromtimestamp(msg["T"] / 1000, tz=timezone.utc),
+                        price=float(msg["p"]),
+                        qty=float(msg["q"]),
+                        is_buyer_maker=bool(msg["m"]),
+                    )
+                    await self._trade_queue.put(trade)
 
                 elif event_type == "kline":
                     kline = msg["k"]
@@ -93,6 +114,9 @@ class BinanceWebSocketConsumer:
                         )
                         await self._candle_queue.put(candle)
                         logger.debug(f"[WS] Closed candle: {candle}")
+
+                elif event_type == "depthUpdate":
+                    await self._depth_queue.put(msg)
 
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning(f"[WS] Malformed message: {exc}")
