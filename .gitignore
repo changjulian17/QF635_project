@@ -51,6 +51,11 @@ htmlcov/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# SQLite database
+*.db
+*.db-shm
+*.db-wal
+
 # Local development
 local/
 tmp/
