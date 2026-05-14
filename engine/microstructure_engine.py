@@ -1,7 +1,5 @@
 import asyncio
-import json
 import logging
-import sqlite3
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -25,7 +23,7 @@ class MicrostructureEngine:
       • applies the diff to the local order book
       • drains accumulated aggTrades for the window
       • computes all microstructure indicators
-      • persists a MicrostructureBar to SQLite
+      • enqueues a MicrostructureBar for DBWriter to persist
       • appends to the in-memory metrics_store deque (newest first)
 
     Initialisation follows the exact Binance synchronisation procedure:
@@ -41,13 +39,13 @@ class MicrostructureEngine:
         trade_queue: asyncio.Queue,
         depth_queue: asyncio.Queue,
         metrics_store: deque,
-        db_path: str = "cryptosentinel.db",
+        ms_bar_queue: asyncio.Queue,
     ) -> None:
         self._lob = lob
         self._trade_queue = trade_queue
         self._depth_queue = depth_queue
         self._metrics_store = metrics_store
-        self._db_path = db_path
+        self._ms_bar_queue = ms_bar_queue
 
         self._cvd: float = 0.0
         self._pending_trades: list[AggTrade] = []
@@ -118,7 +116,7 @@ class MicrostructureEngine:
             self._metrics_store.appendleft(bar)
             self._prev_snap = snap
 
-            asyncio.get_event_loop().run_in_executor(None, self._write_db, bar)
+            await self._ms_bar_queue.put(bar)
 
     async def _collect_trades(self) -> None:
         while True:
@@ -136,9 +134,9 @@ class MicrostructureEngine:
         mid_price = (best_bid + best_ask) / 2.0
         spread = best_ask - best_bid
 
-        # OBI
-        bid_vol = sum(l.qty for l in snap.bids)
-        ask_vol = sum(l.qty for l in snap.asks)
+        # OBI — computed from the tight top-N levels only, not the full stored depth
+        bid_vol = sum(l.qty for l in snap.bids[: settings.LOB_OBI_DEPTH])
+        ask_vol = sum(l.qty for l in snap.asks[: settings.LOB_OBI_DEPTH])
         denom = bid_vol + ask_vol
         obi = (bid_vol - ask_vol) / denom if denom > 0 else 0.0
 
@@ -224,17 +222,17 @@ class MicrostructureEngine:
         self, snap: LOBSnapshot, trades: list[AggTrade]
     ) -> tuple[bool, bool]:
         """
-        Resistance algorithm: a level is consumed by a trade, replenishes
-        within ICEBERG_WINDOW_MS, then is hit again.
-        We approximate this using 100 ms bars: if a level that had trades
-        against it in this window still shows substantial volume (≥50% of
-        previous), it likely replenished — iceberg.
+        Resistance algorithm (L2 approximation):
+          1. A level exceeds the minimum size floor (ICEBERG_MIN_QTY).
+          2. An aggressive trade hits it within ICEBERG_PRICE_TOL.
+          3. After the trade the level has replenished to ≥ ICEBERG_MIN_REPLENISH
+             of its pre-trade qty — indicating hidden reserve behind the visible tip.
+
+        Thresholds are intentionally strict to reduce false positives on a
+        fast-moving book where normal partial fills are common.
         """
         if self._prev_snap is None or not trades:
             return False, False
-
-        window = timedelta(milliseconds=settings.ICEBERG_WINDOW_MS)
-        now = snap.timestamp
 
         iceberg_bid = iceberg_ask = False
 
@@ -243,26 +241,32 @@ class MicrostructureEngine:
 
         for lvl in snap.bids:
             prev_qty = prev_bids.get(lvl.price, 0.0)
-            if prev_qty <= 0:
+            if prev_qty < settings.ICEBERG_MIN_QTY:
                 continue
-            # Were there sell-aggressive trades (hitting the bid) at this price?
-            hit = any(
-                abs(t.price - lvl.price) < 1.0 and t.is_buyer_maker
-                for t in trades
+            # Aggressive sell (buyer_maker=True) must have hit this exact price level
+            hit_vol = sum(
+                t.qty for t in trades
+                if t.is_buyer_maker and abs(t.price - lvl.price) <= settings.ICEBERG_PRICE_TOL
             )
-            if hit and lvl.qty >= prev_qty * 0.5:
+            if hit_vol <= 0:
+                continue
+            # Level replenished to ≥ threshold — hidden reserve consumed and refilled
+            if lvl.qty >= prev_qty * settings.ICEBERG_MIN_REPLENISH:
                 iceberg_bid = True
                 break
 
         for lvl in snap.asks:
             prev_qty = prev_asks.get(lvl.price, 0.0)
-            if prev_qty <= 0:
+            if prev_qty < settings.ICEBERG_MIN_QTY:
                 continue
-            hit = any(
-                abs(t.price - lvl.price) < 1.0 and not t.is_buyer_maker
-                for t in trades
+            # Aggressive buy (buyer_maker=False) must have hit this exact price level
+            hit_vol = sum(
+                t.qty for t in trades
+                if not t.is_buyer_maker and abs(t.price - lvl.price) <= settings.ICEBERG_PRICE_TOL
             )
-            if hit and lvl.qty >= prev_qty * 0.5:
+            if hit_vol <= 0:
+                continue
+            if lvl.qty >= prev_qty * settings.ICEBERG_MIN_REPLENISH:
                 iceberg_ask = True
                 break
 
@@ -402,53 +406,3 @@ class MicrostructureEngine:
         bp_short = any(d == "down" and obi < -settings.OBI_BREAK_THRESH for _, _, d in self._breakouts)
 
         return bp_long, bp_short
-
-    # ── Persistence ───────────────────────────────────────────────────────
-
-    def _write_db(self, bar: MicrostructureBar) -> None:
-        conn = sqlite3.connect(self._db_path)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS microstructure_bars (
-                    ts TEXT, mid_price REAL, spread REAL, obi REAL,
-                    delta REAL, cvd REAL, buy_volume REAL, sell_volume REAL,
-                    reload_bid INTEGER, reload_ask INTEGER,
-                    iceberg_bid INTEGER, iceberg_ask INTEGER,
-                    sweep_up INTEGER, sweep_down INTEGER,
-                    book_flip_bid INTEGER, book_flip_ask INTEGER,
-                    liq_flip_to_res INTEGER, liq_flip_to_sup INTEGER,
-                    break_protect_long INTEGER, break_protect_short INTEGER,
-                    bid_levels TEXT, ask_levels TEXT
-                )
-            """)
-            conn.execute("""
-                INSERT INTO microstructure_bars VALUES
-                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                bar.timestamp.isoformat(),
-                bar.mid_price, bar.spread, bar.obi,
-                bar.delta, bar.cvd, bar.buy_volume, bar.sell_volume,
-                int(bar.reload_bid), int(bar.reload_ask),
-                int(bar.iceberg_bid), int(bar.iceberg_ask),
-                int(bar.sweep_up), int(bar.sweep_down),
-                int(bar.book_flip_bid), int(bar.book_flip_ask),
-                int(bar.liq_flip_to_res), int(bar.liq_flip_to_sup),
-                int(bar.break_protect_long), int(bar.break_protect_short),
-                json.dumps([[l.price, l.qty] for l in bar.bid_levels]),
-                json.dumps([[l.price, l.qty] for l in bar.ask_levels]),
-            ))
-            conn.commit()
-            # Rolling retention: keep only the most recent LOB_HISTORY rows
-            conn.execute("""
-                DELETE FROM microstructure_bars
-                WHERE rowid NOT IN (
-                    SELECT rowid FROM microstructure_bars
-                    ORDER BY ts DESC LIMIT ?
-                )
-            """, (settings.LOB_HISTORY,))
-            conn.commit()
-        except Exception as exc:
-            logger.error(f"[MS] DB write error: {exc}")
-        finally:
-            conn.close()

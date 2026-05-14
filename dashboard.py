@@ -16,9 +16,13 @@ st.caption("[🩺 System Health](/health) · use the sidebar to navigate between
 # Sidebar stays static — only re-renders on user interaction, not on fragment refresh
 with st.sidebar:
     st.header("Settings")
-    heatmap_bars = st.slider("Heatmap window (bars @ 100 ms)", 50, 400, 200)
-    heatmap_tick_range = st.slider("Price range ± ticks", 10, 100, 40)
-    obi_window = st.slider("OBI / CVD history (bars)", 100, 600, 300)
+    heatmap_minutes = st.slider("Heatmap window (min)", 1, 300, 30)
+    heatmap_cols    = st.slider("Heatmap time columns", 100, 500, 200)
+    heatmap_half_range = st.slider("Heatmap price range ± $", 500, 20000, 5000, step=500)
+    obi_minutes = st.slider("OBI / CVD window (min)", 1, 60, 10)
+    heatmap_contrast = st.slider("Heatmap contrast (clip %ile)", 50, 99, 95,
+                                  help="Lower = more contrast (clips colour scale at a lower percentile)")
+    st.caption(f"$50 buckets · {int(heatmap_half_range / 50) * 2} price rows · 1 bar/s cadence")
 
 
 @st.fragment(run_every=30)
@@ -74,21 +78,27 @@ def live_dashboard() -> None:
         st.divider()
 
         # ── Load microstructure history ────────────────────────────────────
+        # 1 bar/s cadence; fetch enough rows for the wider of the two windows
+        fetch_rows = max(heatmap_minutes, obi_minutes) * 60
         try:
             ms = pd.read_sql(
-                f"SELECT * FROM microstructure_bars ORDER BY ts DESC LIMIT {max(heatmap_bars, obi_window)}",
+                f"SELECT * FROM microstructure_bars ORDER BY ts DESC LIMIT {fetch_rows}",
                 conn,
             ).sort_values("ts")
-            ms["ts"] = pd.to_datetime(ms["ts"])
+            ms["ts"] = pd.to_datetime(ms["ts"], utc=True).dt.tz_convert("Asia/Singapore").dt.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             ms = pd.DataFrame()
 
         # ── Heatmap + OBI / CVD / Spread — shared x-axis ─────────────────
         st.subheader("Liquidity Heatmap + OBI / CVD / Spread")
         if not ms.empty:
-            # Use the wider of the two windows so each panel shows its full history
-            obi_df = ms.tail(obi_window).copy()
-            hm_df  = ms.tail(heatmap_bars).copy()
+            # OBI/CVD/Spread: full 1-bar/s resolution for the requested window
+            obi_df = ms.tail(obi_minutes * 60).copy()
+
+            # Heatmap: downsample to heatmap_cols time columns for fast rendering
+            hm_all = ms.tail(heatmap_minutes * 60)
+            step   = max(1, len(hm_all) // heatmap_cols)
+            hm_df  = hm_all.iloc[::step].copy()
 
             fig = make_subplots(
                 rows=4, cols=1, shared_xaxes=True,
@@ -99,40 +109,58 @@ def live_dashboard() -> None:
 
             # ── Row 1: heatmap ────────────────────────────────────────────
             current_mid = float(hm_df["mid_price"].iloc[-1])
-            price_lo = current_mid - heatmap_tick_range
-            price_hi = current_mid + heatmap_tick_range
-            tick_size = 1.0
-            price_ticks = np.arange(price_lo, price_hi + tick_size, tick_size)
-            n_times, n_prices = len(hm_df), len(price_ticks)
+
+            price_lo = current_mid - heatmap_half_range
+            price_hi = current_mid + heatmap_half_range
+            bucket_size = 50.0
+            price_buckets = np.arange(price_lo, price_hi + bucket_size, bucket_size)
+            n_times, n_prices = len(hm_df), len(price_buckets)
 
             bid_matrix = np.zeros((n_prices, n_times))
             ask_matrix = np.zeros((n_prices, n_times))
             for col_idx, (_, row) in enumerate(hm_df.iterrows()):
                 try:
                     for p, q in json.loads(row["bid_levels"]):
-                        ri = int(round((p - price_lo) / tick_size))
+                        ri = int((p - price_lo) / bucket_size)
                         if 0 <= ri < n_prices:
                             bid_matrix[ri, col_idx] += q
                 except Exception:
                     pass
                 try:
                     for p, q in json.loads(row["ask_levels"]):
-                        ri = int(round((p - price_lo) / tick_size))
+                        ri = int((p - price_lo) / bucket_size)
                         if 0 <= ri < n_prices:
                             ask_matrix[ri, col_idx] += q
                 except Exception:
                     pass
 
+            # Zero out the 3 buckets straddling mid so best-bid/ask walls
+            # don't dominate the colour scale and hide the deeper depth structure
+            mid_ri = int((current_mid - price_lo) / bucket_size)
+            for ri in range(max(0, mid_ri - 1), min(n_prices, mid_ri + 2)):
+                bid_matrix[ri, :] = 0.0
+                ask_matrix[ri, :] = 0.0
+
+            all_nonzero = np.concatenate([bid_matrix[bid_matrix > 0], ask_matrix[ask_matrix > 0]])
+            max_vol = np.percentile(all_nonzero, heatmap_contrast) if len(all_nonzero) else 1.0
+
+            # Bids (green) and asks (red) as separate transparent heatmaps so they
+            # don't cancel each other when they land in adjacent buckets near the spread
             fig.add_trace(go.Heatmap(
-                z=ask_matrix - bid_matrix,
-                x=hm_df["ts"], y=price_ticks,
-                colorscale=[
-                    [0.0, "rgba(0,180,80,0.9)"],
-                    [0.5, "rgba(10,10,30,0.3)"],
-                    [1.0, "rgba(220,30,30,0.9)"],
-                ],
-                zmid=0, showscale=False,
-                hovertemplate="Time: %{x}<br>Price: %{y}<br>Net qty: %{z:.4f}<extra></extra>",
+                z=bid_matrix,
+                x=hm_df["ts"], y=price_buckets,
+                colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,200,80,0.85)"]],
+                zmin=0, zmax=max_vol, showscale=False,
+                hovertemplate="Bid qty: %{z:.4f}<extra></extra>",
+                name="Bids",
+            ), row=1, col=1)
+            fig.add_trace(go.Heatmap(
+                z=ask_matrix,
+                x=hm_df["ts"], y=price_buckets,
+                colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(220,40,40,0.85)"]],
+                zmin=0, zmax=max_vol, showscale=False,
+                hovertemplate="Ask qty: %{z:.4f}<extra></extra>",
+                name="Asks",
             ), row=1, col=1)
 
             fig.add_trace(go.Scatter(
@@ -208,17 +236,18 @@ def live_dashboard() -> None:
             fig.update_xaxes(showticklabels=False, row=1, col=1)
             fig.update_xaxes(showticklabels=False, row=2, col=1)
             fig.update_xaxes(showticklabels=False, row=3, col=1)
-            fig.update_xaxes(title_text="Time", row=4, col=1)
+            fig.update_xaxes(title_text="Time (SGT)", row=4, col=1)
             st.plotly_chart(fig, width="stretch")
         else:
             st.info("Waiting for microstructure data…")
 
-        # ── Price chart + pattern signals ─────────────────────────────────
-        st.subheader("Price + Pattern Signals")
+        # ── Candlestick chart ──────────────────────────────────────────────
+        st.subheader("Price")
         try:
             candles = pd.read_sql(
                 "SELECT * FROM candles ORDER BY open_time DESC LIMIT 200", conn
             ).sort_values("open_time")
+            candles["open_time"] = pd.to_datetime(candles["open_time"], utc=True).dt.tz_convert("Asia/Singapore").dt.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             candles = pd.DataFrame()
 
@@ -231,26 +260,17 @@ def live_dashboard() -> None:
                 name="OHLC",
             ))
 
-        try:
-            signals = pd.read_sql(
-                "SELECT * FROM signals ORDER BY detected_at DESC LIMIT 20", conn
-            )
-        except Exception:
-            signals = pd.DataFrame()
-
-        if not signals.empty:
-            for _, row in signals.iterrows():
-                is_long = row.get("direction") == "LONG"
-                fig_price.add_trace(go.Scatter(
-                    x=[row.get("detected_at")], y=[row.get("entry_price")],
-                    mode="markers",
-                    marker=dict(symbol="triangle-up" if is_long else "triangle-down",
-                                size=12, color="lime" if is_long else "red"),
-                    name=row.get("pattern"),
-                ))
+            typical = (candles["high"] + candles["low"] + candles["close"]) / 3
+            vwap = (typical * candles["volume"]).cumsum() / candles["volume"].cumsum()
+            fig_price.add_trace(go.Scatter(
+                x=candles["open_time"], y=vwap, mode="lines",
+                line=dict(color="gold", width=1.5, dash="dot"),
+                name="VWAP",
+            ))
 
         fig_price.update_layout(
             xaxis_rangeslider_visible=False, height=360,
+            xaxis_title="Time (SGT)",
             template="plotly_dark", margin=dict(t=20, b=20),
         )
         st.plotly_chart(fig_price, width="stretch")

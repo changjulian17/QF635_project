@@ -7,8 +7,8 @@ import pytest
 import engine.db_writer as db_mod
 from engine.db_writer import DBWriter
 from models import (
-    Candle, CircuitBreakerStatus, Direction, PatternSignal,
-    PatternType, PortfolioState,
+    Candle, CircuitBreakerStatus, Direction, LOBLevel, MicrostructureBar,
+    PatternSignal, PatternType, PortfolioState,
 )
 
 
@@ -33,6 +33,21 @@ def make_candle(**kw) -> Candle:
         volume=1.23, is_closed=True,
     )
     return Candle(**{**defaults, **kw})
+
+
+def make_ms_bar(**kw) -> MicrostructureBar:
+    defaults = dict(
+        timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        mid_price=80050.0, spread=1.0, obi=0.1,
+        delta=0.5, cvd=1.5, buy_volume=2.0, sell_volume=1.5,
+        reload_bid=False, reload_ask=False,
+        iceberg_bid=False, iceberg_ask=False,
+        sweep_up=False, sweep_down=False,
+        book_flip_bid=False, book_flip_ask=False,
+        liq_flip_to_res=False, liq_flip_to_sup=False,
+        break_protect_long=False, break_protect_short=False,
+    )
+    return MicrostructureBar(**{**defaults, **kw})
 
 
 def make_signal(**kw) -> PatternSignal:
@@ -122,7 +137,7 @@ def test_write_portfolio_persists(temp_db):
 # ── _purge_old_records ────────────────────────────────────────────────────────
 
 def test_purge_removes_old_candles(temp_db, monkeypatch):
-    writer = DBWriter(None, None, make_portfolio())
+    writer = DBWriter(None, None, make_portfolio(), None)
     monkeypatch.setattr(writer, "RETENTION_DAYS", 7)
 
     old_time = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
@@ -144,7 +159,7 @@ def test_purge_removes_old_candles(temp_db, monkeypatch):
 
 
 def test_purge_keeps_recent_signals(temp_db, monkeypatch):
-    writer = DBWriter(None, None, make_portfolio())
+    writer = DBWriter(None, None, make_portfolio(), None)
     monkeypatch.setattr(writer, "RETENTION_DAYS", 7)
 
     DBWriter._write_signal(make_signal())
@@ -154,3 +169,32 @@ def test_purge_keeps_recent_signals(temp_db, monkeypatch):
     count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
     conn.close()
     assert count == 1
+
+
+# ── _write_ms_bar ─────────────────────────────────────────────────────────────
+
+def test_write_ms_bar_persists(temp_db):
+    bar = make_ms_bar(mid_price=80050.0, obi=0.25, sweep_up=True)
+    DBWriter._write_ms_bar(bar)
+    conn = sqlite3.connect(temp_db)
+    row = conn.execute("SELECT mid_price, obi, sweep_up FROM microstructure_bars").fetchone()
+    conn.close()
+    assert row == (80050.0, 0.25, 1)
+
+
+def test_write_ms_bar_rolling_retention(temp_db, monkeypatch):
+    import engine.db_writer as db_mod
+    monkeypatch.setattr(db_mod.settings, "LOB_HISTORY", 3)
+    for i in range(5):
+        DBWriter._write_ms_bar(make_ms_bar(mid_price=float(i)))
+    conn = sqlite3.connect(temp_db)
+    count = conn.execute("SELECT COUNT(*) FROM microstructure_bars").fetchone()[0]
+    conn.close()
+    assert count == 3
+
+
+def test_init_db_enables_wal(temp_db):
+    conn = sqlite3.connect(temp_db)
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    conn.close()
+    assert mode == "wal"

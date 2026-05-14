@@ -45,6 +45,7 @@ async def main() -> None:
     signal_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
     signal_db_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
     order_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+    ms_bar_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
 
     # Shared in-memory metrics store (newest bar first); also consumed by future scalper
     metrics_store: deque = deque(maxlen=settings.LOB_HISTORY)
@@ -52,11 +53,11 @@ async def main() -> None:
     # Components
     ws_consumer = BinanceWebSocketConsumer(candle_queue, candle_db_queue, trade_queue, depth_queue)
     lob = LocalOrderBook()
-    ms_engine = MicrostructureEngine(lob, trade_queue, depth_queue, metrics_store)
+    ms_engine = MicrostructureEngine(lob, trade_queue, depth_queue, metrics_store, ms_bar_queue)
     detector = PatternDetector(candle_queue, signal_queue, signal_db_queue)
     risk = RiskEngine(signal_queue, order_queue, portfolio)
     executor = OrderManager(order_queue, portfolio)
-    db_writer = DBWriter(candle_db_queue, signal_db_queue, portfolio)
+    db_writer = DBWriter(candle_db_queue, signal_db_queue, portfolio, ms_bar_queue)
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(ws_consumer.start(), name="ws_consumer")

@@ -35,10 +35,15 @@ class Settings(BaseSettings):
     UI_REFRESH_INTERVAL: float = 1.0
 
     # Microstructure / LOB
-    LOB_DEPTH: int = 20                     # levels to use for OBI and heatmap
-    LOB_HISTORY: int = 600                  # bars to keep in DB (60 s at 100 ms cadence)
+    LOB_DEPTH: int = 1000                   # levels fetched per snapshot (stored in heatmap)
+    LOB_OBI_DEPTH: int = 20                 # top-N levels used for OBI computation
+    LOB_HISTORY: int = 18000                # bars to keep in DB (5 h at 1 bar/s cadence)
+    LOB_HEATMAP_BUCKET: float = 5.0         # $ bucket size for heatmap price aggregation
     RELOAD_SIGMA: float = 3.0               # σ threshold for reload detection
     ICEBERG_WINDOW_MS: int = 500            # look-back window for iceberg resistance algorithm
+    ICEBERG_MIN_REPLENISH: float = 0.80     # level must refill to ≥80 % of previous qty
+    ICEBERG_MIN_QTY: float = 0.5            # minimum level qty (BTC) — filters thin noise levels
+    ICEBERG_PRICE_TOL: float = 0.10         # max $ distance for a trade to count as hitting a level
     SWEEP_LEVELS: int = 5                   # ask/bid levels whose volume is compared against trade size
     BREAK_PROTECT_WINDOW_MS: int = 2000     # ms after a breakout to look for protective liquidity
     OBI_BREAK_THRESH: float = 0.40          # OBI magnitude required to confirm break+protect

@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
 
-from models import Candle, PatternSignal, PortfolioState
+from config import settings
+from models import Candle, MicrostructureBar, PatternSignal, PortfolioState
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +14,7 @@ DB_PATH = "cryptosentinel.db"
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS candles (
                 open_time TEXT PRIMARY KEY,
@@ -35,6 +38,19 @@ def init_db() -> None:
                 drawdown_pct REAL, circuit_breaker TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS microstructure_bars (
+                ts TEXT, mid_price REAL, spread REAL, obi REAL,
+                delta REAL, cvd REAL, buy_volume REAL, sell_volume REAL,
+                reload_bid INTEGER, reload_ask INTEGER,
+                iceberg_bid INTEGER, iceberg_ask INTEGER,
+                sweep_up INTEGER, sweep_down INTEGER,
+                book_flip_bid INTEGER, book_flip_ask INTEGER,
+                liq_flip_to_res INTEGER, liq_flip_to_sup INTEGER,
+                break_protect_long INTEGER, break_protect_short INTEGER,
+                bid_levels TEXT, ask_levels TEXT
+            )
+        """)
         conn.commit()
     logger.info("[DB] Database initialized.")
 
@@ -49,10 +65,12 @@ class DBWriter:
         candle_queue: asyncio.Queue,
         signal_queue: asyncio.Queue,
         portfolio: PortfolioState,
+        ms_bar_queue: asyncio.Queue,
     ) -> None:
         self._candle_queue = candle_queue
         self._signal_queue = signal_queue
         self._portfolio = portfolio
+        self._ms_bar_queue = ms_bar_queue
 
     async def run(self) -> None:
         logger.info("[DB] Writer started.")
@@ -60,6 +78,7 @@ class DBWriter:
             tg.create_task(self._candle_loop())
             tg.create_task(self._signal_loop())
             tg.create_task(self._portfolio_loop())
+            tg.create_task(self._ms_bar_loop())
             tg.create_task(self._cleanup_loop())
 
     async def _candle_loop(self) -> None:
@@ -71,6 +90,11 @@ class DBWriter:
         while True:
             signal: PatternSignal = await self._signal_queue.get()
             await asyncio.to_thread(self._write_signal, signal)
+
+    async def _ms_bar_loop(self) -> None:
+        while True:
+            bar: MicrostructureBar = await self._ms_bar_queue.get()
+            await asyncio.to_thread(self._write_ms_bar, bar)
 
     async def _portfolio_loop(self) -> None:
         while True:
@@ -124,5 +148,34 @@ class DBWriter:
                 "INSERT OR REPLACE INTO portfolio VALUES (?,?,?,?,?)",
                 (datetime.now(timezone.utc).isoformat(), pf.equity,
                  pf.daily_pnl, pf.drawdown_pct, pf.circuit_breaker.name),
+            )
+            conn.commit()
+
+    @staticmethod
+    def _write_ms_bar(bar: MicrostructureBar) -> None:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO microstructure_bars VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    bar.timestamp.isoformat(),
+                    bar.mid_price, bar.spread, bar.obi,
+                    bar.delta, bar.cvd, bar.buy_volume, bar.sell_volume,
+                    int(bar.reload_bid), int(bar.reload_ask),
+                    int(bar.iceberg_bid), int(bar.iceberg_ask),
+                    int(bar.sweep_up), int(bar.sweep_down),
+                    int(bar.book_flip_bid), int(bar.book_flip_ask),
+                    int(bar.liq_flip_to_res), int(bar.liq_flip_to_sup),
+                    int(bar.break_protect_long), int(bar.break_protect_short),
+                    json.dumps([[l.price, l.qty] for l in bar.bid_levels]),
+                    json.dumps([[l.price, l.qty] for l in bar.ask_levels]),
+                ),
+            )
+            conn.execute(
+                """DELETE FROM microstructure_bars
+                   WHERE rowid NOT IN (
+                       SELECT rowid FROM microstructure_bars
+                       ORDER BY ts DESC LIMIT ?
+                   )""",
+                (settings.LOB_HISTORY,),
             )
             conn.commit()

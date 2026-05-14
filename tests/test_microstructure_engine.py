@@ -16,7 +16,7 @@ def make_engine() -> MicrostructureEngine:
         trade_queue=asyncio.Queue(),
         depth_queue=asyncio.Queue(),
         metrics_store=deque(maxlen=100),
-        db_path=":memory:",
+        ms_bar_queue=asyncio.Queue(),
     )
 
 
