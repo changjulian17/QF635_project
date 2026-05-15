@@ -13,7 +13,6 @@ Startup sequence (master arch §9):
 import asyncio
 import logging
 import signal
-from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from binance import AsyncClient
@@ -51,6 +50,86 @@ async def _drain(queue: asyncio.Queue) -> None:
     """Consume and discard messages so the queue never backs up."""
     while True:
         await queue.get()
+
+
+async def _emergency_close_all(
+    order_manager: "OrderManager",
+    portfolio: "PortfolioState",
+    db_path: str,
+    reason: str,
+) -> None:
+    """
+    Emergency stop: block new orders, log open positions, persist the event.
+    OCO brackets already protect open positions — do NOT market-close them.
+    """
+    order_manager.accepting_new_signals = False
+    logger.critical("[KS] EMERGENCY STOP — %s", reason)
+    for pos in portfolio.positions:
+        logger.critical("[KS] Open position (OCO-protected): %s", pos)
+    _write_event(db_path, "KILLSWITCH_FIRED", {
+        "reason": reason,
+        "equity": portfolio.equity,
+        "daily_pnl": portfolio.daily_pnl,
+        "open_positions": len(portfolio.positions),
+    })
+
+
+async def _killswitch_monitor(
+    killswitch: "GlobalKillswitch",
+    portfolio: "PortfolioState",
+    shared_state: "SharedState",
+    order_manager: "OrderManager",
+    db_path: str,
+    interval: float = 1.0,
+) -> None:
+    """
+    KS-1 (budget) and KS-2 (heartbeat) are checked every second.
+    KS-3 (slippage) is wired directly in OrderManager on each fill.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        if killswitch.is_active:
+            continue
+
+        if killswitch.check_budget(portfolio.daily_pnl, 0.0):
+            await _emergency_close_all(order_manager, portfolio, db_path, "KS-1_BUDGET")
+            continue
+
+        if killswitch.check_heartbeat(
+            shared_state.heartbeat_status, shared_state.last_delta_ms
+        ):
+            await _emergency_close_all(order_manager, portfolio, db_path, "KS-2_HEARTBEAT")
+
+
+async def _fill_handler(
+    fill_queue: asyncio.Queue,
+    budget: "DailyBudget",
+    killswitch: "GlobalKillswitch",
+    order_manager: "OrderManager",
+    portfolio: "PortfolioState",
+    db_path: str,
+) -> None:
+    """
+    Process fill events from OrderManager.
+    Updates DailyBudget realised PnL and checks KS-3 slippage trigger.
+    """
+    while True:
+        fill = await fill_queue.get()
+        side        = fill.get("side", "")
+        fill_price  = float(fill.get("fill_price", 0.0))
+        entry_price = float(fill.get("entry_price", 0.0))
+        qty         = float(fill.get("qty", 0.0))
+
+        # Slippage check (KS-3) — direction inferred from fill side
+        direction = "LONG" if side == "BUY" else "SHORT"
+        if killswitch.record_slippage(entry_price, fill_price, direction):
+            await _emergency_close_all(order_manager, portfolio, db_path, "KS-3_SLIPPAGE")
+
+        # Approximate realised PnL for DailyBudget tracking on entry fills
+        # (precise PnL requires close price; this is a conservative estimate)
+        slippage_cost = abs(fill_price - entry_price) * qty
+        budget.realised_pnl -= slippage_cost
+        logger.debug("[Fill] side=%s qty=%.6f fill=%.2f slippage_cost=%.4f", side, qty, fill_price, slippage_cost)
 
 
 async def _depth_fanout(
@@ -108,8 +187,8 @@ async def _shutdown_watchdog(
 
     # Log any open positions (OCO bracket protects them; do NOT close manually)
     if portfolio.positions:
-        for pid, pos in portfolio.positions.items():
-            logger.warning("[Shutdown] Open position retained: id=%s %s", pid, pos)
+        for pos in portfolio.positions:
+            logger.warning("[Shutdown] Open position retained: %s", pos)
     else:
         logger.info("[Shutdown] No open positions.")
 
@@ -269,9 +348,20 @@ async def main() -> None:
             # Persistence
             tg.create_task(db_writer.run(),           name="db_writer")
 
-            # Drain queues that have no active consumer in Phase 1M
+            # Drain approved micro-signals (wired to execution in a future phase)
             tg.create_task(_drain(micro_approved_queue), name="drain_micro_approved")
-            tg.create_task(_drain(fill_queue),           name="drain_fill")
+
+            # Killswitch monitoring (KS-1 budget, KS-2 heartbeat) + fill handler (KS-3)
+            tg.create_task(
+                _killswitch_monitor(
+                    killswitch, portfolio, shared_state, order_manager, settings.REGISTRY_DB
+                ),
+                name="killswitch_monitor",
+            )
+            tg.create_task(
+                _fill_handler(fill_queue, budget, killswitch, order_manager, portfolio, settings.REGISTRY_DB),
+                name="fill_handler",
+            )
 
             # Session management
             tg.create_task(
