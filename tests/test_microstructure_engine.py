@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from engine.lob_engine import LocalOrderBook
+from core.lob_engine import LocalOrderBook
 from engine.microstructure_engine import MicrostructureEngine
 from models import AggTrade, LOBLevel, LOBSnapshot
 

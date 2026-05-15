@@ -3,13 +3,13 @@ import logging
 from collections import deque
 
 from config import settings
+from core.lob_engine import LocalOrderBook
+from core.pattern_detector import PatternDetector
+from core.ws_consumer import BinanceWebSocketConsumer
 from engine.db_writer import DBWriter, init_db
-from engine.lob_engine import LocalOrderBook
 from engine.microstructure_engine import MicrostructureEngine
-from engine.order_manager import OrderManager
-from engine.pattern_detector import PatternDetector
-from engine.risk_engine import RiskEngine
-from engine.websocket_consumer import BinanceWebSocketConsumer
+from execution.order_manager import OrderManager
+from risk.engine import RiskEngine
 from models import PortfolioState
 
 logging.basicConfig(
