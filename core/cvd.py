@@ -34,6 +34,29 @@ class WelfordOnline:
     def std(self) -> float:
         return math.sqrt(self.variance)
 
+    def zscore(self, value: float) -> float:
+        """Return z-score of value against the CURRENT distribution, then update.
+        Strictly causal: the incoming value is scored before it influences the stats."""
+        s = self.std
+        z = (value - self._mean) / s if s > 1e-9 else 0.0
+        self.update(value)
+        return z
+
+    def percentile_rank(self, value: float) -> float:
+        """Approximate percentile rank via normal CDF, then update."""
+        s = self.std
+        if s < 1e-9:
+            self.update(value)
+            return 0.5
+        z = (value - self._mean) / s
+        # Abramowitz & Stegun approximation of standard normal CDF
+        t = 1.0 / (1.0 + 0.2316419 * abs(z))
+        poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+        cdf = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * z * z) * poly
+        rank = cdf if z >= 0 else 1.0 - cdf
+        self.update(value)
+        return rank
+
 
 class CVDCalculator:
     """
@@ -52,11 +75,9 @@ class CVDCalculator:
     def update(self, trade: AggTrade) -> None:
         """Process one aggTrade and update CVD."""
         signed_qty = -trade.qty if trade.is_buyer_maker else trade.qty
-        prev_cvd = self._cvd
         self._cvd += signed_qty
         self._history.append(self._cvd)
-        delta = self._cvd - prev_cvd
-        self._delta_stats.update(delta)
+        self._delta_stats.update(signed_qty)
 
     def get_cvd(self) -> float:
         """Current cumulative volume delta."""

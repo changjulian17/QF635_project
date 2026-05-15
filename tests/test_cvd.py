@@ -103,3 +103,40 @@ def test_welford_zero_before_any_update():
     w = WelfordOnline()
     assert w.std == 0.0
     assert w.variance == 0.0
+
+
+def test_welford_zscore_strictly_causal():
+    """z-score at observation N must not depend on observations N+1..M."""
+    w50 = WelfordOnline()
+    w200 = WelfordOnline()
+    values = [float(i % 7) for i in range(200)]
+    z50 = z200 = None
+    for i, v in enumerate(values):
+        z = w200.zscore(v)
+        if i < 50:
+            w50.zscore(v)
+        if i == 49:
+            z50 = w50.zscore(values[50]) if False else None  # capture state after 50
+        if i == 50:
+            z200 = z
+    # Independently replay first 51 values in w50
+    w50b = WelfordOnline()
+    for v in values[:50]:
+        w50b.update(v)
+    z50_direct = w50b.zscore(values[50])
+    assert abs(z50_direct - z200) < 1e-9
+
+
+def test_welford_percentile_rank_midpoint():
+    """Value equal to the mean should have rank near 0.5."""
+    w = WelfordOnline()
+    for v in [1.0, 2.0, 3.0, 4.0, 5.0]:
+        w.update(v)
+    rank = w.percentile_rank(3.0)   # mean is 3.0
+    assert 0.4 < rank < 0.6
+
+
+def test_welford_zscore_returns_zero_before_variance():
+    w = WelfordOnline()
+    w.update(5.0)
+    assert w.zscore(5.0) == 0.0   # std still 0 → z=0
