@@ -16,13 +16,23 @@ class OrderManager:
         self._client: AsyncClient | None = None
 
     async def start(self) -> None:
-        self._client = await AsyncClient.create(
-            api_key=settings.BINANCE_API_KEY,
-            api_secret=settings.BINANCE_API_SECRET,
-            testnet=settings.BINANCE_TESTNET,
-        )
-        logger.info("[Exec] Binance AsyncClient connected (testnet).")
+        try:
+            self._client = await AsyncClient.create(
+                api_key=settings.BINANCE_API_KEY,
+                api_secret=settings.BINANCE_API_SECRET,
+                testnet=settings.BINANCE_TESTNET,
+            )
+            logger.info("[Exec] Binance AsyncClient connected (testnet).")
+        except Exception as exc:
+            logger.error("[Exec] Cannot connect to Binance testnet: %s — running in drain mode.", exc)
+            await self._drain_loop()
+            return
         await self._order_loop()
+
+    async def _drain_loop(self) -> None:
+        """Discard orders when Binance is unreachable. Prevents queue backpressure."""
+        while True:
+            await self._order_queue.get()
 
     async def _order_loop(self) -> None:
         while True:

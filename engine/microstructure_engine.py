@@ -66,8 +66,18 @@ class MicrostructureEngine:
 
     async def run(self) -> None:
         asyncio.create_task(self._collect_trades())
-        await self._initialise()
+        try:
+            await self._initialise()
+        except Exception as exc:
+            logger.error("[MS] Initialisation failed: %s — running in drain mode.", exc)
+            await self._drain_loop()
+            return
         await self._main_loop()
+
+    async def _drain_loop(self) -> None:
+        """Discard depth events when the engine cannot initialise. Prevents queue backpressure."""
+        while True:
+            await self._depth_queue.get()
 
     async def _initialise(self) -> None:
         """Apply the first depth20 snapshot from the queue."""
