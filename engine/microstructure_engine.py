@@ -3,7 +3,6 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
 import numpy as np
 
 from config import settings
@@ -11,8 +10,6 @@ from .lob_engine import LocalOrderBook
 from models import AggTrade, LOBLevel, LOBSnapshot, MicrostructureBar
 
 logger = logging.getLogger(__name__)
-
-_SNAPSHOT_URL = f"{settings.REST_BASE}/api/v3/depth"
 
 
 class MicrostructureEngine:
@@ -73,37 +70,17 @@ class MicrostructureEngine:
         await self._main_loop()
 
     async def _initialise(self) -> None:
-        """Fetch REST snapshot and synchronise with buffered depth events."""
+        """Apply the first depth20 snapshot from the queue."""
         self._lob.reset()
-        logger.info("[MS] Fetching order book snapshot…")
-
-        async with aiohttp.ClientSession() as session:
-            params = {"symbol": settings.SYMBOL, "limit": 1000}
-            async with session.get(_SNAPSHOT_URL, params=params) as resp:
-                data = await resp.json()
-
-        self._lob.set_snapshot(data)
-        snap_id = data["lastUpdateId"]
-
-        # Drain events buffered in the queue while we were fetching
-        drained = 0
-        while not self._depth_queue.empty():
-            event = self._depth_queue.get_nowait()
-            if int(event["u"]) > snap_id:
-                self._lob.apply_diff(event)
-                drained += 1
-
-        logger.info(f"[MS] Initialised. Applied {drained} buffered diff events.")
+        logger.info("[MS] Waiting for first depth20 snapshot…")
+        event = await self._depth_queue.get()
+        self._lob.set_snapshot(event)
+        logger.info("[MS] Initialised from depth20 snapshot. lastUpdateId=%d", event.get("lastUpdateId", 0))
 
     async def _main_loop(self) -> None:
         while True:
             event = await self._depth_queue.get()
-
-            ok = self._lob.apply_diff(event)
-            if not ok:
-                logger.warning("[MS] Sequence gap — reinitialising LOB.")
-                await self._initialise()
-                continue
+            self._lob.set_snapshot(event)
 
             snap = self._lob.get_snapshot(settings.LOB_DEPTH)
             if snap is None:
@@ -120,11 +97,12 @@ class MicrostructureEngine:
 
     async def _collect_trades(self) -> None:
         while True:
-            trade: AggTrade = await self._trade_queue.get()
-            self._pending_trades.append(trade)
-            # Record for iceberg detection keyed by rounded price (1 tick = $1 on BTC)
-            rounded = round(trade.price, 0)
-            self._trade_hist[rounded].append((trade.timestamp, trade.qty, trade.is_buyer_maker))
+            item = await self._trade_queue.get()
+            if not isinstance(item, AggTrade):
+                continue  # bookTicker dicts share this queue; spread is derived from LOB
+            self._pending_trades.append(item)
+            rounded = round(item.price, 0)
+            self._trade_hist[rounded].append((item.timestamp, item.qty, item.is_buyer_maker))
 
     # ── Bar computation ───────────────────────────────────────────────────
 
