@@ -80,17 +80,19 @@ class MicrostructureEngine:
             await self._depth_queue.get()
 
     async def _initialise(self) -> None:
-        """Apply the first depth20 snapshot from the queue."""
+        """Wait for first valid depth20 snapshot — LOB state machine handles sync."""
         self._lob.reset()
         logger.info("[MS] Waiting for first depth20 snapshot…")
-        event = await self._depth_queue.get()
-        self._lob.set_snapshot(event)
-        logger.info("[MS] Initialised from depth20 snapshot. lastUpdateId=%d", event.get("lastUpdateId", 0))
+        while True:
+            event = await self._depth_queue.get()
+            if self._lob.apply_snapshot(event):
+                logger.info("[MS] LOB synced. lastUpdateId=%d", event.get("lastUpdateId", 0))
+                return
 
     async def _main_loop(self) -> None:
         while True:
             event = await self._depth_queue.get()
-            self._lob.set_snapshot(event)
+            self._lob.apply_snapshot(event)
 
             snap = self._lob.get_snapshot(settings.LOB_DEPTH)
             if snap is None:

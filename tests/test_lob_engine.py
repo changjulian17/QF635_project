@@ -1,5 +1,6 @@
 """Unit tests for LocalOrderBook — pure synchronous LOB logic."""
 from core.lob_engine import LocalOrderBook
+from models import LOBStateMachineState, SharedState
 
 
 def snapshot_data(last_id: int = 100, bids=None, asks=None) -> dict:
@@ -125,3 +126,89 @@ def test_reset_clears_state():
     lob.reset()
     assert not lob.is_ready
     assert lob.get_snapshot() is None
+
+
+# ── State machine (Phase 1D) ──────────────────────────────────────────────────
+
+def snap_msg(last_id: int, bids=None, asks=None) -> dict:
+    return {
+        "lastUpdateId": last_id,
+        "bids": bids or [["30000.00", "1.5"], ["29999.00", "0.8"]],
+        "asks": asks or [["30001.00", "1.2"], ["30002.00", "0.5"]],
+    }
+
+
+def test_state_machine_transition_to_synced():
+    lob = LocalOrderBook()
+    assert lob.state == LOBStateMachineState.UNINITIALISED
+    ok = lob.apply_snapshot(snap_msg(last_id=1000))
+    assert ok is True
+    assert lob.state == LOBStateMachineState.SYNCED
+    assert lob.lob_status == "SYNCED"
+    assert lob.is_ready
+
+
+def test_gap_detected_sets_stale():
+    lob = LocalOrderBook()
+    lob.apply_snapshot(snap_msg(last_id=1000))
+    assert lob.state == LOBStateMachineState.SYNCED
+    # Feed a stale snapshot (lastUpdateId regressed)
+    ok = lob.apply_snapshot(snap_msg(last_id=900))
+    assert ok is False
+    assert lob.state == LOBStateMachineState.GAP_DETECTED
+    assert lob.lob_status == "GAP_DETECTED"
+    # Book should still hold the last valid snapshot
+    assert lob.is_ready
+
+
+def test_reinitialise_on_gap():
+    lob = LocalOrderBook()
+    lob.apply_snapshot(snap_msg(last_id=1000))
+    lob.apply_snapshot(snap_msg(last_id=900))   # triggers GAP_DETECTED
+    assert lob.state == LOBStateMachineState.GAP_DETECTED
+    # Next valid snapshot should recover
+    ok = lob.apply_snapshot(snap_msg(last_id=1100))
+    assert ok is True
+    assert lob.state == LOBStateMachineState.SYNCED
+
+
+def test_gap_severity_tiering():
+    lob = LocalOrderBook()
+    assert lob._classify_gap(100)   == "CONTINUE"
+    assert lob._classify_gap(499)   == "CONTINUE"
+    assert lob._classify_gap(500)   == "HALT_ENTRIES"
+    assert lob._classify_gap(4999)  == "HALT_ENTRIES"
+    assert lob._classify_gap(5000)  == "CLOSE_REVIEW"
+    assert lob._classify_gap(50000) == "CLOSE_REVIEW"
+
+
+def test_shared_state_updated_on_transition():
+    state = SharedState()
+    lob = LocalOrderBook(shared_state=state)
+    assert state.lob_status == "UNINITIALISED"
+    lob.apply_snapshot(snap_msg(last_id=500))
+    assert state.lob_status == "SYNCED"
+    lob.apply_snapshot(snap_msg(last_id=100))   # stale → GAP_DETECTED
+    assert state.lob_status == "GAP_DETECTED"
+
+
+def test_get_current_walls_identifies_outlier():
+    # Build a book with realistic qty variance so std > 0, then plant a 50x outlier
+    base = [0.8 + (i % 5) * 0.15 for i in range(20)]   # 0.8, 0.95, 1.1, 1.25, 1.4, ...
+    bids = [[str(30000 - i * 10), str(round(base[i], 2))] for i in range(20)]
+    bids[5] = [str(30000 - 5 * 10), "50.0"]   # clear outlier at index 5
+    asks = [["30100.00", str(round(base[i], 2))] for i in range(20)]
+    lob = LocalOrderBook()
+    lob.apply_snapshot(snap_msg(last_id=1, bids=bids, asks=asks))
+    walls = lob.get_current_walls(sigma=2.5, window=5)
+    wall_prices = {w["price"] for w in walls if w["side"] == "bid"}
+    assert float(bids[5][0]) in wall_prices
+
+
+def test_reset_returns_to_uninitialised():
+    lob = LocalOrderBook()
+    lob.apply_snapshot(snap_msg(last_id=1000))
+    assert lob.state == LOBStateMachineState.SYNCED
+    lob.reset()
+    assert lob.state == LOBStateMachineState.UNINITIALISED
+    assert not lob.is_ready
