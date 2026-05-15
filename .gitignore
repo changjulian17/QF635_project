@@ -63,3 +63,7 @@ tmp/
 temp/
 .claude/
 .gitignore
+
+# Notes
+research
+CLAUDE.md
