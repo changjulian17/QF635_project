@@ -1,5 +1,5 @@
 """Unit tests for LocalOrderBook — pure synchronous LOB logic."""
-from engine.lob_engine import LocalOrderBook
+from core.lob_engine import LocalOrderBook
 
 
 def snapshot_data(last_id: int = 100, bids=None, asks=None) -> dict:
