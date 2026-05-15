@@ -1,0 +1,193 @@
+"""
+Signal Telemetry — async writer that records every gate evaluation to registry.db.
+
+Every signal (approved AND rejected) is persisted so the 7-gate funnel
+can be analysed and the confidence scorer can be trained offline.
+"""
+
+import asyncio
+import logging
+import os
+import sqlite3
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Optional
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+_FLUSH_BATCH    = 50
+_FLUSH_INTERVAL = 10.0   # seconds
+
+
+@dataclass
+class SignalRecord:
+    """One row in signal_records — covers every gate evaluation."""
+    signal_id:       str   = field(default_factory=lambda: str(uuid.uuid4()))
+    strategy_id:     str   = "v3.0"
+    timestamp:       str   = field(default_factory=lambda: _now_iso())
+    micro_signal:    str   = ""     # MicroSignal.signal_type or ""
+    gate_passed:     str   = ""     # "GATE_0_FAIL" … "APPROVED"
+    rejection_reason: str  = ""
+
+    # Feature snapshot (subset — extend as needed)
+    lob_status:       str   = ""
+    heartbeat_status: str   = ""
+    obi_zscore:       float = 0.0
+    cvd_delta:        float = 0.0
+    spread_bps:       float = 0.0
+    confidence:       float = 0.0
+    direction:        str   = ""
+
+    # Trade outcome — filled in after position closes
+    outcome:          str   = ""    # "WIN" | "LOSS" | "FLAT"
+    pnl:              float = 0.0
+    pnl_pct:          float = 0.0
+    duration_min:     float = 0.0
+
+
+def _now_iso() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+class SignalTelemetry:
+    """
+    Drains a telemetry_queue of SignalRecord objects and writes them to
+    registry.db in batches.  Flushed on FLUSH_BATCH records OR FLUSH_INTERVAL
+    seconds, whichever comes first.
+    """
+
+    def __init__(
+        self,
+        telemetry_queue: asyncio.Queue,
+        db_path: str = settings.REGISTRY_DB,
+    ) -> None:
+        self._queue   = telemetry_queue
+        self._db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+        self._buf: list[SignalRecord] = []
+        self._last_flush: float = time.monotonic()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+        self._conn = self._open_db()
+        logger.info("[Telemetry] Recording signals to %s", self._db_path)
+        await self._drain_loop()
+
+    async def _drain_loop(self) -> None:
+        while True:
+            try:
+                record = await asyncio.wait_for(self._queue.get(), timeout=_FLUSH_INTERVAL)
+                self._buf.append(record)
+                if len(self._buf) >= _FLUSH_BATCH:
+                    await self._flush()
+            except asyncio.TimeoutError:
+                if self._buf:
+                    await self._flush()
+
+    # ── Flush ─────────────────────────────────────────────────────────────────
+
+    async def _flush(self) -> None:
+        if not self._buf or not self._conn:
+            return
+        rows = self._buf[:]
+        self._buf.clear()
+        self._last_flush = time.monotonic()
+        try:
+            self._conn.executemany(
+                """
+                INSERT OR IGNORE INTO signal_records (
+                    signal_id, strategy_id, timestamp,
+                    micro_signal, gate_passed, rejection_reason,
+                    lob_status, heartbeat_status,
+                    obi_zscore, cvd_delta, spread_bps, confidence, direction,
+                    outcome, pnl, pnl_pct, duration_min
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        r.signal_id, r.strategy_id, r.timestamp,
+                        r.micro_signal, r.gate_passed, r.rejection_reason,
+                        r.lob_status, r.heartbeat_status,
+                        r.obi_zscore, r.cvd_delta, r.spread_bps,
+                        r.confidence, r.direction,
+                        r.outcome, r.pnl, r.pnl_pct, r.duration_min,
+                    )
+                    for r in rows
+                ],
+            )
+            self._conn.commit()
+            logger.debug("[Telemetry] Flushed %d records.", len(rows))
+        except sqlite3.Error as exc:
+            logger.error("[Telemetry] Flush failed: %s", exc)
+            self._buf = rows + self._buf   # re-queue on transient error
+
+    def update_outcome(
+        self,
+        signal_id: str,
+        outcome: str,
+        pnl: float,
+        pnl_pct: float,
+        duration_min: float,
+    ) -> None:
+        """Called by OrderManager after a position closes."""
+        if not self._conn:
+            return
+        try:
+            self._conn.execute(
+                """
+                UPDATE signal_records
+                SET outcome=?, pnl=?, pnl_pct=?, duration_min=?
+                WHERE signal_id=?
+                """,
+                (outcome, pnl, pnl_pct, duration_min, signal_id),
+            )
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            logger.error("[Telemetry] Outcome update failed: %s", exc)
+
+    # ── Schema ────────────────────────────────────────────────────────────────
+
+    def _open_db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS signal_records (
+                signal_id        TEXT PRIMARY KEY,
+                strategy_id      TEXT NOT NULL,
+                timestamp        TEXT NOT NULL,
+                micro_signal     TEXT,
+                gate_passed      TEXT,
+                rejection_reason TEXT,
+                lob_status       TEXT,
+                heartbeat_status TEXT,
+                obi_zscore       REAL,
+                cvd_delta        REAL,
+                spread_bps       REAL,
+                confidence       REAL,
+                direction        TEXT,
+                outcome          TEXT DEFAULT '',
+                pnl              REAL DEFAULT 0.0,
+                pnl_pct          REAL DEFAULT 0.0,
+                duration_min     REAL DEFAULT 0.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_sigrecords_ts
+                ON signal_records(strategy_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_sigrecords_gate
+                ON signal_records(gate_passed, micro_signal);
+
+            CREATE TABLE IF NOT EXISTS system_events (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type   TEXT NOT NULL,
+                occurred_at  TEXT NOT NULL,
+                payload_json TEXT
+            );
+        """)
+        conn.commit()
+        return conn
