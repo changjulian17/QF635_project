@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     STARTING_EQUITY: float = 10_000.0
     MAX_DRAWDOWN_PCT: float = 0.05
     DAILY_LOSS_LIMIT_PCT: float = 0.02
+    # 5-tier DOV loss thresholds (§5 risk_management_plan)
+    TIER_REDUCED_PCT: float = 0.0050   # ≥ 0.50% DOV loss → REDUCED
+    TIER_MINIMAL_PCT: float = 0.0075   # ≥ 0.75% DOV loss → MINIMAL
+    TIER_PASSIVE_PCT: float = 0.0090   # ≥ 0.90% DOV loss → PASSIVE (no new entries)
+    TIER_HALTED_PCT:  float = 0.0100   # ≥ 1.00% DOV loss → HALTED
     MAX_CONSECUTIVE_LOSSES: int = 3
     RISK_PER_TRADE_PCT: float = 0.01
     KELLY_FRACTION: float = 0.25
