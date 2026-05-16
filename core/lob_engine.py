@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import statistics
 from datetime import datetime, timezone
@@ -43,10 +44,12 @@ class LocalOrderBook:
         self._shared_state = shared_state
         self._gap_severity: str = "CONTINUE"
         self._snapshot_count: int = 0
+        self._lock = asyncio.Lock()
+        self._last_event_time: datetime | None = None
 
     # ── Snapshot stream (depth20@100ms) ───────────────────────────────────────
 
-    def apply_snapshot(self, msg: dict) -> bool:
+    async def apply_snapshot(self, msg: dict) -> bool:
         """
         Apply a depth20@100ms full-snapshot message.
 
@@ -54,32 +57,42 @@ class LocalOrderBook:
         (stale lastUpdateId). On rejection the book is NOT cleared — it
         retains the last valid state.
         """
-        last_update_id = int(msg.get("lastUpdateId", 0))
-        bids = msg.get("bids", [])
-        asks = msg.get("asks", [])
+        async with self._lock:
+            last_update_id = int(msg.get("lastUpdateId", 0))
+            bids = msg.get("bids", [])
+            asks = msg.get("asks", [])
 
-        if self._snapshot_count > 0 and last_update_id <= self._last_update_id:
-            gap = self._last_update_id - last_update_id
-            self._gap_severity = self._classify_gap(gap)
-            if self._state != LOBStateMachineState.GAP_DETECTED:
-                self._transition(
-                    LOBStateMachineState.GAP_DETECTED,
-                    f"lastUpdateId regressed by {gap} (severity={self._gap_severity})",
-                )
-            return False
+            if self._snapshot_count > 0 and last_update_id <= self._last_update_id:
+                gap = self._last_update_id - last_update_id
+                self._gap_severity = self._classify_gap(gap)
+                if self._state != LOBStateMachineState.GAP_DETECTED:
+                    self._transition(
+                        LOBStateMachineState.GAP_DETECTED,
+                        f"lastUpdateId regressed by {gap} (severity={self._gap_severity})",
+                    )
+                return False
 
-        self._bids = {float(p): float(q) for p, q in bids}
-        self._asks = {float(p): float(q) for p, q in asks}
-        self._last_update_id = last_update_id
-        self._ready = True
-        self._snapshot_count += 1
-
-        if self._state != LOBStateMachineState.SYNCED:
-            self._transition(
-                LOBStateMachineState.SYNCED,
-                f"snapshot applied lastUpdateId={last_update_id}",
+            # Prefer exchange transaction time (T), fall back to event time (E),
+            # then wall clock — so LOBSnapshot.timestamp reflects market time not receive time.
+            raw_ts = msg.get("T") or msg.get("E")
+            self._last_event_time = (
+                datetime.fromtimestamp(raw_ts / 1000, tz=timezone.utc)
+                if raw_ts is not None
+                else datetime.now(timezone.utc)
             )
-        return True
+
+            self._bids = {float(p): float(q) for p, q in bids}
+            self._asks = {float(p): float(q) for p, q in asks}
+            self._last_update_id = last_update_id
+            self._ready = True
+            self._snapshot_count += 1
+
+            if self._state != LOBStateMachineState.SYNCED:
+                self._transition(
+                    LOBStateMachineState.SYNCED,
+                    f"snapshot applied lastUpdateId={last_update_id}",
+                )
+            return True
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -107,21 +120,22 @@ class LocalOrderBook:
 
     # ── Wall identification ───────────────────────────────────────────────────
 
-    def get_current_walls(self, sigma: float = 2.5, window: int = 5) -> list[dict]:
+    async def get_current_walls(self, sigma: float = 2.5, window: int = 5) -> list[dict]:
         """
         Scan visible book levels and return those that qualify as resting
         liquidity walls: levels where qty >= median(surrounding±window) + sigma × std.
 
         Returns list of {"price": float, "qty": float, "sigma": float, "side": str}.
         """
-        walls: list[dict] = []
-        walls.extend(
-            self._walls_in_side(sorted(self._bids.items(), reverse=True), "bid", sigma, window)
-        )
-        walls.extend(
-            self._walls_in_side(sorted(self._asks.items()), "ask", sigma, window)
-        )
-        return walls
+        async with self._lock:
+            walls: list[dict] = []
+            walls.extend(
+                self._walls_in_side(sorted(self._bids.items(), reverse=True), "bid", sigma, window)
+            )
+            walls.extend(
+                self._walls_in_side(sorted(self._asks.items()), "ask", sigma, window)
+            )
+            return walls
 
     def _walls_in_side(
         self,
@@ -206,19 +220,20 @@ class LocalOrderBook:
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
-    def get_snapshot(self, depth: int = 20) -> LOBSnapshot | None:
-        if not self._ready:
-            return None
+    async def get_snapshot(self, depth: int = 20) -> LOBSnapshot | None:
+        async with self._lock:
+            if not self._ready:
+                return None
 
-        sorted_bids = sorted(self._bids.items(), reverse=True)[:depth]
-        sorted_asks = sorted(self._asks.items())[:depth]
+            sorted_bids = sorted(self._bids.items(), reverse=True)[:depth]
+            sorted_asks = sorted(self._asks.items())[:depth]
 
-        return LOBSnapshot(
-            timestamp=datetime.now(timezone.utc),
-            bids=[LOBLevel(price=p, qty=q) for p, q in sorted_bids],
-            asks=[LOBLevel(price=p, qty=q) for p, q in sorted_asks],
-            last_update_id=self._last_update_id,
-        )
+            return LOBSnapshot(
+                timestamp=self._last_event_time or datetime.now(timezone.utc),
+                bids=[LOBLevel(price=p, qty=q) for p, q in sorted_bids],
+                asks=[LOBLevel(price=p, qty=q) for p, q in sorted_asks],
+                last_update_id=self._last_update_id,
+            )
 
     @property
     def is_ready(self) -> bool:
@@ -228,11 +243,13 @@ class LocalOrderBook:
     def lob_status(self) -> str:
         return self._state.value
 
-    def reset(self) -> None:
-        self._bids.clear()
-        self._asks.clear()
-        self._last_update_id = 0
-        self._ready = False
-        self._snapshot_count = 0
-        self._gap_severity = "CONTINUE"
-        self._transition(LOBStateMachineState.UNINITIALISED, "reset")
+    async def reset(self) -> None:
+        async with self._lock:
+            self._bids.clear()
+            self._asks.clear()
+            self._last_update_id = 0
+            self._ready = False
+            self._snapshot_count = 0
+            self._gap_severity = "CONTINUE"
+            self._last_event_time = None
+            self._transition(LOBStateMachineState.UNINITIALISED, "reset")

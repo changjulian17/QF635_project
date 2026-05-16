@@ -23,6 +23,9 @@ class FeatureParams:
     atr_period:              int   = 14
     vwap_reset_utc_midnight: bool  = True
     wall_sigma:              float = 2.5
+    cvd_delta_ticks:         int   = 5
+    vol_climax_ratio:        float = 3.0
+    vwap_atr_scale:          float = 2.0
 
 
 class FeatureComputer:
@@ -40,15 +43,15 @@ class FeatureComputer:
         self._p = params or FeatureParams()
 
         # Online stats — updated during update_candle / update_orderbook
-        self._obi_stats    = WelfordOnline()
-        self._vol_stats    = WelfordOnline()
-        self._atr_stats    = WelfordOnline()
-        self._spread_stats = WelfordOnline()
+        self._obi_stats = WelfordOnline()
+        self._vol_stats = WelfordOnline()
+        self._atr_stats = WelfordOnline()
 
-        # Candle buffers for ATR computation
-        self._highs:  deque[float] = deque(maxlen=self._p.atr_period + 2)
-        self._lows:   deque[float] = deque(maxlen=self._p.atr_period + 2)
-        self._closes: deque[float] = deque(maxlen=self._p.rsi_period + 2)
+        # Candle buffers — ATR and RSI use separate close deques (different periods)
+        self._highs:      deque[float] = deque(maxlen=self._p.atr_period + 2)
+        self._lows:       deque[float] = deque(maxlen=self._p.atr_period + 2)
+        self._atr_closes: deque[float] = deque(maxlen=self._p.atr_period + 2)
+        self._closes:     deque[float] = deque(maxlen=self._p.rsi_period + 2)
 
         # VWAP accumulators (reset at UTC midnight)
         self._tpv_sum:       float = 0.0
@@ -101,12 +104,13 @@ class FeatureComputer:
         # ATR
         self._highs.append(candle.high)
         self._lows.append(candle.low)
+        self._atr_closes.append(candle.close)
         self._closes.append(candle.close)
         self._atr = self._compute_atr()
 
         # vol_ratio: score current volume against prior distribution (causal), then update
         if self._vol_stats.n > 0:
-            mean = self._vol_stats._mean
+            mean = self._vol_stats.mean
             self._vol_ratio = candle.volume / mean if mean > 1e-9 else 1.0
         else:
             self._vol_ratio = 1.0
@@ -123,9 +127,9 @@ class FeatureComputer:
     def _compute_atr(self) -> float:
         highs  = list(self._highs)
         lows   = list(self._lows)
-        closes = list(self._closes)
+        closes = list(self._atr_closes)
         trs = []
-        for i in range(1, len(closes)):
+        for i in range(1, len(highs)):
             tr = max(
                 highs[i] - lows[i],
                 abs(highs[i] - closes[i - 1]),
@@ -188,7 +192,6 @@ class FeatureComputer:
         self._obi_zscore = self._obi_stats.zscore(obi)
 
         self._spread_bps = ((best_ask - best_bid) / mid * 10_000) if mid > 0 else 0.0
-        self._spread_stats.update(self._spread_bps)
 
         # Wall features
         if walls and mid > 0:
@@ -218,11 +221,11 @@ class FeatureComputer:
             return None
 
         atr       = self._atr if self._atr > 0 else 1.0
-        cvd_delta = cvd_calculator.get_cvd_delta(5)
+        cvd_delta = cvd_calculator.get_cvd_delta(self._p.cvd_delta_ticks)
 
-        price_vs_vwap = math.tanh((self._cur_close - self._vwap) / (2.0 * atr))
+        price_vs_vwap = math.tanh((self._cur_close - self._vwap) / (self._p.vwap_atr_scale * atr))
         vwap_reclaim  = int(self._prev_close < self._vwap <= self._cur_close)
-        vol_climax    = int(self._vol_ratio > 3.0)
+        vol_climax    = int(self._vol_ratio > self._p.vol_climax_ratio)
         cvd_positive  = int(cvd_delta > 0)
 
         return FeatureVector(

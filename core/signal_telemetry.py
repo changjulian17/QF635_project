@@ -6,12 +6,13 @@ can be analysed and the confidence scorer can be trained offline.
 """
 
 import asyncio
+import datetime
 import logging
-import os
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from config import settings
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 _FLUSH_BATCH    = 50
 _FLUSH_INTERVAL = 10.0   # seconds
+_MAX_BUF        = 500    # hard cap — ~10× _FLUSH_BATCH; prevents OOM on persistent DB error
 
 
 @dataclass
@@ -49,7 +51,6 @@ class SignalRecord:
 
 
 def _now_iso() -> str:
-    import datetime
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
@@ -74,10 +75,25 @@ class SignalTelemetry:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = self._open_db()
         logger.info("[Telemetry] Recording signals to %s", self._db_path)
-        await self._drain_loop()
+        try:
+            await self._drain_loop()
+        except asyncio.CancelledError:
+            await self._flush_remaining()
+            raise
+        finally:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+
+    async def close(self) -> None:
+        """Flush remaining records and close the DB connection."""
+        await self._flush_remaining()
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
     async def _drain_loop(self) -> None:
         while True:
@@ -89,6 +105,15 @@ class SignalTelemetry:
             except asyncio.TimeoutError:
                 if self._buf:
                     await self._flush()
+
+    async def _flush_remaining(self) -> None:
+        """Drain the queue into the buffer and flush — called on shutdown."""
+        while not self._queue.empty():
+            try:
+                self._buf.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        await self._flush()
 
     # ── Flush ─────────────────────────────────────────────────────────────────
 
@@ -125,7 +150,14 @@ class SignalTelemetry:
             logger.debug("[Telemetry] Flushed %d records.", len(rows))
         except sqlite3.Error as exc:
             logger.error("[Telemetry] Flush failed: %s", exc)
-            self._buf = rows + self._buf   # re-queue on transient error
+            combined = rows + self._buf
+            if len(combined) > _MAX_BUF:
+                logger.warning(
+                    "[Telemetry] Buffer overflow — dropping %d newest records (cap=%d).",
+                    len(combined) - _MAX_BUF, _MAX_BUF,
+                )
+                combined = combined[:_MAX_BUF]   # keep oldest for audit trail
+            self._buf = combined
 
     def update_outcome(
         self,

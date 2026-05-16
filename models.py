@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from datetime import datetime, timezone
@@ -211,6 +212,25 @@ class MicroSignal:
     cvd_std:           float = 0.0     # CVD spike in std multiples
     price_move_pct:    float = 0.0
     confidence:        float = 0.0     # filled by StrategyExecutor after scoring
+
+
+@dataclass
+class MicroOrderRequest:
+    """Executable output of StrategyExecutor; sent to the micro-execution layer."""
+    micro_signal:   "MicroSignal"
+    signal_id:      str          # links back to SignalRecord for telemetry outcome updates
+    order_type:     str          # "IOC_LIMIT"
+    side:           str          # "BUY" | "SELL"
+    limit_price:    Optional[float]  # None = taker (execution layer resolves via LOB); float = explicit IOC limit
+    ioc_timeout_ms: int
+    confidence:     float
+    notional_hint:  float        # risk fraction of equity = RISK_PCT × KELLY × confidence;
+                                 # execution layer: qty = (equity × notional_hint) / abs(entry − protection_wall)
+    fill_event:            asyncio.Event = field(default_factory=asyncio.Event)
+                                         # execution layer calls .set() on confirmed fill
+    position_closed_event: asyncio.Event = field(default_factory=asyncio.Event)
+                                         # execution layer calls .set() when position exits (TP/SL/manual);
+                                         # Gate 6 monitor exits cleanly without firing the wall-removed alert
 
 
 @dataclass

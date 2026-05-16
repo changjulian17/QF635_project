@@ -209,6 +209,16 @@ def test_wall_not_detected_when_no_walls():
     assert fc._wall_distance_bps == 0.0
 
 
+# ── ATR with mismatched rsi/atr periods ──────────────────────────────────────
+
+def test_atr_no_crash_when_rsi_period_gt_atr_period():
+    """rsi_period > atr_period previously caused IndexError in _compute_atr."""
+    fc = FeatureComputer(FeatureParams(rsi_period=20, atr_period=10))
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    for i in range(25):
+        fc.update_candle(_candle(close=100.0 + i * 0.1, dt=base + timedelta(minutes=i)))
+
+
 # ── spread_bps ────────────────────────────────────────────────────────────────
 
 def test_spread_bps_correct():

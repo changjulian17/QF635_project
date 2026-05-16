@@ -1,29 +1,35 @@
 """
 7-Gate Strategy Executor — evaluates every MicroSignal through a sequential
-gate pipeline and emits approved OrderRequests with full telemetry at each exit.
+gate pipeline and emits approved MicroOrderRequests with full telemetry at each exit.
 
 Gates (master arch §5.5):
   Gate 0 — Data Fidelity     (LOB SYNCED + heartbeat not CRITICAL)
-  Gate 1 — Microstructure    (confirmed Sweep+Protection signal)
+  Gate 1 — Microstructure    (confirmed Sweep+Protection+prior Absorption signal)
   Gate 2 — Confidence        (rule-based scorer >= MIN_CONFIDENCE)
   Gate 3 — Capital           (daily budget remaining)
-  Gate 4 — Order Selection   (spread within acceptable range)
+  Gate 4 — Order Selection   (spread within session-aware p95 range)
   Gate 5 — Execution Sync    (signal not stale)
   Gate 6 — Persistence       (post-entry; protection wall still present)
 """
 
 import asyncio
 import logging
+import math
 import time
-from typing import Optional
 
 from config import settings
-from core.signal_telemetry import SignalRecord, SignalTelemetry
-from models import FeatureVector, MicroSignal, SharedState
+from core.cvd import WelfordOnline
+from core.signal_telemetry import SignalRecord
+from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState
 
 logger = logging.getLogger(__name__)
 
 _IOC_STALE_MS = settings.IOC_TIMEOUT_MS   # signal older than this is rejected
+
+
+def _wall_present(price: float, walls: list[dict], tol: float = 0.01) -> bool:
+    """Tolerance-aware wall lookup. Avoids false absences from float repr drift."""
+    return any(abs(w["price"] - price) <= tol for w in walls)
 
 
 # ── Gate functions ────────────────────────────────────────────────────────────
@@ -43,6 +49,8 @@ def gate_1_microstructure(signal: MicroSignal, absorption_armed: bool) -> tuple[
         return False, "no consumed wall"
     if signal.protection_wall is None:
         return False, "no protection wall"
+    if not absorption_armed:
+        return False, "protection wall has no prior absorption"
     return True, ""
 
 
@@ -66,7 +74,6 @@ def gate_3_capital(budget, tier: str) -> tuple[bool, str]:
 
 
 def gate_4_order_selection(
-    signal: MicroSignal,
     spread_bps: float,
     spread_p95: float,
 ) -> tuple[bool, str, str]:
@@ -130,21 +137,50 @@ class PersistenceMonitor:
         position_side: str,
         lob_engine,
         order_manager,
+        position_closed_event: asyncio.Event,
         check_interval_ms: int = 200,
     ) -> None:
         interval = check_interval_ms / 1000.0
         while True:
-            await asyncio.sleep(interval)
-            walls = lob_engine.get_current_walls()
-            wall_prices = {w["price"] for w in walls}
-            if protection_wall_price not in wall_prices:
+            # Race the poll interval against position-closed. If the position exits
+            # normally (TP/SL), stop quietly without firing the wall-removed alert.
+            try:
+                await asyncio.wait_for(position_closed_event.wait(), timeout=interval)
+                logger.debug(
+                    "[Gate6] Position closed — stopping monitor for wall %.2f",
+                    protection_wall_price,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            walls = await lob_engine.get_current_walls()
+            if not _wall_present(protection_wall_price, walls):
                 logger.warning(
                     "[Gate6] Protection wall at %.2f removed — alerting order manager",
                     protection_wall_price,
                 )
                 if hasattr(order_manager, "handle_protection_wall_removed"):
                     await order_manager.handle_protection_wall_removed(position_side)
-                break
+                return
+
+
+# ── Null CVD fallback ─────────────────────────────────────────────────────────
+
+class _NullCVD:
+    """Stands in when no CVD calculator is injected. Warns once per instance."""
+
+    def __init__(self) -> None:
+        self._warned = False
+
+    def get_cvd_delta(self, ticks: int = 5) -> float:
+        if not self._warned:
+            logger.warning(
+                "[Executor] No CVD calculator injected — cvd_delta forced to 0; "
+                "inject explicitly for accurate confidence scoring"
+            )
+            self._warned = True
+        return 0.0
 
 
 # ── Strategy Executor ─────────────────────────────────────────────────────────
@@ -152,8 +188,16 @@ class PersistenceMonitor:
 class StrategyExecutor:
     """
     Runs MicroSignals through all 7 gates. Emits telemetry at every gate exit
-    (pass and fail). Approved signals are forwarded to signal_queue.
+    (pass and fail). Approved signals become MicroOrderRequests forwarded to
+    signal_queue. Gate 6 (PersistenceMonitor) starts as a background task
+    after approval when lob_engine and order_manager are injected.
+
+    Telemetry is non-blocking: put_nowait drops records if the queue is full
+    rather than stalling the approval-to-order path.
     """
+
+    _SPREAD_P95_COLD_START = 5.0   # fallback until ≥10 spread samples observed
+    _SPREAD_P95_FACTOR     = 1.64  # normal approximation for 95th percentile
 
     def __init__(
         self,
@@ -164,17 +208,45 @@ class StrategyExecutor:
         shared_state: SharedState,
         budget=None,
         rule_scorer=None,
-        spread_p95: float = 5.0,
+        cvd_calculator=None,
+        lob_engine=None,
+        order_manager=None,
+        gate6_check_interval_ms: int = 200,
     ) -> None:
-        self._micro_q   = micro_signal_queue
-        self._signal_q  = signal_queue
-        self._telem_q   = telemetry_queue
-        self._fc        = feature_computer
-        self._state     = shared_state
-        self._budget    = budget
-        self._scorer    = rule_scorer or RuleBasedScorer()
-        self._spread_p95 = spread_p95
+        self._micro_q       = micro_signal_queue
+        self._signal_q      = signal_queue
+        self._telem_q       = telemetry_queue
+        self._fc            = feature_computer
+        self._state         = shared_state
+        self._budget        = budget
+        self._scorer        = rule_scorer or RuleBasedScorer()
         self._risk_tier: str = "FULL"
+        self._lob_engine    = lob_engine
+        self._order_manager = order_manager
+
+        if cvd_calculator is None:
+            logger.warning(
+                "[Executor] No CVD calculator injected — using null fallback; "
+                "inject cvd_calculator for accurate confidence scoring"
+            )
+        self._cvd = cvd_calculator or _NullCVD()
+
+        # Log-space spread tracker — correct for right-skewed spread distributions.
+        # Stores log(spread_bps) so p95 = exp(log_mean + 1.64 × log_std), which
+        # handles the fat right tail that mean+1.64σ in linear space underestimates.
+        self._log_spread_stats = WelfordOnline()
+
+        # Tracked Gate 6 tasks (persistence monitors + their fill-wait watchers).
+        self._gate6_tasks: set[asyncio.Task] = set()
+        self._gate6_check_ms = gate6_check_interval_ms
+
+    @property
+    def _spread_p95(self) -> float:
+        """Session-aware 95th-percentile spread via log-normal approximation."""
+        if self._log_spread_stats.n < 10:
+            return self._SPREAD_P95_COLD_START
+        log_p95 = self._log_spread_stats.mean + self._SPREAD_P95_FACTOR * self._log_spread_stats.std
+        return math.exp(log_p95)
 
     async def run(self) -> None:
         while True:
@@ -192,73 +264,155 @@ class StrategyExecutor:
             self._state.lob_status, self._state.heartbeat_status
         )
         if not ok:
-            await self._reject(rec, "GATE_0_FAIL", reason)
+            self._reject(rec, "GATE_0_FAIL", reason)
             return
 
-        # Gate 1 — microstructure
+        # Gate 1 — microstructure (prior absorption on protection wall required)
         ok, reason = gate_1_microstructure(signal, signal.prior_absorption)
         if not ok:
-            await self._reject(rec, "GATE_1_FAIL", reason)
+            self._reject(rec, "GATE_1_FAIL", reason)
             return
 
         # Gate 2 — confidence
-        fv = self._fc.compute(
-            cvd_calculator=self._fc._cvd if hasattr(self._fc, "_cvd") else _NullCVD(),
-            shared_state=self._state,
-        ) if hasattr(self._fc, "compute") else None
+        fv = self._fc.compute(cvd_calculator=self._cvd, shared_state=self._state)
 
         if fv is None:
-            await self._reject(rec, "GATE_2_FAIL", "feature vector not ready")
+            self._reject(rec, "GATE_2_FAIL", "feature vector not ready")
             return
 
+        # Snapshot current p95 BEFORE including this bar (causal), then update in log-space
+        spread_p95 = self._spread_p95
+        self._log_spread_stats.update(math.log(max(fv.spread_bps, 1e-4)))
+
         ok, reason, confidence = gate_2_confidence(fv, signal, self._scorer)
-        rec.confidence   = confidence
-        rec.obi_zscore   = fv.obi_zscore
-        rec.cvd_delta    = fv.cvd_delta
-        rec.spread_bps   = fv.spread_bps
-        rec.lob_status   = fv.lob_status
+        rec.confidence       = confidence
+        rec.obi_zscore       = fv.obi_zscore
+        rec.cvd_delta        = fv.cvd_delta
+        rec.spread_bps       = fv.spread_bps
+        rec.lob_status       = fv.lob_status
         rec.heartbeat_status = self._state.heartbeat_status
         if not ok:
-            await self._reject(rec, "GATE_2_FAIL", reason)
+            self._reject(rec, "GATE_2_FAIL", reason)
             return
 
         # Gate 3 — capital
         ok, reason = gate_3_capital(self._budget, self._risk_tier)
         if not ok:
-            await self._reject(rec, "GATE_3_FAIL", reason)
+            self._reject(rec, "GATE_3_FAIL", reason)
             return
 
-        # Gate 4 — order selection
-        ok, reason, order_type = gate_4_order_selection(
-            signal, fv.spread_bps, self._spread_p95
-        )
+        # Gate 4 — order selection (session-aware spread p95)
+        ok, reason, order_type = gate_4_order_selection(fv.spread_bps, spread_p95)
         if not ok:
-            await self._reject(rec, "GATE_4_FAIL", reason)
+            self._reject(rec, "GATE_4_FAIL", reason)
             return
 
         # Gate 5 — execution sync
         ok, reason = gate_5_execution_sync(signal.timestamp_ms, self._state.last_delta_ms)
         if not ok:
-            await self._reject(rec, "GATE_5_FAIL", reason)
+            self._reject(rec, "GATE_5_FAIL", reason)
             return
 
-        # All gates passed
-        signal.confidence = confidence
+        # All gates passed — assemble executable order request
         rec.gate_passed = "APPROVED"
-        await self._telem_q.put(rec)
-        await self._signal_q.put(signal)
+        self._emit_telemetry(rec)
+
+        # notional_hint = risk fraction of equity; execution layer applies:
+        #   qty = (equity × notional_hint) / abs(entry_price − protection_wall_price)
+        notional_hint = round(
+            confidence * settings.KELLY_FRACTION * settings.RISK_PER_TRADE_PCT, 6
+        )
+        order_req = MicroOrderRequest(
+            micro_signal   = signal,
+            signal_id      = rec.signal_id,
+            order_type     = order_type,
+            side           = "BUY" if signal.direction == "LONG" else "SELL",
+            limit_price    = None,   # execution layer resolves via live LOB
+            ioc_timeout_ms = _IOC_STALE_MS,
+            confidence     = confidence,
+            notional_hint  = notional_hint,
+        )
+        await self._signal_q.put(order_req)
         logger.info(
-            "[Executor] APPROVED %s %s confidence=%.3f",
-            signal.direction, signal.signal_type, confidence,
+            "[Executor] APPROVED %s %s confidence=%.3f order_type=%s notional_hint=%.4f%%",
+            signal.direction, signal.signal_type, confidence, order_type,
+            notional_hint * 100,
         )
 
-    async def _reject(self, rec: SignalRecord, gate: str, reason: str) -> None:
+        # Gate 6 — watch for fill confirmation, then start persistence monitor.
+        # Guard at call site: no task is created when Gate 6 deps are absent.
+        if self._lob_engine and self._order_manager and signal.protection_wall:
+            watch = asyncio.create_task(
+                self._gate6_watch(
+                    fill_event=order_req.fill_event,
+                    position_closed_event=order_req.position_closed_event,
+                    signal=signal,
+                    signal_id=rec.signal_id,
+                ),
+                name=f"gate6_watch_{rec.signal_id[:8]}",
+            )
+            watch.add_done_callback(self._on_gate6_task_done)
+            self._gate6_tasks.add(watch)
+        else:
+            logger.debug("[Gate6] Skipped — lob_engine/order_manager not injected")
+
+    async def _gate6_watch(
+        self,
+        fill_event: asyncio.Event,
+        position_closed_event: asyncio.Event,
+        signal: MicroSignal,
+        signal_id: str,
+    ) -> None:
+        """
+        Waits for fill confirmation then starts PersistenceMonitor.
+        Only created when lob_engine, order_manager, and protection_wall are all present
+        (guarded at call site). Exits silently if the fill never arrives within the timeout.
+        """
+        fill_timeout = _IOC_STALE_MS * 10 / 1000.0
+        try:
+            await asyncio.wait_for(fill_event.wait(), timeout=fill_timeout)
+        except asyncio.TimeoutError:
+            logger.debug(
+                "[Gate6] No fill confirmation for %s within %.0fms — monitor not started",
+                signal_id[:8], fill_timeout * 1000,
+            )
+            return
+
+        logger.info(
+            "[Gate6] Fill confirmed for %s — starting persistence monitor on wall %.2f",
+            signal_id[:8], signal.protection_wall.price,
+        )
+        mon = asyncio.create_task(
+            PersistenceMonitor().monitor(
+                protection_wall_price=signal.protection_wall.price,
+                position_side=signal.direction,
+                lob_engine=self._lob_engine,
+                order_manager=self._order_manager,
+                position_closed_event=position_closed_event,
+                check_interval_ms=self._gate6_check_ms,
+            ),
+            name=f"gate6_persistence_{signal_id[:8]}",
+        )
+        mon.add_done_callback(self._on_gate6_task_done)
+        self._gate6_tasks.add(mon)
+
+    def _on_gate6_task_done(self, task: asyncio.Task) -> None:
+        self._gate6_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(
+                "[Gate6] Task %s crashed: %s", task.get_name(), task.exception()
+            )
+
+    def _reject(self, rec: SignalRecord, gate: str, reason: str) -> None:
         rec.gate_passed      = gate
         rec.rejection_reason = reason
-        await self._telem_q.put(rec)
+        self._emit_telemetry(rec)
         logger.debug("[Executor] %s: %s", gate, reason)
 
-
-class _NullCVD:
-    def get_cvd_delta(self, bars: int = 5) -> float:
-        return 0.0
+    def _emit_telemetry(self, rec: SignalRecord) -> None:
+        try:
+            self._telem_q.put_nowait(rec)
+        except asyncio.QueueFull:
+            logger.warning(
+                "[Executor] Telemetry queue full — record dropped (gate=%s)", rec.gate_passed
+            )

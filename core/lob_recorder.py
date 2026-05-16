@@ -27,9 +27,12 @@ _STREAMS = (
     f"{settings.SYMBOL.lower()}@depth20@100ms",
     f"{settings.SYMBOL.lower()}@aggTrade",
 )
-_FLUSH_RECORDS = 500
+_FLUSH_RECORDS = 100
 _FLUSH_SECONDS = 5.0
 _MAX_RECONNECT_DELAY = 60.0
+_MAX_BUFFER_SIZE = 10_000
+_RETENTION_DAYS = 7
+_CLEANUP_INTERVAL = 86_400.0
 
 
 class LOBRecorder:
@@ -46,6 +49,7 @@ class LOBRecorder:
         self._reconnect_delay: float = 1.0
         self._running: bool = False
         self._conn: sqlite3.Connection | None = None
+        self._flush_lock = asyncio.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -54,7 +58,15 @@ class LOBRecorder:
         os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
         self._conn = self._open_db()
         logger.info("[LOBRec] Recording to %s", self._db_path)
-        await self._connect_loop()
+        cleanup_task = asyncio.create_task(self._cleanup_loop())
+        try:
+            await self._connect_loop()
+        finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
 
     async def stop(self) -> None:
         self._running = False
@@ -109,7 +121,7 @@ class LOBRecorder:
                 event_type = msg.get("e")
 
                 if "depth20" in stream:
-                    ts = int(time.time() * 1000)
+                    ts = int(msg.get("T") or msg.get("E") or time.time() * 1000)
                     self._depth_buf.append((
                         ts,
                         json.dumps(msg.get("bids", [])),
@@ -140,12 +152,33 @@ class LOBRecorder:
     async def _flush(self) -> None:
         if not self._conn:
             return
-        depth_rows = self._depth_buf[:]
-        trade_rows = self._trade_buf[:]
-        self._depth_buf.clear()
-        self._trade_buf.clear()
-        self._last_flush = time.monotonic()
+        async with self._flush_lock:
+            depth_rows = self._depth_buf[:]
+            trade_rows = self._trade_buf[:]
+            self._depth_buf.clear()
+            self._trade_buf.clear()
+            self._last_flush = time.monotonic()
 
+            success = await asyncio.to_thread(self._flush_sync, depth_rows, trade_rows)
+
+            if not success:
+                combined_depth = depth_rows + self._depth_buf
+                combined_trade = trade_rows + self._trade_buf
+                if len(combined_depth) > _MAX_BUFFER_SIZE:
+                    logger.warning(
+                        "[LOBRec] Buffer cap hit; dropping %d depth rows.",
+                        len(combined_depth) - _MAX_BUFFER_SIZE,
+                    )
+                if len(combined_trade) > _MAX_BUFFER_SIZE:
+                    logger.warning(
+                        "[LOBRec] Buffer cap hit; dropping %d trade rows.",
+                        len(combined_trade) - _MAX_BUFFER_SIZE,
+                    )
+                self._depth_buf = combined_depth[:_MAX_BUFFER_SIZE]
+                self._trade_buf = combined_trade[:_MAX_BUFFER_SIZE]
+
+    def _flush_sync(self, depth_rows: list, trade_rows: list) -> bool:
+        """Synchronous DB write — runs in a thread pool via asyncio.to_thread."""
         try:
             cur = self._conn.cursor()
             if depth_rows:
@@ -163,11 +196,27 @@ class LOBRecorder:
                 "[LOBRec] Flushed %d snapshots, %d trades.",
                 len(depth_rows), len(trade_rows),
             )
+            return True
         except sqlite3.Error as exc:
             logger.error("[LOBRec] DB write failed: %s", exc)
-            # Re-queue rows so they aren't lost on transient errors
-            self._depth_buf = depth_rows + self._depth_buf
-            self._trade_buf = trade_rows + self._trade_buf
+            return False
+
+    async def _cleanup_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(_CLEANUP_INTERVAL)
+            if self._conn:
+                await asyncio.to_thread(self._purge_old_records)
+
+    def _purge_old_records(self) -> None:
+        cutoff_ms = int((time.time() - _RETENTION_DAYS * 86_400) * 1000)
+        try:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM depth_snapshots WHERE ts_event < ?", (cutoff_ms,))
+            cur.execute("DELETE FROM agg_trades WHERE ts_event < ?", (cutoff_ms,))
+            self._conn.commit()
+            logger.info("[LOBRec] Purged records older than %d days.", _RETENTION_DAYS)
+        except sqlite3.Error as exc:
+            logger.error("[LOBRec] Cleanup failed: %s", exc)
 
     def _open_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -198,7 +247,7 @@ class LOBRecorder:
     # ── Health ────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
-        """Return row counts and DB file size. Used by the health dashboard."""
+        """Return row counts (DB + unflushed buffer) and DB file size."""
         if not self._conn:
             return {"depth_rows": 0, "trade_rows": 0, "db_size_bytes": 0}
         try:
@@ -210,8 +259,8 @@ class LOBRecorder:
             ).fetchone()[0]
             db_size = os.path.getsize(self._db_path) if os.path.exists(self._db_path) else 0
             return {
-                "depth_rows": depth_rows,
-                "trade_rows": trade_rows,
+                "depth_rows": depth_rows + len(self._depth_buf),
+                "trade_rows": trade_rows + len(self._trade_buf),
                 "db_size_bytes": db_size,
             }
         except sqlite3.Error:

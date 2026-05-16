@@ -56,20 +56,20 @@ def test_cvd_delta_insufficient_history():
     assert cvd.get_cvd_delta(5) == 0.0
 
 
-def test_cvd_delta_default_bars():
-    """Default bars=5 should be consistent with explicit bars=5."""
+def test_cvd_delta_default_ticks():
+    """Default ticks=5 should be consistent with explicit ticks=5."""
     cvd = CVDCalculator()
     for _ in range(10):
         cvd.update(_trade(1.0, is_buyer_maker=False))
     assert cvd.get_cvd_delta() == cvd.get_cvd_delta(5)
 
 
-def test_cvd_std_positive_after_trades():
+def test_cvd_tick_std_positive_after_trades():
     cvd = CVDCalculator()
     # Mix of buys and sells to create variance
     for i in range(20):
         cvd.update(_trade(float(i % 3 + 1), is_buyer_maker=(i % 2 == 0)))
-    assert cvd.get_cvd_std() > 0.0
+    assert cvd.get_cvd_tick_std() > 0.0
 
 
 def test_reset_daily_clears_state():
@@ -79,7 +79,7 @@ def test_reset_daily_clears_state():
     cvd.reset_daily()
     assert cvd.get_cvd() == 0.0
     assert cvd.get_cvd_delta(5) == 0.0
-    assert cvd.get_cvd_std() == 0.0
+    assert cvd.get_cvd_tick_std() == 0.0
 
 
 # ── WelfordOnline ──────────────────────────────────────────────────────────────

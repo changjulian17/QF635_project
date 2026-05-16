@@ -236,7 +236,7 @@ class MicrostructureDetector:
                 break
 
         # Sweep + Protection check
-        cvd_std = self._cvd.get_cvd_std()
+        cvd_std = self._cvd.get_cvd_tick_std()
         cvd_spike_std = abs(cvd_delta_1t) / cvd_std if cvd_std > 1e-9 else 0.0
 
         for price, ws in list(self._wall_states.items()):

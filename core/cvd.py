@@ -27,6 +27,10 @@ class WelfordOnline:
         self._M2 += delta * (value - self._mean)
 
     @property
+    def mean(self) -> float:
+        return self._mean
+
+    @property
     def variance(self) -> float:
         return self._M2 / (self.n - 1) if self.n > 1 else 0.0
 
@@ -83,14 +87,14 @@ class CVDCalculator:
         """Current cumulative volume delta."""
         return self._cvd
 
-    def get_cvd_delta(self, bars: int = 5) -> float:
-        """CVD change over the last `bars` ticks. Returns 0.0 if insufficient history."""
-        if len(self._history) <= bars:
+    def get_cvd_delta(self, ticks: int = 5) -> float:
+        """CVD change over the last `ticks` ticks. Returns 0.0 if insufficient history."""
+        if len(self._history) <= ticks:
             return 0.0
-        return self._history[-1] - self._history[-1 - bars]
+        return self._history[-1] - self._history[-1 - ticks]
 
-    def get_cvd_std(self) -> float:
-        """Welford online std of per-tick CVD deltas."""
+    def get_cvd_tick_std(self) -> float:
+        """Welford online std of per-trade signed quantity (each trade's contribution to CVD, i.e. per-tick CVD change)."""
         return self._delta_stats.std
 
     def reset_daily(self) -> None:
