@@ -1,0 +1,399 @@
+"""Tests for the 7-gate StrategyExecutor in strategy/executor.py."""
+import asyncio
+import time
+
+import pytest
+
+from strategy.executor import (
+    PersistenceMonitor,
+    RuleBasedScorer,
+    StrategyExecutor,
+    _wall_present,
+    gate_0_data_fidelity,
+    gate_1_microstructure,
+    gate_2_confidence,
+    gate_3_capital,
+    gate_4_order_selection,
+    gate_5_execution_sync,
+)
+from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState, WallState
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _wall(side: str = "ask") -> WallState:
+    now = int(time.time() * 1000)
+    return WallState(
+        price=30000.0, qty_initial=50.0, qty_current=5.0,
+        first_seen_ts=now - 600, last_seen_ts=now,
+        side=side, sigma=3.0,
+    )
+
+
+def _signal(direction: str = "LONG", age_ms: int = 10, prior_absorption: bool = True) -> MicroSignal:
+    return MicroSignal(
+        signal_type      = "SWEEP_WITH_PROTECTION",
+        direction        = direction,
+        timestamp_ms     = int(time.time() * 1000) - age_ms,
+        consumed_wall    = _wall("ask"),
+        protection_wall  = _wall("bid"),
+        prior_absorption = prior_absorption,
+    )
+
+
+def _fv(**kwargs) -> FeatureVector:
+    defaults = dict(
+        lob_status="SYNCED", obi_zscore=0.5, cvd_delta=1.0,
+        vol_ratio=2.0, spread_bps=3.0, cvd_positive=1,
+        rsi_value=55.0,
+    )
+    defaults.update(kwargs)
+    return FeatureVector(**defaults)
+
+
+# ── Gate 0 ────────────────────────────────────────────────────────────────────
+
+def test_gate0_fails_on_stale_lob():
+    ok, reason = gate_0_data_fidelity("GAP_DETECTED", "HEALTHY")
+    assert ok is False
+    assert "GAP_DETECTED" in reason
+
+
+def test_gate0_fails_on_heartbeat_critical():
+    ok, reason = gate_0_data_fidelity("SYNCED", "CRITICAL")
+    assert ok is False
+    assert "CRITICAL" in reason
+
+
+def test_gate0_passes_when_healthy():
+    ok, _ = gate_0_data_fidelity("SYNCED", "HEALTHY")
+    assert ok is True
+
+
+def test_gate0_passes_degraded_heartbeat():
+    ok, _ = gate_0_data_fidelity("SYNCED", "DEGRADED")
+    assert ok is True
+
+
+# ── Gate 1 ────────────────────────────────────────────────────────────────────
+
+def test_gate1_fails_without_sweep():
+    sig = MicroSignal(signal_type="UNKNOWN", direction="LONG", timestamp_ms=0)
+    ok, reason = gate_1_microstructure(sig, False)
+    assert ok is False
+
+
+def test_gate1_fails_missing_consumed_wall():
+    sig = MicroSignal(
+        signal_type="SWEEP_WITH_PROTECTION", direction="LONG",
+        timestamp_ms=0, consumed_wall=None, protection_wall=_wall("bid"),
+    )
+    ok, reason = gate_1_microstructure(sig, False)
+    assert ok is False
+
+
+def test_gate1_passes_valid_signal():
+    ok, _ = gate_1_microstructure(_signal(), True)
+    assert ok is True
+
+
+def test_gate1_fails_no_absorption():
+    ok, reason = gate_1_microstructure(_signal(), False)
+    assert ok is False
+    assert "absorption" in reason.lower()
+
+
+# ── Gate 2 ────────────────────────────────────────────────────────────────────
+
+def test_gate2_fails_below_confidence():
+    scorer = RuleBasedScorer()
+    fv = _fv(obi_zscore=-5.0, cvd_positive=0, vol_ratio=0.1, spread_bps=20.0)
+    ok, reason, score = gate_2_confidence(fv, _signal("LONG"), scorer)
+    assert ok is False
+    assert score < 0.58
+
+
+def test_gate2_passes_above_confidence():
+    scorer = RuleBasedScorer()
+    fv = _fv(obi_zscore=1.0, cvd_positive=1, vol_ratio=3.0, spread_bps=3.0)
+    ok, reason, score = gate_2_confidence(fv, _signal("LONG"), scorer)
+    assert ok is True
+    assert score >= 0.58
+
+
+# ── Gate 3 ────────────────────────────────────────────────────────────────────
+
+def test_gate3_fails_when_halted():
+    ok, reason = gate_3_capital(None, "HALTED")
+    assert ok is False
+
+
+def test_gate3_passes_full_tier():
+    ok, _ = gate_3_capital(None, "FULL")
+    assert ok is True
+
+
+# ── Gate 4 ────────────────────────────────────────────────────────────────────
+
+def test_gate4_fails_on_wide_spread():
+    ok, reason, _ = gate_4_order_selection(spread_bps=50.0, spread_p95=5.0)
+    assert ok is False
+    assert "spread" in reason.lower()
+
+
+def test_gate4_passes_normal_spread():
+    ok, _, order_type = gate_4_order_selection(spread_bps=3.0, spread_p95=5.0)
+    assert ok is True
+    assert order_type == "IOC_LIMIT"
+
+
+# ── Wall presence helper ──────────────────────────────────────────────────────
+
+def test_wall_present_exact_match():
+    assert _wall_present(30000.0, [{"price": 30000.0}])
+
+
+def test_wall_present_float_drift():
+    assert _wall_present(30000.0, [{"price": 30000.005}])   # within 1 cent tol
+
+
+def test_wall_present_outside_tolerance():
+    assert not _wall_present(30000.0, [{"price": 30001.0}])
+
+
+def test_wall_present_empty_book():
+    assert not _wall_present(30000.0, [])
+
+
+# ── Gate 5 ────────────────────────────────────────────────────────────────────
+
+def test_gate5_fails_on_stale_signal():
+    ok, reason = gate_5_execution_sync(
+        signal_timestamp_ms=int(time.time() * 1000) - 5000,
+        last_delta_ms=10.0,
+    )
+    assert ok is False
+    assert "stale" in reason.lower()
+
+
+def test_gate5_fails_on_high_latency():
+    ok, reason = gate_5_execution_sync(
+        signal_timestamp_ms=int(time.time() * 1000),
+        last_delta_ms=600.0,
+    )
+    assert ok is False
+
+
+def test_gate5_passes_fresh_signal():
+    ok, _ = gate_5_execution_sync(
+        signal_timestamp_ms=int(time.time() * 1000) - 10,
+        last_delta_ms=50.0,
+    )
+    assert ok is True
+
+
+# ── RuleBasedScorer ───────────────────────────────────────────────────────────
+
+def test_scorer_max_score_long():
+    scorer = RuleBasedScorer()
+    fv  = _fv(obi_zscore=1.0, vol_ratio=4.0, spread_bps=3.0, cvd_positive=1)
+    sig = _signal("LONG")
+    score = scorer.score(fv, sig)
+    assert score == pytest.approx(1.0)
+
+
+def test_scorer_zero_score_misaligned():
+    scorer = RuleBasedScorer()
+    fv  = _fv(obi_zscore=-5.0, vol_ratio=0.0, spread_bps=20.0, cvd_positive=0)
+    sig = _signal("LONG")
+    score = scorer.score(fv, sig)
+    assert score == pytest.approx(0.0)
+
+
+# ── Full executor integration ─────────────────────────────────────────────────
+
+class _MockFC:
+    """Feature computer stub that always returns a passing FeatureVector."""
+    def compute(self, cvd_calculator, shared_state, **kwargs):
+        return _fv(obi_zscore=1.0, cvd_positive=1, vol_ratio=3.0, spread_bps=3.0)
+
+
+def test_approved_order_request_contract():
+    """MicroOrderRequest must carry the full executable contract after approval."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+        )
+        await ex._evaluate(_signal())
+        await asyncio.sleep(0)  # let gate6_watch task run and self-terminate
+
+        req: MicroOrderRequest = await signal_q.get()
+        assert req.order_type == "IOC_LIMIT"
+        assert req.side == "BUY"
+        assert req.limit_price is None              # execution layer resolves via LOB
+        assert req.notional_hint > 0.0              # Kelly × risk_pct × confidence
+        assert isinstance(req.fill_event, asyncio.Event)
+        assert not req.fill_event.is_set()          # unsignalled until execution layer fills
+        assert req.signal_id != ""
+
+    asyncio.run(_run())
+
+
+def test_gate6_watch_starts_monitor_after_fill():
+    """Gate 6 persistence monitor must not start until fill_event is set."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        class _MockLOB:
+            async def get_current_walls(self):
+                return []   # wall absent immediately → monitor exits on first check
+
+        class _MockOM:
+            received = False
+            async def handle_protection_wall_removed(self, side):
+                _MockOM.received = True
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+            lob_engine=_MockLOB(),
+            order_manager=_MockOM(),
+            gate6_check_interval_ms=5,   # fast polling for test
+        )
+        await ex._evaluate(_signal())
+        req: MicroOrderRequest = await signal_q.get()
+
+        assert ex._gate6_tasks, "watch task should be tracked before fill"
+        req.fill_event.set()                       # simulate execution layer confirming fill
+        await asyncio.sleep(0.05)                  # 50ms >> 5ms check interval
+
+        # gate6_tasks transitions: watch exits → monitor starts → wall absent → monitor exits
+        # after sleep both should have cleaned up (wall returns empty list immediately)
+        assert _MockOM.received, "order_manager should have been notified of wall removal"
+
+    asyncio.run(_run())
+
+
+def test_gate6_monitor_stops_on_position_closed():
+    """Monitor must exit cleanly without firing the wall alert when position closes normally."""
+    async def _run():
+        class _MockLOB:
+            async def get_current_walls(self):
+                return [{"price": 30000.0}]   # wall always present
+
+        class _MockOM:
+            alerted = False
+            async def handle_protection_wall_removed(self, side):
+                _MockOM.alerted = True
+
+        closed_event = asyncio.Event()
+        task = asyncio.create_task(
+            PersistenceMonitor().monitor(
+                protection_wall_price=30000.0,
+                position_side="LONG",
+                lob_engine=_MockLOB(),
+                order_manager=_MockOM(),
+                position_closed_event=closed_event,
+                check_interval_ms=5,
+            )
+        )
+        closed_event.set()                  # position exits via TP/SL
+        await asyncio.sleep(0.05)
+
+        assert task.done(), "monitor should have stopped after position closed"
+        assert not _MockOM.alerted, "should not alert order_manager on normal position exit"
+
+    asyncio.run(_run())
+
+
+def test_spread_p95_log_space():
+    """Log-space p95 must exceed the linear-space approximation for right-skewed data."""
+    import math as _math
+
+    state = SharedState()
+    ex = StrategyExecutor(
+        micro_signal_queue=asyncio.Queue(),
+        signal_queue=asyncio.Queue(),
+        telemetry_queue=asyncio.Queue(),
+        feature_computer=_MockFC(),
+        shared_state=state,
+    )
+    # Feed 15 samples with a strong right tail (spike to 80 bps)
+    samples = [2.0, 2.1, 2.3, 2.0, 2.5, 2.2, 2.4, 1.9, 2.1, 2.3, 3.0, 5.0, 80.0, 60.0, 40.0]
+    for s in samples:
+        ex._log_spread_stats.update(_math.log(max(s, 1e-4)))
+
+    p95 = ex._spread_p95
+    linear_mean = sum(samples) / len(samples)
+    # Log-space p95 should capture the right tail; must exceed the linear mean
+    assert p95 > linear_mean, (
+        f"log-space p95={p95:.2f} should exceed linear mean={linear_mean:.2f} "
+        "for right-skewed data"
+    )
+    # And must be less than the max outlier (not exploding)
+    assert p95 < max(samples) * 2
+
+
+def test_all_gates_pass_approved_telemetry():
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+        )
+        await micro_q.put(_signal())
+        await ex._evaluate(await micro_q.get())
+
+        assert not signal_q.empty()
+        assert not telem_q.empty()
+        rec = await telem_q.get()
+        assert rec.gate_passed == "APPROVED"
+
+    asyncio.run(_run())
+
+
+def test_telemetry_emitted_at_every_rejection():
+    """Gate 0 failure must still emit a telemetry record."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="GAP_DETECTED", heartbeat_status="HEALTHY")
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+        )
+        await ex._evaluate(_signal())
+
+        assert signal_q.empty()           # not approved
+        assert not telem_q.empty()        # but telemetry emitted
+        rec = await telem_q.get()
+        assert rec.gate_passed == "GATE_0_FAIL"
+
+    asyncio.run(_run())

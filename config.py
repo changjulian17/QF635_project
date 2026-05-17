@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     STARTING_EQUITY: float = 10_000.0
     MAX_DRAWDOWN_PCT: float = 0.05
     DAILY_LOSS_LIMIT_PCT: float = 0.02
+    # 5-tier DOV loss thresholds (§5 risk_management_plan)
+    TIER_REDUCED_PCT: float = 0.0050   # ≥ 0.50% DOV loss → REDUCED
+    TIER_MINIMAL_PCT: float = 0.0075   # ≥ 0.75% DOV loss → MINIMAL
+    TIER_PASSIVE_PCT: float = 0.0090   # ≥ 0.90% DOV loss → PASSIVE (no new entries)
+    TIER_HALTED_PCT:  float = 0.0100   # ≥ 1.00% DOV loss → HALTED
     MAX_CONSECUTIVE_LOSSES: int = 3
     RISK_PER_TRADE_PCT: float = 0.01
     KELLY_FRACTION: float = 0.25
@@ -57,6 +62,13 @@ class Settings(BaseSettings):
     SWEEP_LEVELS: int = 5
     BREAK_PROTECT_WINDOW_MS: int = 2000
     OBI_BREAK_THRESH: float = 0.40
+    PRICE_PRUNE_INTERVAL: int = 100   # prune stale price keys every N bars (~10 s at 10 Hz)
+    PRICE_PRUNE_BAND: float = 0.02    # keep prices within ±2% of current mid
+    SWEEP_THRESHOLD: float = 0.80        # buy/sell vol must exceed this fraction of top-N book depth
+    BOOK_FLIP_SIGMA: float = 3.0         # min z-score for a level to qualify as "large" in book-flip
+    BOOK_FLIP_MIN_CONSUMED: float = 0.30 # max fraction consumed before cancellation is inferred
+    BOOK_FLIP_AGG_RATIO: float = 0.50    # min aggression vol (as fraction of mean_qty) to confirm flip
+    BREAK_MIN_VOL: float = 1.0           # min absolute buy/sell volume to register a breakout
 
     # Heartbeat monitor (§4)
     HEARTBEAT_WARN_MS: int = 200
