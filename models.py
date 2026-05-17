@@ -234,6 +234,18 @@ class MicroOrderRequest:
 
 
 @dataclass
+class FillDetail:
+    """Emitted by OrderManager to fill_queue on a confirmed IOC fill."""
+    signal_id:    str
+    side:         str    # "BUY" | "SELL"
+    fill_price:   float
+    qty:          float
+    limit_price:  float
+    slippage_bps: float
+    order_id:     str    # Binance orderId or "DRY_RUN"
+
+
+@dataclass
 class KillswitchState:
     fired:              bool  = False
     trigger:            str   = ""
