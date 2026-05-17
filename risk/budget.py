@@ -25,7 +25,8 @@ class DailyBudget:
 
     @property
     def loss_pct(self) -> float:
-        return abs(min(self.realised_pnl, 0.0)) / self.dov if self.dov > 0 else 0.0
+        total = self.realised_pnl + self.unrealised_pnl
+        return abs(min(total, 0.0)) / self.dov if self.dov > 0 else 0.0
 
     def reset(self, new_equity: float, hard_limit_pct: float = 0.01) -> None:
         self.dov            = new_equity

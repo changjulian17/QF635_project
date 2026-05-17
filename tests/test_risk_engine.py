@@ -36,8 +36,14 @@ def make_signal(confidence=0.8, entry=30_000.0, sl=29_700.0, tp=30_900.0) -> Pat
     )
 
 
-def make_engine(portfolio: PortfolioState, budget: DailyBudget | None = None) -> RiskEngine:
-    return RiskEngine(asyncio.Queue(), asyncio.Queue(), portfolio, budget)
+def make_engine(
+    portfolio: PortfolioState,
+    budget: DailyBudget | None = None,
+    killswitch: GlobalKillswitch | None = None,
+    pyramid=None,
+) -> RiskEngine:
+    from risk.pyramid import PyramidController
+    return RiskEngine(asyncio.Queue(), asyncio.Queue(), portfolio, budget, killswitch, pyramid)
 
 
 # ── Circuit breakers (existing, backward-compat) ──────────────────────────────
@@ -83,15 +89,20 @@ def test_evaluate_rejects_low_confidence():
 
 def test_evaluate_rejects_when_max_positions_reached():
     from models import Position
+    from risk.pyramid import PyramidController
     pf = make_portfolio()
     pf.positions.append(
         Position(symbol="BTCUSDT", side=Direction.LONG,
                  entry_price=30_000.0, quantity=0.01,
                  stop_loss=29_700.0, take_profit=30_900.0)
     )
-    engine = make_engine(pf)
-    req = engine._evaluate(make_signal())
+    # Sync pyramid: leg 1 opened at 30_000; signal also at 30_000 → PnL = 0 → not profitable
+    pyr = PyramidController()
+    pyr.open_leg(qty=0.01, entry_price=30_000.0, direction="LONG")
+    engine = make_engine(pf, pyramid=pyr)
+    req = engine._evaluate(make_signal())  # entry_price=30_000 → leg 1 break-even → rejected
     assert req.approved is False
+    assert "pyramid" in req.rejection_reason.lower()
 
 
 def test_evaluate_rejects_when_circuit_breaker_halted():
@@ -108,15 +119,15 @@ def test_position_sizing_normal():
     engine = make_engine(make_portfolio())
     sig = make_signal(entry=30_000.0, sl=29_700.0)  # $300 SL distance
     # With default budget: risk_amount = min(100, 60, 40) = 40
-    # kelly = 0.25 * 0.8 = 0.2; qty = (40/300) * 0.2 = 0.0267
-    qty = engine._size_position_vol_target(sig)
+    # kelly = 0.25 * 0.8 = 0.2; leg_scalar leg1 = 1.0; qty = (40/300) * 0.2 = 0.0267
+    qty = engine._size_position(sig)
     assert qty > 0
 
 
 def test_position_sizing_zero_sl_distance():
     engine = make_engine(make_portfolio())
     sig = make_signal(entry=30_000.0, sl=30_000.0)
-    assert engine._size_position_vol_target(sig) == 0.0
+    assert engine._size_position(sig) == 0.0
 
 
 # ── Trade result recording (existing, backward-compat) ────────────────────────
@@ -306,9 +317,11 @@ def test_killswitch_no_fire_within_limit():
 
 
 def test_killswitch_fires_on_heartbeat_critical():
+    # KS-2 requires settings.HEARTBEAT_CONSEC_LIMIT (3) consecutive CRITICALs
     ks = GlobalKillswitch(dov=10_000.0)
-    fired = ks.check_heartbeat("CRITICAL", delta_ms=600.0)
-    assert fired is True
+    assert ks.check_heartbeat("CRITICAL", delta_ms=600.0) is False  # 1st — no fire
+    assert ks.check_heartbeat("CRITICAL", delta_ms=600.0) is False  # 2nd — no fire
+    assert ks.check_heartbeat("CRITICAL", delta_ms=600.0) is True   # 3rd — fires
     assert ks.is_active is True
 
 
@@ -334,3 +347,141 @@ def test_killswitch_cannot_be_reset_without_restart():
     # Subsequent call with healthy values must not clear the fired state (Rule 12)
     ks.check_budget(realised_pnl=0.0, unrealised_pnl=0.0)
     assert ks.is_active is True
+
+
+# ── New tests: budget loss_pct fix ───────────────────────────────────────────
+
+def test_loss_pct_includes_unrealised_pnl():
+    b = DailyBudget.from_equity(10_000.0)
+    b.realised_pnl   = -50.0
+    b.unrealised_pnl = -30.0  # open position sitting at a loss
+    # total loss = 80; 80/10000 = 0.008 → should push into MINIMAL tier
+    assert b.loss_pct == pytest.approx(0.008)
+
+
+# ── New tests: KS-2 consecutive counter ──────────────────────────────────────
+
+def test_ks2_fires_only_after_consecutive_criticals():
+    ks = GlobalKillswitch(dov=10_000.0)
+    assert ks.check_heartbeat("CRITICAL", 600.0) is False
+    assert ks.check_heartbeat("CRITICAL", 600.0) is False
+    assert ks.check_heartbeat("CRITICAL", 600.0) is True
+    assert ks.is_active is True
+
+
+def test_ks2_resets_on_healthy_heartbeat():
+    ks = GlobalKillswitch(dov=10_000.0)
+    ks.check_heartbeat("CRITICAL", 600.0)
+    ks.check_heartbeat("CRITICAL", 600.0)
+    ks.check_heartbeat("HEALTHY", 50.0)   # resets counter
+    assert ks.check_heartbeat("CRITICAL", 600.0) is False  # back to count=1
+    assert ks.is_active is False
+
+
+# ── New tests: pyramid direction fix ─────────────────────────────────────────
+
+def test_pyramid_short_pnl_direction():
+    p = PyramidController()
+    p.open_leg(qty=0.1, entry_price=30_000.0, direction="SHORT")
+    # Price fell: profitable for SHORT
+    ok, _ = p.can_add_leg(current_price=29_900.0)
+    assert ok is True
+
+
+# ── New tests: killswitch wired into engine ───────────────────────────────────
+
+def test_killswitch_blocks_evaluate():
+    ks = GlobalKillswitch(dov=10_000.0)
+    ks.check_budget(realised_pnl=-200.0, unrealised_pnl=0.0)  # fire KS
+    engine = make_engine(make_portfolio(), killswitch=ks)
+    req = engine._evaluate(make_signal())
+    assert req.approved is False
+    assert "HALTED" in req.rejection_reason
+
+
+def test_killswitch_checked_on_record_trade():
+    ks = GlobalKillswitch(dov=10_000.0, hard_limit_pct=0.01)
+    pf = make_portfolio()
+    engine = make_engine(pf, killswitch=ks)
+    # A loss big enough to breach the hard limit (> $100 on $10k DOV)
+    engine.record_trade_result(-150.0)
+    assert ks.is_active is True
+
+
+# ── New tests: pyramid wired into engine ──────────────────────────────────────
+
+def test_pyramid_leg_via_engine():
+    from models import Position
+    pf = make_portfolio()
+    # Simulate an open position (leg 1 entered at 29_900, now at 30_000 → profitable)
+    pf.positions.append(
+        Position(symbol="BTCUSDT", side=Direction.LONG,
+                 entry_price=29_900.0, quantity=0.01,
+                 stop_loss=29_700.0, take_profit=30_900.0)
+    )
+    from risk.pyramid import PyramidController
+    pyr = PyramidController()
+    pyr.open_leg(qty=0.01, entry_price=29_900.0, direction="LONG")  # sync leg 1
+    engine = make_engine(pf, pyramid=pyr)
+    # Signal at 30_000: leg 1 is profitable (+$1/unit) → pyramid should allow leg 2
+    req = engine._evaluate(make_signal(entry=30_000.0, sl=29_700.0))
+    assert req.approved is True
+    assert req.quantity > 0
+
+
+# ── New tests: mark_unrealised ────────────────────────────────────────────────
+
+def test_mark_unrealised_updates_budget_loss_pct():
+    pf = make_portfolio()
+    engine = make_engine(pf)
+    # Realised = 0, unrealised = -80 → loss_pct should be 0.8%
+    engine.mark_unrealised(-80.0)
+    assert engine._budget.loss_pct == pytest.approx(0.008)
+
+
+def test_mark_unrealised_triggers_tier_downgrade():
+    pf = make_portfolio()
+    engine = make_engine(pf)
+    engine.mark_unrealised(-75.0)  # 0.75% → MINIMAL tier on next evaluation
+    engine._check_circuit_breakers()
+    assert engine.tier == "MINIMAL"
+
+
+# ── New tests: close_leg FIFO ─────────────────────────────────────────────────
+
+def test_close_leg_removes_oldest_leg():
+    p = PyramidController()
+    p.open_leg(qty=0.10, entry_price=30_000.0, direction="LONG")
+    p.open_leg(qty=0.05, entry_price=30_100.0, direction="LONG")
+    p.close_leg()
+    assert p.leg_count == 1
+    # Remaining leg should be the second one (entry=30_100)
+    assert p._legs[0]["entry"] == 30_100.0
+
+
+def test_close_leg_on_empty_pyramid_is_safe():
+    p = PyramidController()
+    p.close_leg()  # must not raise
+    assert p.leg_count == 0
+
+
+def test_record_trade_closes_one_leg_not_all():
+    from risk.pyramid import PyramidController
+    pyr = PyramidController()
+    pyr.open_leg(qty=0.10, entry_price=30_000.0, direction="LONG")
+    pyr.open_leg(qty=0.05, entry_price=30_100.0, direction="LONG")
+    engine = make_engine(make_portfolio(), pyramid=pyr)
+    engine.record_trade_result(50.0)   # leg 1 closes
+    assert engine._pyramid.leg_count == 1  # leg 2 still tracked
+
+
+# ── New tests: session reset clears pyramid ───────────────────────────────────
+
+def test_reset_for_new_session_clears_pyramid():
+    from risk.pyramid import PyramidController
+    pyr = PyramidController()
+    pyr.open_leg(qty=0.10, entry_price=30_000.0, direction="LONG")
+    pyr.open_leg(qty=0.05, entry_price=30_100.0, direction="LONG")
+    engine = make_engine(make_portfolio(), pyramid=pyr)
+    engine.reset_for_new_session()
+    assert engine._pyramid.leg_count == 0

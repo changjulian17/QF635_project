@@ -57,7 +57,7 @@ FILTER — Confidence Scorer
 CryptoSentinel/
 │
 ├── main.py                    # Async orchestrator — all coroutines
-├── backtest.py                # CLI backtest runner (both paths)
+├── backtest.py                # CLI backtest runner (Phase 2 — not yet implemented)
 ├── config.py                  # Pydantic V2 settings from .env
 ├── models.py                  # Shared dataclasses and enums
 ├── requirements.txt
@@ -70,7 +70,7 @@ CryptoSentinel/
 │   ├── cvd.py                 # Standalone CVD calculator
 │   ├── pattern_detector.py    # OHLCV chart pattern detection (context/boost)
 │   ├── signal_telemetry.py    # Signal record writer (all gates, pass + fail)
-│   └── startup_reconciler.py  # Exchange state reconciliation on startup
+│   └── startup_reconciler.py  # Exchange state reconciliation on startup (Phase 1M — pending)
 │
 ├── strategy/                  # Alpha generation and execution
 │   ├── features.py            # FeatureComputer + WelfordOnline (single source of truth)
@@ -86,16 +86,16 @@ CryptoSentinel/
 ├── execution/                 # Order management
 │   └── order_manager.py       # IOC aggressive limit orders + OCO brackets
 │
-├── backtesting/               # Offline strategy research (Phase 2)
+├── backtesting/               # Offline strategy research (Phase 2 — not yet implemented)
 │   ├── tick_backtester.py     # Path A: replay lob_tick.db
 │   ├── walk_forward.py        # Path B: OHLCV walk-forward
 │   └── metrics.py             # Sharpe, Sortino, Calmar, MDD, PF, WR
 │
-├── data/                      # Data acquisition (Phase 2)
+├── data/                      # Data acquisition (Phase 2 — not yet implemented)
 │   ├── fetcher.py             # OHLCVFetcher (CCXT + SQLite cache)
 │   └── validator.py           # 9-check data quality validator
 │
-├── dashboard/                 # Dash application — all pages (Phase 3)
+├── dashboard/                 # Dash application — all pages (Phase 3 — not yet implemented)
 │   ├── app.py                 # Main Dash app + routing
 │   └── pages/
 │       ├── live.py            # /live — Trading monitor + kill switch
@@ -376,9 +376,13 @@ All settings live in `config.py` and can be overridden via `.env`.
 ### Risk Engine
 | Setting | Default | Description |
 |---|---|---|
-| `MAX_DRAWDOWN_PCT` | `0.05` | 5% drawdown → HALTED |
-| `DAILY_LOSS_LIMIT_PCT` | `0.01` | 1% daily loss → HALTED |
-| `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 15-min cooldown |
+| `MAX_DRAWDOWN_PCT` | `0.05` | 5% drawdown from peak → HALTED |
+| `DAILY_LOSS_LIMIT_PCT` | `0.02` | Legacy portfolio daily-loss hard stop (belt-and-suspenders) |
+| `TIER_REDUCED_PCT` | `0.005` | ≥ 0.5% DOV loss → REDUCED (50% size, min conf 0.65) |
+| `TIER_MINIMAL_PCT` | `0.0075` | ≥ 0.75% DOV loss → MINIMAL (25% size, min conf 0.80) |
+| `TIER_PASSIVE_PCT` | `0.009` | ≥ 0.9% DOV loss → PASSIVE (no new entries) |
+| `TIER_HALTED_PCT` | `0.01` | ≥ 1.0% DOV loss → HALTED |
+| `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 5-min cooldown |
 | `RISK_PER_TRADE_PCT` | `0.01` | Equity risked per trade (1%) |
 | `KELLY_FRACTION` | `0.25` | Fractional Kelly applied to sizing |
 | `ATR_MULTIPLIER_SL` | `1.5` | Stop-loss distance in ATR units |
@@ -403,19 +407,21 @@ All settings live in `config.py` and can be overridden via `.env`.
 ## Tests
 
 ```
-tests/test_models.py              6 tests  — PortfolioState, WallState, FeatureVector
-tests/test_lob_engine.py         16 tests  — state machine, gap detection, wall scan
-tests/test_microstructure.py      7 tests  — wall identification, absorption, sweep
-tests/test_features.py            4 tests  — Welford, no-lookahead, VWAP reset
-tests/test_executor.py            7 tests  — all 7 gates, telemetry emission
-tests/test_cvd.py                 3 tests  — buy/sell CVD, 5-bar delta
-tests/test_signal_telemetry.py    4 tests  — flush, batch, outcome update
-tests/test_db_writer.py           9 tests  — SQLite write, upsert, purge
-tests/test_pattern_detector.py    8 tests  — ATR, swing detection, S/R breakout
-tests/test_risk_engine.py        20 tests  — 5-tier, killswitch, pyramid, circuit breakers
-tests/test_integration.py         2 tests  — gate funnel, killswitch blocking
-─────────────────────────────────────────────────────────────────────────────
-Total                            ~90 tests (Phase 1 target)
+tests/test_models.py                6 tests  — PortfolioState, WallState, FeatureVector
+tests/test_lob_engine.py           20 tests  — state machine, gap detection, wall scan
+tests/test_microstructure.py       14 tests  — wall identification, absorption, sweep
+tests/test_features.py             14 tests  — Welford, no-lookahead, VWAP reset
+tests/test_executor.py             29 tests  — all 7 gates, telemetry emission
+tests/test_cvd.py                  14 tests  — buy/sell CVD, 5-bar delta, std
+tests/test_signal_telemetry.py     10 tests  — flush, batch, timeout, outcome update
+tests/test_db_writer.py            12 tests  — SQLite write, upsert, purge
+tests/test_pattern_detector.py      8 tests  — ATR, swing detection, S/R breakout
+tests/test_risk_engine.py          35 tests  — 5-tier, killswitch, pyramid, circuit breakers
+tests/test_lob_recorder.py         14 tests  — recorder flush, reconnect, stats
+tests/test_ws_consumer.py           6 tests  — heartbeat states, shared state update
+tests/test_microstructure_engine.py 30 tests  — legacy microstructure engine
+──────────────────────────────────────────────────────────────────────────────
+Total                             212 tests
 ```
 
 ---
@@ -468,8 +474,9 @@ These rules are invariants. Any code that violates them is incorrect.
 
 ## Phased Delivery
 
-| Phase | Weeks | Goal |
-|-------|-------|------|
-| **Phase 1** | 1–3 | Foundation: LOB Recorder, HeartbeatMonitor, LOB state machine, FeatureComputer, Wall/Absorption/Sweep signals, 7-Gate executor, GlobalKillswitch, IOC limit orders, signal telemetry, startup reconciler |
-| **Phase 2** | 4–8 | Backtesting: OHLCV Path B (VectorBT + Optuna), Tick Path A (replay `lob_tick.db`), XGBoost scorer, Strategy Builder + Registry |
-| **Phase 3** | 9–12 | Dashboard: Dash migration (5 pages: /live, /lob, /backtest, /registry, /config), decay monitoring, LIVE promotion pipeline |
+| Phase | Weeks | Goal | Status |
+|-------|-------|------|--------|
+| **Phase 1A–1K** | 1–3 | Foundation (complete): LOB Recorder, HeartbeatMonitor, LOB state machine, FeatureComputer, Wall/Absorption/Sweep signals, 7-Gate executor, 5-tier Risk Engine, DailyBudget, PyramidController, GlobalKillswitch, signal telemetry | ✅ Done |
+| **Phase 1L–1N** | 3 | Foundation (pending): IOC limit orders (1L), startup reconciler + midnight reset (1M), integration test + killswitch wire-up (1N) | ⏳ Pending |
+| **Phase 2** | 4–8 | Backtesting: OHLCV Path B (VectorBT + Optuna), Tick Path A (replay `lob_tick.db`), XGBoost scorer, Strategy Builder + Registry | 🔜 Next |
+| **Phase 3** | 9–12 | Dashboard: Dash migration (5 pages: /live, /lob, /backtest, /registry, /config), decay monitoring, LIVE promotion pipeline | 🔜 Future |

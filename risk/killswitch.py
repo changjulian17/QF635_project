@@ -23,9 +23,10 @@ _SLIPPAGE_WINDOW = 20
 class GlobalKillswitch:
 
     def __init__(self, dov: float, hard_limit_pct: float = 0.01) -> None:
-        self._hard_limit     = dov * hard_limit_pct
-        self._state          = KillswitchState()
+        self._hard_limit      = dov * hard_limit_pct
+        self._state           = KillswitchState()
         self._slippage_buf: deque[float] = deque(maxlen=_SLIPPAGE_WINDOW)
+        self._consec_critical: int = 0
 
     # ── Public checks ─────────────────────────────────────────────────────────
 
@@ -45,17 +46,21 @@ class GlobalKillswitch:
         return False
 
     def check_heartbeat(self, heartbeat_status: str, delta_ms: float) -> bool:
-        """KS-2: fire if heartbeat status is CRITICAL."""
+        """KS-2: fire after settings.HEARTBEAT_CONSEC_LIMIT consecutive CRITICAL packets."""
         if self._state.fired:
             return True
         if heartbeat_status == "CRITICAL":
-            return self._fire(
-                "KS-2_HEARTBEAT",
-                f"heartbeat=CRITICAL delta_ms={delta_ms:.0f}",
-                latency=delta_ms,
-                slippage=0.0,
-                total_loss=0.0,
-            )
+            self._consec_critical += 1
+            if self._consec_critical >= settings.HEARTBEAT_CONSEC_LIMIT:
+                return self._fire(
+                    "KS-2_HEARTBEAT",
+                    f"heartbeat=CRITICAL x{self._consec_critical} delta_ms={delta_ms:.0f}",
+                    latency=delta_ms,
+                    slippage=0.0,
+                    total_loss=0.0,
+                )
+        else:
+            self._consec_critical = 0
         return False
 
     def record_slippage(self, signal_price: float, fill_price: float, direction: str) -> bool:
