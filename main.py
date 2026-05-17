@@ -10,7 +10,8 @@ Startup sequence (master arch §9):
   6. Start TaskGroup with all coroutines:
        lob_recorder, ws_consumer, depth_fanout, lob_engine, micro_detector,
        pattern_detector, strategy_executor, risk_engine, order_manager,
-       signal_telemetry, midnight_reset_loop, db_writer, fill_processor
+       signal_telemetry, midnight_reset_loop, db_writer, fill_processor,
+       portfolio_mtm_loop
 """
 import asyncio
 import logging
@@ -65,6 +66,42 @@ async def shutdown_handler(
         {"open_positions": len(portfolio.positions), "ts": datetime.utcnow().isoformat()},
     )
     logger.info("[Shutdown] Graceful shutdown complete")
+
+
+# ── Killswitch emergency close ────────────────────────────────────────────────
+
+async def emergency_close_all(
+    order_manager: OrderManager,
+    portfolio: PortfolioState,
+    telemetry: SignalTelemetry,
+    reason: str,
+) -> None:
+    """Hard stop: close all open positions, write system event, reject new signals."""
+    logger.critical("[KS] emergency_close_all — reason=%s", reason)
+    await order_manager.force_close_all(reason)
+    telemetry.write_system_event(
+        "KILLSWITCH_FIRED",
+        {"reason": reason, "equity": portfolio.equity, "ts": datetime.utcnow().isoformat()},
+    )
+
+
+# ── Portfolio mark-to-market loop (KS-1) ─────────────────────────────────────
+
+async def _portfolio_mtm_loop(
+    killswitch: GlobalKillswitch,
+    budget: DailyBudget,
+    order_manager: OrderManager,
+    portfolio: PortfolioState,
+    telemetry: SignalTelemetry,
+) -> None:
+    """Check KS-1 budget breach every second. Exits after triggering emergency_close_all."""
+    while True:
+        await asyncio.sleep(1.0)
+        if killswitch.check_budget(budget.realised_pnl, budget.unrealised_pnl):
+            await emergency_close_all(
+                order_manager, portfolio, telemetry, "KILLSWITCH_BUDGET"
+            )
+            return
 
 
 # ── Midnight reset ────────────────────────────────────────────────────────────
@@ -179,6 +216,15 @@ async def main() -> None:
     om_queue:           asyncio.Queue = asyncio.Queue(maxsize=50)
     fill_queue:         asyncio.Queue = asyncio.Queue(maxsize=200)
 
+    # Killswitch callbacks — closures capture by reference; resolved at call-time
+    # after all components are constructed and before the TaskGroup starts.
+    async def _heartbeat_cb(status: str, delta_ms: float) -> None:
+        if killswitch.check_heartbeat(status, delta_ms):
+            await emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_HEARTBEAT")
+
+    async def _ks_fire_cb(reason: str) -> None:
+        await emergency_close_all(order_manager, portfolio, telemetry, reason)
+
     # Components ──────────────────────────────────────────────────────────────
     ws_consumer = BinanceWebSocketConsumer(
         candle_queue=candle_queue,
@@ -186,6 +232,7 @@ async def main() -> None:
         trade_queue=trade_queue,
         depth_queue=raw_depth_queue,
         shared_state=shared_state,
+        heartbeat_cb=_heartbeat_cb,
     )
     lob_recorder = LOBRecorder()
     micro_detector = MicrostructureDetector(
@@ -207,6 +254,7 @@ async def main() -> None:
         fill_queue=fill_queue,
         killswitch=killswitch,
         equity_fn=lambda: portfolio.equity,
+        ks_fire_cb=_ks_fire_cb,
     )
     strategy_executor = StrategyExecutor(
         micro_signal_queue=micro_signal_queue,
@@ -279,6 +327,10 @@ async def main() -> None:
             tg.create_task(db_writer.run(),                                                   name="db_writer")
             tg.create_task(_drain_queue(re_order_queue),                                      name="re_order_drain")
             tg.create_task(_process_fills(fill_queue, portfolio),                             name="fill_processor")
+            tg.create_task(
+                _portfolio_mtm_loop(killswitch, budget, order_manager, portfolio, telemetry),
+                name="portfolio_mtm_loop",
+            )
     except* asyncio.CancelledError:
         pass
     except* Exception as eg:

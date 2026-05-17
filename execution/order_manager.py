@@ -33,7 +33,7 @@ Adding a new order type requires only a new subclass — not changes here.
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from binance import AsyncClient
 
@@ -78,17 +78,20 @@ class OrderManager:
         killswitch: GlobalKillswitch,
         equity_fn: Callable[[], float],
         book_fn: Callable[[], tuple[float, float]] | None = None,
+        ks_fire_cb: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         """
         book_fn: optional callable returning (best_bid, best_ask) without a REST
         round-trip — wire to the LOB engine's current top-of-book for lowest latency
         and accurate DRY_RUN position sizing. Falls back to REST when None.
+        ks_fire_cb: called with a reason string when KS-3 slippage fires.
         """
         self._signal_q   = signal_queue
         self.fill_queue  = fill_queue
         self._killswitch = killswitch
         self._equity_fn  = equity_fn
         self._book_fn    = book_fn
+        self._ks_fire_cb = ks_fire_cb
         self._client: AsyncClient | None = None
 
         # Graceful-shutdown gate: set False before draining the queue.
@@ -310,7 +313,9 @@ class OrderManager:
 
         fill_price = _weighted_avg_fill(resp)
         direction  = req.micro_signal.direction
-        self._killswitch.record_slippage(signal_price, fill_price, direction)
+        ks_fired   = self._killswitch.record_slippage(signal_price, fill_price, direction)
+        if ks_fired and self._ks_fire_cb is not None:
+            asyncio.create_task(self._ks_fire_cb("KILLSWITCH_SLIPPAGE"))
 
         slippage_bps = (
             (fill_price - signal_price) / signal_price * 10_000
@@ -581,3 +586,62 @@ class OrderManager:
         self._open_position_closed_event  = None
         self._placing_oco                 = False
         self._cancel_oco_on_placement     = False
+
+    # ── Killswitch hard stop ──────────────────────────────────────────────────
+
+    async def force_close_all(self, reason: str) -> None:
+        """
+        Killswitch-triggered hard stop: reject all new signals and immediately
+        close any open position.  Called by emergency_close_all in main.py.
+
+        Mirrors the Gate-6 cancel+close logic with the S1 race-fix intact.
+        """
+        self.accepting_new_signals = False
+        logger.critical("[Exec] force_close_all — reason=%s", reason)
+
+        async with self._position_lock:
+            qty         = self._open_position_qty
+            side        = self._open_position_side
+            oco_id      = self._open_oco_list_id
+            event       = self._open_position_closed_event
+            placing_oco = self._placing_oco
+
+        if qty == 0.0 or side is None:
+            logger.info("[Exec] force_close_all: no open position to close")
+            return
+
+        if settings.DRY_RUN:
+            logger.info("[Exec] DRY RUN — force_close_all: resetting position state")
+            if event:
+                event.set()
+            async with self._position_lock:
+                self._reset_open_position()
+            return
+
+        # Live: if OCO is still being placed, delegate to _place_oco (S1 fix).
+        if placing_oco:
+            async with self._position_lock:
+                self._cancel_oco_on_placement = True
+            logger.warning("[Exec] force_close_all: OCO in-flight — deferred cancel scheduled")
+            return
+
+        if oco_id is not None and self._client:
+            try:
+                await self._client.delete_oco_order(
+                    symbol=settings.SYMBOL,
+                    orderListId=oco_id,
+                )
+                logger.info("[Exec] force_close_all: OCO %d cancelled", oco_id)
+            except Exception as exc:
+                logger.error("[Exec] force_close_all: OCO cancel failed: %s", exc)
+
+        closed = await self._emergency_close(qty, side, reason)
+        if closed and event:
+            event.set()
+        elif not closed:
+            logger.critical(
+                "[Exec] force_close_all: emergency close unfilled — manual intervention required"
+            )
+
+        async with self._position_lock:
+            self._reset_open_position()

@@ -3,6 +3,7 @@ import json
 import logging
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 import numpy as np
@@ -85,12 +86,14 @@ class BinanceWebSocketConsumer:
         trade_queue: asyncio.Queue | None = None,
         depth_queue: asyncio.Queue | None = None,
         shared_state: SharedState | None = None,
+        heartbeat_cb: Callable[[str, float], Awaitable[None]] | None = None,
     ) -> None:
         self._candle_queue    = candle_queue
         self._candle_db_queue = candle_db_queue
         self._trade_queue     = trade_queue
         self._depth_queue     = depth_queue
         self._shared_state    = shared_state or SharedState()
+        self._heartbeat_cb    = heartbeat_cb
         self._running         = False
         self._reconnect_delay = 1.0
         self._max_delay       = 60.0
@@ -160,6 +163,10 @@ class BinanceWebSocketConsumer:
                 status   = self.heartbeat.record(event_ms)
                 self._shared_state.heartbeat_status = status
                 self._shared_state.last_delta_ms    = self.heartbeat.last_delta_ms
+                if self._heartbeat_cb is not None:
+                    asyncio.create_task(
+                        self._heartbeat_cb(status, self.heartbeat.last_delta_ms)
+                    )
 
                 await self._dispatch(stream, msg)
 
