@@ -7,6 +7,7 @@ can be analysed and the confidence scorer can be trained offline.
 
 import asyncio
 import datetime
+import json
 import logging
 import sqlite3
 import time
@@ -158,6 +159,23 @@ class SignalTelemetry:
                 )
                 combined = combined[:_MAX_BUF]   # keep oldest for audit trail
             self._buf = combined
+
+    def write_system_event(self, event_type: str, payload: dict | None = None) -> None:
+        """Write a lifecycle event to system_events while telemetry is running."""
+        if self._conn is None:
+            return
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO system_events (event_type, occurred_at, payload_json) VALUES (?, ?, ?)",
+                    (
+                        event_type,
+                        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        json.dumps(payload) if payload is not None else None,
+                    ),
+                )
+        except sqlite3.Error as exc:
+            logger.warning("[Telemetry] system_event write failed %s: %s", event_type, exc)
 
     def update_outcome(
         self,
