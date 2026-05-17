@@ -153,7 +153,7 @@ class FeatureComputer:
         if self._rsi_bars <= self._p.rsi_period:
             self._avg_gain += gain
             self._avg_loss += loss
-            if self._rsi_bars == self._p.rsi_period:
+            if self._rsi_bars >= self._p.rsi_period:
                 self._avg_gain /= self._p.rsi_period
                 self._avg_loss /= self._p.rsi_period
                 self._rsi_ready = True

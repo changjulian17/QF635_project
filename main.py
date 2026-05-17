@@ -130,19 +130,24 @@ async def _watch_shutdown(event: asyncio.Event) -> None:
     raise asyncio.CancelledError("shutdown signal received")
 
 
+_fanout_drop_count = 0
+
+
 async def _depth_fanout(
     src: asyncio.Queue,
     lob_q: asyncio.Queue,
     ms_q: asyncio.Queue,
 ) -> None:
     """Fan out depth snapshots to both lob_engine and micro_detector."""
+    global _fanout_drop_count
     while True:
         msg = await src.get()
         for q in (lob_q, ms_q):
             try:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
-                pass
+                _fanout_drop_count += 1
+                logger.warning("[Fanout] Depth snapshot dropped (queue full) — total drops=%d", _fanout_drop_count)
 
 
 async def _run_lob_engine(lob: LocalOrderBook, depth_q: asyncio.Queue) -> None:
@@ -162,7 +167,7 @@ async def _process_fills(
     fill_q: asyncio.Queue,
     portfolio: PortfolioState,
 ) -> None:
-    """Log fill events; portfolio equity update wired in Phase 1N."""
+    """Log IOC entry fills. Realised P&L is tracked in DailyBudget via budget.realised_pnl."""
     while True:
         fill: FillDetail = await fill_q.get()
         logger.info(

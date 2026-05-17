@@ -71,8 +71,7 @@ def test_gate_funnel_produces_signal_records(tmp_path):
         budget    = DailyBudget.from_equity(10_000.0)
         telemetry = SignalTelemetry(tel_q, db_path=str(tmp_path / "test.db"))
 
-        mock_fc = MagicMock()
-        mock_fc.compute.return_value = FeatureVector(
+        fv_normal = FeatureVector(
             lob_status="SYNCED",
             obi_zscore=1.0,
             cvd_delta=1.0,
@@ -81,6 +80,11 @@ def test_gate_funnel_produces_signal_records(tmp_path):
             cvd_positive=1,
             rsi_value=55.0,
         )
+        mock_fc = MagicMock()
+        # Signals 1+2 never reach compute (gate 0/1 reject first).
+        # Signal 3: None → GATE_2_FAIL ("feature vector not ready").
+        # Signal 4: fv_normal → passes all gates → APPROVED.
+        mock_fc.compute.side_effect = [None, fv_normal]
 
         executor = StrategyExecutor(
             micro_signal_queue=micro_q,
@@ -121,7 +125,7 @@ def test_gate_funnel_produces_signal_records(tmp_path):
         ))
         await asyncio.sleep(0.05)  # let executor process signal 2
 
-        # Signal 3 — passes all gates (APPROVED)
+        # Signal 3 — fails Gate 2: feature vector not ready (compute returns None)
         await micro_q.put(MicroSignal(
             signal_type="SWEEP_WITH_PROTECTION",
             direction="LONG",
@@ -130,7 +134,18 @@ def test_gate_funnel_produces_signal_records(tmp_path):
             protection_wall=_wall(94_000.0),
             prior_absorption=True,
         ))
-        await asyncio.sleep(0.1)  # let executor process signal 3 + telemetry drain
+        await asyncio.sleep(0.05)  # let executor process signal 3
+
+        # Signal 4 — passes all gates (APPROVED)
+        await micro_q.put(MicroSignal(
+            signal_type="SWEEP_WITH_PROTECTION",
+            direction="LONG",
+            timestamp_ms=int(time.time() * 1000),
+            consumed_wall=_wall(95_000.0, "ask"),
+            protection_wall=_wall(94_000.0),
+            prior_absorption=True,
+        ))
+        await asyncio.sleep(0.1)  # let executor process signal 4 + telemetry drain
 
         exec_task.cancel()
         telem_task.cancel()
@@ -151,6 +166,7 @@ def test_gate_funnel_produces_signal_records(tmp_path):
 
     assert "GATE_0_FAIL" in gate_values, f"Missing GATE_0_FAIL — got {gate_values}"
     assert "GATE_1_FAIL" in gate_values, f"Missing GATE_1_FAIL — got {gate_values}"
+    assert "GATE_2_FAIL" in gate_values, f"Missing GATE_2_FAIL — got {gate_values}"
     assert "APPROVED"    in gate_values, f"Missing APPROVED    — got {gate_values}"
 
 

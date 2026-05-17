@@ -184,8 +184,12 @@ class MicrostructureDetector:
     # ── Snapshot processing ───────────────────────────────────────────────────
 
     async def _process_snapshot(self, msg: dict) -> None:
-        bids_raw = {float(p): float(q) for p, q in msg.get("bids", [])}
-        asks_raw = {float(p): float(q) for p, q in msg.get("asks", [])}
+        try:
+            bids_raw = {float(p): float(q) for p, q in msg.get("bids", [])}
+            asks_raw = {float(p): float(q) for p, q in msg.get("asks", [])}
+        except (ValueError, TypeError) as exc:
+            logger.error("[MS] Malformed depth snapshot — skipping: %s", exc)
+            return
         if not bids_raw or not asks_raw:
             return
 
@@ -237,7 +241,8 @@ class MicrostructureDetector:
 
         # Sweep + Protection check
         cvd_std = self._cvd.get_cvd_tick_std()
-        cvd_spike_std = abs(cvd_delta_1t) / cvd_std if cvd_std > 1e-9 else 0.0
+        _cvd_n_ready = self._cvd._delta_stats.n >= 10
+        cvd_spike_std = (abs(cvd_delta_1t) / cvd_std if cvd_std > 1e-9 else 0.0) if _cvd_n_ready else 0.0
 
         for price, ws in list(self._wall_states.items()):
             if ws.reload_ratio >= _CONSUMED_RATIO:

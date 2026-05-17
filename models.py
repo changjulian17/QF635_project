@@ -79,7 +79,7 @@ class PortfolioState:
 
     @property
     def daily_loss_pct(self) -> float:
-        return abs(min(0, self.daily_pnl)) / self.starting_equity
+        return abs(min(0, self.daily_pnl)) / self.starting_equity if self.starting_equity > 0 else 0.0
 
 
 # ── Microstructure models ──────────────────────────────────────────────────
@@ -161,7 +161,7 @@ class WallState:
 
     @property
     def persistence_ms(self) -> int:
-        return self.last_seen_ts - self.first_seen_ts
+        return max(0, self.last_seen_ts - self.first_seen_ts)
 
     @property
     def is_persistent(self) -> bool:

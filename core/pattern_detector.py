@@ -76,9 +76,13 @@ class PatternDetector:
         for i in range(w, len(series) - w):
             window = series[i - w: i + w + 1]
             if is_high and series[i] == np.max(window):
-                pivots.append(i)
+                # Deduplicate: skip if previous pivot has the same price (flat top)
+                if not pivots or series[i] != series[pivots[-1]]:
+                    pivots.append(i)
             elif not is_high and series[i] == np.min(window):
-                pivots.append(i)
+                # Deduplicate: skip if previous pivot has the same price (flat bottom)
+                if not pivots or series[i] != series[pivots[-1]]:
+                    pivots.append(i)
         return pivots
 
     def _check_wedge(self, highs, lows, closes, sh_idx, sl_idx, atr: float, vol_ratio: float) -> PatternSignal | None:
@@ -123,6 +127,7 @@ class PatternDetector:
             return None
 
         entry = current_close
+        atr = max(atr, entry * 0.001)   # floor: minimum 0.1% of price when market is flat
         if direction == Direction.LONG:
             sl = entry - settings.ATR_MULTIPLIER_SL * atr
             tp = entry + settings.ATR_MULTIPLIER_TP * atr
@@ -145,11 +150,14 @@ class PatternDetector:
         )
 
     def _check_sr_breakout(self, closes, highs, lows, atr: float, vol_ratio: float) -> PatternSignal | None:
+        if len(closes) < 30:
+            return None
         lookback = closes[-30:]
         resistance = np.percentile(lookback, 95)
         support = np.percentile(lookback, 5)
         current = closes[-1]
-        tolerance = atr * 0.3
+        atr = max(atr, current * 0.001)   # floor: minimum 0.1% of price when market is flat
+        tolerance = max(atr * 0.3, 0.01)
 
         if current > resistance + tolerance and vol_ratio >= settings.BREAKOUT_VOL_MULT:
             sl = current - settings.ATR_MULTIPLIER_SL * atr

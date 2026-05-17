@@ -4,6 +4,7 @@ Startup Reconciler — reconcile local portfolio state with Binance exchange sta
 Called once on startup BEFORE any coroutines run (master arch §9, Step 3).
 Every step is wrapped in try/except so a single exchange error never blocks startup.
 """
+import asyncio
 import json
 import logging
 import sqlite3
@@ -49,7 +50,9 @@ async def reconcile_on_startup(
 
     # S1 — open orders on exchange
     try:
-        open_orders = await client.get_open_orders(symbol=symbol)
+        open_orders = await asyncio.wait_for(
+            client.get_open_orders(symbol=symbol), timeout=30.0
+        )
         result["open_orders"] = open_orders
         logger.info("[Reconcile] %d open order(s) found on exchange", len(open_orders))
     except Exception as exc:
@@ -58,7 +61,7 @@ async def reconcile_on_startup(
 
     # S2 — BTC balance (free + locked)
     try:
-        account = await client.get_account()
+        account = await asyncio.wait_for(client.get_account(), timeout=30.0)
         for bal in account.get("balances", []):
             if bal["asset"] == "BTC":
                 result["btc_balance"] = float(bal["free"]) + float(bal["locked"])
@@ -96,6 +99,7 @@ async def reconcile_on_startup(
         conn.close()
         today_pnl = sum(float(r[0]) for r in rows)
         risk_engine._budget.realised_pnl = today_pnl
+        portfolio.daily_pnl = today_pnl
         result["restored_pnl"] = today_pnl
         logger.info(
             "[Reconcile] Restored realised_pnl=%.4f from %d trade(s) today",

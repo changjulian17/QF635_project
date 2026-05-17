@@ -144,13 +144,19 @@ class BinanceWebSocketConsumer:
     async def _receive_loop(self, ws) -> None:
         conn_start = asyncio.get_event_loop().time()
 
-        async for raw_msg in ws:
+        while True:
             if not self._running:
                 break
 
             if asyncio.get_event_loop().time() - conn_start > _MAX_CONNECTION_SECONDS:
                 logger.info("[WS] Approaching 24 h limit — reconnecting proactively.")
                 await ws.close()
+                break
+
+            try:
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("[WS] No message for 30s — forcing reconnect")
                 break
 
             try:
@@ -164,8 +170,13 @@ class BinanceWebSocketConsumer:
                 self._shared_state.heartbeat_status = status
                 self._shared_state.last_delta_ms    = self.heartbeat.last_delta_ms
                 if self._heartbeat_cb is not None:
-                    asyncio.create_task(
-                        self._heartbeat_cb(status, self.heartbeat.last_delta_ms)
+                    _task = asyncio.create_task(
+                        self._heartbeat_cb(status, self.heartbeat.last_delta_ms),
+                        name="heartbeat_cb",
+                    )
+                    _task.add_done_callback(
+                        lambda t: logger.critical("[WS] heartbeat_cb crashed: %s", t.exception())
+                        if not t.cancelled() and t.exception() is not None else None
                     )
 
                 await self._dispatch(stream, msg)

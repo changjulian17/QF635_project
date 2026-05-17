@@ -37,11 +37,9 @@ class PyramidController:
                 return False, "Leg 1 not yet profitable"
 
         if next_leg == 3:
-            if len(self._legs) < 2:
-                return False, "fewer than 2 open legs"
-            combined = sum(self._unrealised_pnl_leg(i, current_price) for i in range(2))
+            combined = sum(self._unrealised_pnl_leg(i, current_price) for i in range(len(self._legs)))
             if combined <= 0:
-                return False, "Legs 1+2 combined not profitable"
+                return False, "open legs combined not profitable"
 
         return True, ""
 
@@ -50,6 +48,8 @@ class PyramidController:
         return _LEG_SCALARS.get(self.leg_count + 1, 0.0)
 
     def open_leg(self, qty: float, entry_price: float, direction: str = "LONG") -> None:
+        if len(self._legs) >= _MAX_LEGS:
+            raise RuntimeError(f"Pyramid full ({_MAX_LEGS} legs) — call close_leg first")
         self._legs.append({"qty": qty, "entry": entry_price, "direction": direction})
         logger.info("[Pyramid] Leg %d opened qty=%.6f @ %.2f dir=%s",
                     self.leg_count, qty, entry_price, direction)

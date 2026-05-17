@@ -110,7 +110,7 @@ def test_outcome_update(tmp_path):
     rec = _record()
     t._buf = [rec]
     asyncio.run(t._flush())
-    t.update_outcome(rec.signal_id, "WIN", pnl=50.0, pnl_pct=0.005, duration_min=12.5)
+    asyncio.run(t.update_outcome(rec.signal_id, "WIN", pnl=50.0, pnl_pct=0.005, duration_min=12.5))
     row = t._conn.execute(
         "SELECT outcome, pnl, pnl_pct, duration_min FROM signal_records WHERE signal_id=?",
         (rec.signal_id,),

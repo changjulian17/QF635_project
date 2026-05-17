@@ -10,6 +10,7 @@ import datetime
 import json
 import logging
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -72,6 +73,11 @@ class SignalTelemetry:
         self._conn: Optional[sqlite3.Connection] = None
         self._buf: list[SignalRecord] = []
         self._last_flush: float = time.monotonic()
+        self._db_lock = asyncio.Lock()
+        # Serialises event-loop writes (write_system_event) with thread-pool writes
+        # (update_outcome via asyncio.to_thread). asyncio.Lock alone cannot protect
+        # across OS-thread boundaries.
+        self._write_lock = threading.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -119,65 +125,67 @@ class SignalTelemetry:
     # ── Flush ─────────────────────────────────────────────────────────────────
 
     async def _flush(self) -> None:
-        if not self._buf or not self._conn:
-            return
-        rows = self._buf[:]
-        self._buf.clear()
-        self._last_flush = time.monotonic()
-        try:
-            self._conn.executemany(
-                """
-                INSERT OR IGNORE INTO signal_records (
-                    signal_id, strategy_id, timestamp,
-                    micro_signal, gate_passed, rejection_reason,
-                    lob_status, heartbeat_status,
-                    obi_zscore, cvd_delta, spread_bps, confidence, direction,
-                    outcome, pnl, pnl_pct, duration_min
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                [
-                    (
-                        r.signal_id, r.strategy_id, r.timestamp,
-                        r.micro_signal, r.gate_passed, r.rejection_reason,
-                        r.lob_status, r.heartbeat_status,
-                        r.obi_zscore, r.cvd_delta, r.spread_bps,
-                        r.confidence, r.direction,
-                        r.outcome, r.pnl, r.pnl_pct, r.duration_min,
-                    )
-                    for r in rows
-                ],
-            )
-            self._conn.commit()
-            logger.debug("[Telemetry] Flushed %d records.", len(rows))
-        except sqlite3.Error as exc:
-            logger.error("[Telemetry] Flush failed: %s", exc)
-            combined = rows + self._buf
-            if len(combined) > _MAX_BUF:
-                logger.warning(
-                    "[Telemetry] Buffer overflow — dropping %d newest records (cap=%d).",
-                    len(combined) - _MAX_BUF, _MAX_BUF,
+        async with self._db_lock:
+            if not self._buf or not self._conn:
+                return
+            rows = self._buf[:]
+            self._buf.clear()
+            self._last_flush = time.monotonic()
+            try:
+                self._conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO signal_records (
+                        signal_id, strategy_id, timestamp,
+                        micro_signal, gate_passed, rejection_reason,
+                        lob_status, heartbeat_status,
+                        obi_zscore, cvd_delta, spread_bps, confidence, direction,
+                        outcome, pnl, pnl_pct, duration_min
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    [
+                        (
+                            r.signal_id, r.strategy_id, r.timestamp,
+                            r.micro_signal, r.gate_passed, r.rejection_reason,
+                            r.lob_status, r.heartbeat_status,
+                            r.obi_zscore, r.cvd_delta, r.spread_bps,
+                            r.confidence, r.direction,
+                            r.outcome, r.pnl, r.pnl_pct, r.duration_min,
+                        )
+                        for r in rows
+                    ],
                 )
-                combined = combined[:_MAX_BUF]   # keep oldest for audit trail
-            self._buf = combined
+                self._conn.commit()
+                logger.debug("[Telemetry] Flushed %d records.", len(rows))
+            except sqlite3.Error as exc:
+                logger.error("[Telemetry] Flush failed: %s", exc)
+                combined = rows + self._buf
+                if len(combined) > _MAX_BUF:
+                    logger.warning(
+                        "[Telemetry] Buffer overflow — dropping %d newest records (cap=%d).",
+                        len(combined) - _MAX_BUF, _MAX_BUF,
+                    )
+                    combined = combined[:_MAX_BUF]   # keep oldest for audit trail
+                self._buf = combined
 
     def write_system_event(self, event_type: str, payload: dict | None = None) -> None:
         """Write a lifecycle event to system_events while telemetry is running."""
         if self._conn is None:
             return
         try:
-            with self._conn:
-                self._conn.execute(
-                    "INSERT INTO system_events (event_type, occurred_at, payload_json) VALUES (?, ?, ?)",
-                    (
-                        event_type,
-                        datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        json.dumps(payload) if payload is not None else None,
-                    ),
-                )
+            with self._write_lock:
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT INTO system_events (event_type, occurred_at, payload_json) VALUES (?, ?, ?)",
+                        (
+                            event_type,
+                            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            json.dumps(payload) if payload is not None else None,
+                        ),
+                    )
         except sqlite3.Error as exc:
             logger.warning("[Telemetry] system_event write failed %s: %s", event_type, exc)
 
-    def update_outcome(
+    async def update_outcome(
         self,
         signal_id: str,
         outcome: str,
@@ -188,16 +196,22 @@ class SignalTelemetry:
         """Called by OrderManager after a position closes."""
         if not self._conn:
             return
+
+        def _do_update() -> None:
+            with self._write_lock:
+                self._conn.execute(
+                    """
+                    UPDATE signal_records
+                    SET outcome=?, pnl=?, pnl_pct=?, duration_min=?
+                    WHERE signal_id=?
+                    """,
+                    (outcome, pnl, pnl_pct, duration_min, signal_id),
+                )
+                self._conn.commit()
+
         try:
-            self._conn.execute(
-                """
-                UPDATE signal_records
-                SET outcome=?, pnl=?, pnl_pct=?, duration_min=?
-                WHERE signal_id=?
-                """,
-                (outcome, pnl, pnl_pct, duration_min, signal_id),
-            )
-            self._conn.commit()
+            async with self._db_lock:
+                await asyncio.to_thread(_do_update)
         except sqlite3.Error as exc:
             logger.error("[Telemetry] Outcome update failed: %s", exc)
 

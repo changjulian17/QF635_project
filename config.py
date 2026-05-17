@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
-from pydantic import ConfigDict
+from pydantic import ConfigDict, model_validator
+
 
 class Settings(BaseSettings):
     model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8")
@@ -78,5 +79,24 @@ class Settings(BaseSettings):
     # Persistence
     REGISTRY_DB: str = "strategies/registry.db"
     LOB_TICK_DB: str = "data/lob_tick.db"
+
+    @model_validator(mode="after")
+    def _validate_tier_ordering(self) -> "Settings":
+        assert self.TIER_REDUCED_PCT < self.TIER_MINIMAL_PCT, \
+            f"TIER_REDUCED_PCT ({self.TIER_REDUCED_PCT}) must be < TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT})"
+        assert self.TIER_MINIMAL_PCT < self.TIER_PASSIVE_PCT, \
+            f"TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT}) must be < TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT})"
+        assert self.TIER_PASSIVE_PCT < self.TIER_HALTED_PCT, \
+            f"TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT}) must be < TIER_HALTED_PCT ({self.TIER_HALTED_PCT})"
+        assert self.TIER_HALTED_PCT <= self.DAILY_LOSS_LIMIT_PCT, \
+            f"TIER_HALTED_PCT ({self.TIER_HALTED_PCT}) must be <= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"
+        assert self.MAX_DRAWDOWN_PCT >= self.DAILY_LOSS_LIMIT_PCT, \
+            f"MAX_DRAWDOWN_PCT ({self.MAX_DRAWDOWN_PCT}) must be >= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"
+        assert 0.0 < self.KELLY_FRACTION <= 0.5, \
+            f"KELLY_FRACTION ({self.KELLY_FRACTION}) must be in (0.0, 0.5]"
+        assert self.ATR_MULTIPLIER_TP > self.ATR_MULTIPLIER_SL, \
+            f"ATR_MULTIPLIER_TP ({self.ATR_MULTIPLIER_TP}) must be > ATR_MULTIPLIER_SL ({self.ATR_MULTIPLIER_SL})"
+        return self
+
 
 settings = Settings()

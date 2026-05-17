@@ -2,7 +2,7 @@
 
 Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on the Binance Spot Testnet.
 
-**Current phase:** Phase 1M complete (1A–1M done; 1N pending). 271 tests passing.
+**Current phase:** Phase 1 complete (1A–1N done). 273 tests passing.
 
 ## Project layout
 
@@ -46,7 +46,7 @@ scripts/
   test_connection.py — verify Binance testnet connectivity and auth
   test_orders.py     — BUY + SELL round-trip execution test
 
-tests/               — pytest unit tests (212 tests across 13 files)
+tests/               — pytest unit tests (273 tests across 18 files)
 ```
 
 ## Quick actions
@@ -104,4 +104,4 @@ Run unit tests:
 | 1K — Risk Engine rewrite | ✅ | risk/ (engine, budget, pyramid, killswitch) |
 | 1L — IOC execution layer | ✅ | execution/order_manager.py rewrite |
 | 1M — Startup reconciler | ✅ | core/startup_reconciler.py + main.py rewrite |
-| 1N — Integration test | ⏳ | tests/test_integration.py |
+| 1N — Integration test | ✅ | tests/test_integration.py |

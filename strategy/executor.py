@@ -106,9 +106,9 @@ class RuleBasedScorer:
     def score(self, fv: FeatureVector, signal: MicroSignal) -> float:
         score = 0.0
         # OBI directional alignment
-        if signal.direction == "LONG" and fv.obi_zscore > -0.20:
+        if signal.direction == "LONG" and fv.obi_zscore > 0.20:
             score += 0.30
-        elif signal.direction == "SHORT" and fv.obi_zscore < 0.20:
+        elif signal.direction == "SHORT" and fv.obi_zscore < -0.20:
             score += 0.30
         # Volume surge
         score += min(fv.vol_ratio / 4.0, 0.25)
@@ -378,23 +378,32 @@ class StrategyExecutor:
             )
             return
 
-        logger.info(
-            "[Gate6] Fill confirmed for %s — starting persistence monitor on wall %.2f",
-            signal_id[:8], signal.protection_wall.price,
-        )
-        mon = asyncio.create_task(
-            PersistenceMonitor().monitor(
-                protection_wall_price=signal.protection_wall.price,
-                position_side=signal.direction,
-                lob_engine=self._lob_engine,
-                order_manager=self._order_manager,
-                position_closed_event=position_closed_event,
-                check_interval_ms=self._gate6_check_ms,
-            ),
-            name=f"gate6_persistence_{signal_id[:8]}",
-        )
-        mon.add_done_callback(self._on_gate6_task_done)
-        self._gate6_tasks.add(mon)
+        try:
+            logger.info(
+                "[Gate6] Fill confirmed for %s — starting persistence monitor on wall %.2f",
+                signal_id[:8], signal.protection_wall.price,
+            )
+            mon = asyncio.create_task(
+                PersistenceMonitor().monitor(
+                    protection_wall_price=signal.protection_wall.price,
+                    position_side=signal.direction,
+                    lob_engine=self._lob_engine,
+                    order_manager=self._order_manager,
+                    position_closed_event=position_closed_event,
+                    check_interval_ms=self._gate6_check_ms,
+                ),
+                name=f"gate6_persistence_{signal_id[:8]}",
+            )
+            mon.add_done_callback(self._on_gate6_task_done)
+            self._gate6_tasks.add(mon)
+        except Exception:
+            logger.exception(
+                "[Gate6] Failed to start persistence monitor for %s — "
+                "triggering wall-removed alert as safety fallback",
+                signal_id[:8],
+            )
+            if self._order_manager is not None:
+                await self._order_manager.handle_protection_wall_removed(signal.direction)
 
     def _on_gate6_task_done(self, task: asyncio.Task) -> None:
         self._gate6_tasks.discard(task)

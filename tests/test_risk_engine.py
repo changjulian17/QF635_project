@@ -429,6 +429,28 @@ def test_pyramid_leg_via_engine():
     assert req.quantity > 0
 
 
+def test_pyramid_leg3_check_uses_remaining_legs_after_fifo_close():
+    """After close_leg() pops Leg 1, can_add_leg for Leg 3 must check
+    the two remaining open legs (now at indices 0 and 1), not hardcoded
+    original Leg 1 + Leg 2."""
+    p = PyramidController()
+    p.open_leg(qty=1.0,   entry_price=100.0, direction="LONG")  # Leg 1
+    p.open_leg(qty=0.5,   entry_price=102.0, direction="LONG")  # Leg 2
+    p.open_leg(qty=0.25,  entry_price=104.0, direction="LONG")  # Leg 3
+    p.close_leg()  # FIFO close of Leg 1 → _legs = [Leg2@102, Leg3@104]
+
+    # At price 110: Leg2 unrealised = 0.5*(110-102)=+4, Leg3 = 0.25*(110-104)=+1.5
+    # Combined = +5.5 > 0 → should be allowed to add a 3rd leg again
+    ok, reason = p.can_add_leg(current_price=110.0)
+    assert ok is True, f"Expected ok but got: {reason}"
+
+    # At price 101: Leg2 unrealised = 0.5*(101-102)=-0.5, Leg3 = 0.25*(101-104)=-0.75
+    # Combined = -1.25 < 0 → must be rejected
+    ok2, reason2 = p.can_add_leg(current_price=101.0)
+    assert ok2 is False
+    assert "profitable" in reason2
+
+
 # ── New tests: mark_unrealised ────────────────────────────────────────────────
 
 def test_mark_unrealised_updates_budget_loss_pct():

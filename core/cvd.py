@@ -91,7 +91,7 @@ class CVDCalculator:
         """CVD change over the last `ticks` ticks. Returns 0.0 if insufficient history."""
         if len(self._history) <= ticks:
             return 0.0
-        return self._history[-1] - self._history[-1 - ticks]
+        return self._history[-1] - self._history[-(ticks + 1)]
 
     def get_cvd_tick_std(self) -> float:
         """Welford online std of per-trade signed quantity (each trade's contribution to CVD, i.e. per-tick CVD change)."""
