@@ -70,12 +70,13 @@ CryptoSentinel/
 │   ├── cvd.py                 # Standalone CVD calculator
 │   ├── pattern_detector.py    # OHLCV chart pattern detection (context/boost)
 │   ├── signal_telemetry.py    # Signal record writer (all gates, pass + fail)
-│   └── startup_reconciler.py  # Exchange state reconciliation on startup (Phase 1M — pending)
+│   └── startup_reconciler.py  # Exchange state reconciliation on startup + midnight reset
 │
 ├── strategy/                  # Alpha generation and execution
 │   ├── features.py            # FeatureComputer + WelfordOnline (single source of truth)
 │   ├── microstructure.py      # Wall Identification / Absorption / Sweep + Fresh Wall
-│   └── executor.py            # StrategyExecutor — 7-Gate pipeline + confidence scorer
+│   ├── executor.py            # StrategyExecutor — 7-Gate pipeline + confidence scorer
+│   └── spec.py                # StrategySpec — immutable YAML-backed strategy descriptor
 │
 ├── risk/                      # Risk management
 │   ├── engine.py              # RiskEngine — 5-tier throttling, DOV, circuit breakers
@@ -84,14 +85,18 @@ CryptoSentinel/
 │   └── killswitch.py          # GlobalKillswitch — Budget / Heartbeat / Slippage triggers
 │
 ├── execution/                 # Order management
-│   └── order_manager.py       # IOC aggressive limit orders + OCO brackets
+│   ├── order_manager.py       # IOC aggressive limit orders + OCO brackets
+│   └── orders.py              # Order domain classes and enums
 │
-├── backtesting/               # Offline strategy research (Phase 2 — not yet implemented)
-│   ├── tick_backtester.py     # Path A: replay lob_tick.db
-│   ├── walk_forward.py        # Path B: OHLCV walk-forward
-│   └── metrics.py             # Sharpe, Sortino, Calmar, MDD, PF, WR
+├── backtesting/               # Offline strategy research
+│   ├── event_engine.py        # Path A: tick-level event replay engine
+│   ├── signals.py             # Signal generation for backtesting
+│   ├── walk_forward.py        # Path B: OHLCV walk-forward (VectorBT + Optuna)
+│   ├── vectorbt_runner.py     # VectorBT execution wrapper
+│   ├── metrics.py             # Sharpe, Sortino, Calmar, MDD, PF, WR
+│   └── costs.py               # Transaction cost model
 │
-├── data/                      # Data acquisition (Phase 2 — not yet implemented)
+├── data/                      # Data acquisition
 │   ├── fetcher.py             # OHLCVFetcher (CCXT + SQLite cache)
 │   └── validator.py           # 9-check data quality validator
 │
@@ -109,7 +114,7 @@ CryptoSentinel/
 │   └── configs/               # Frozen YAML strategy specs
 │
 ├── data/
-│   ├── lob_tick.db            # LOB Recorder output (real Binance data)
+│   ├── lob_tick.db            # LOB Recorder output (real Binance data — live-writing)
 │   ├── ohlcv_cache.db         # OHLCV SQLite cache (CCXT)
 │   └── backtest_results.db    # Backtest results storage
 │
@@ -407,22 +412,42 @@ All settings live in `config.py` and can be overridden via `.env`.
 ## Tests
 
 ```
-tests/test_models.py                6 tests  — PortfolioState, WallState, FeatureVector
-tests/test_lob_engine.py           20 tests  — state machine, gap detection, wall scan
-tests/test_microstructure.py       14 tests  — wall identification, absorption, sweep
-tests/test_features.py             14 tests  — Welford, no-lookahead, VWAP reset
-tests/test_executor.py             29 tests  — all 7 gates, telemetry emission
-tests/test_cvd.py                  14 tests  — buy/sell CVD, 5-bar delta, std
-tests/test_signal_telemetry.py     10 tests  — flush, batch, timeout, outcome update
-tests/test_db_writer.py            12 tests  — SQLite write, upsert, purge
-tests/test_pattern_detector.py      8 tests  — ATR, swing detection, S/R breakout
-tests/test_risk_engine.py          35 tests  — 5-tier, killswitch, pyramid, circuit breakers
-tests/test_lob_recorder.py         14 tests  — recorder flush, reconnect, stats
-tests/test_ws_consumer.py           6 tests  — heartbeat states, shared state update
+tests/test_risk_engine.py          49 tests  — 5-tier, killswitch, pyramid, circuit breakers
 tests/test_microstructure_engine.py 30 tests  — legacy microstructure engine
+tests/test_executor.py             29 tests  — all 7 gates, telemetry emission
+tests/test_order_manager.py        22 tests  — IOC entry, OCO bracket, fill handling
+tests/test_lob_engine.py           20 tests  — state machine, gap detection, wall scan
+tests/test_lob_recorder.py         14 tests  — recorder flush, reconnect, stats
+tests/test_cvd.py                  14 tests  — buy/sell CVD, 5-bar delta, std
+tests/test_features.py             14 tests  — Welford, no-lookahead, VWAP reset
+tests/test_microstructure.py       14 tests  — wall identification, absorption, sweep
+tests/test_startup_reconciler.py   14 tests  — reconciliation, midnight reset
+tests/test_db_writer.py            12 tests  — SQLite write, upsert, purge
+tests/test_signal_telemetry.py     10 tests  — flush, batch, timeout, outcome update
+tests/test_orders.py               10 tests  — order domain classes and enums
+tests/test_pattern_detector.py      8 tests  — ATR, swing detection, S/R breakout
+tests/test_models.py                6 tests  — PortfolioState, WallState, FeatureVector
+tests/test_ws_consumer.py           6 tests  — heartbeat states, shared state update
+tests/test_integration.py           2 tests  — end-to-end signal → execution pipeline
 ──────────────────────────────────────────────────────────────────────────────
-Total                             212 tests
+Total                             314 tests
 ```
+
+---
+
+## Path to Paper Trading
+
+The trading engine is fully operational on the Binance Spot Testnet. The remaining work before enabling live paper trading (`DRY_RUN=False`) is data accumulation and strategy validation:
+
+| Step | Action | Status |
+|------|--------|--------|
+| **1. Accumulate LOB data** | Keep `lob_recorder` running continuously. Target ≥30 days of `lob_tick.db` data for statistically robust walk-forward splits. Currently ~273 MB and growing. | 🔄 Ongoing |
+| **2. Fetch OHLCV history** | Run `data/fetcher.py` to populate `ohlcv_cache.db` for Path B backtesting | 🔜 Pending |
+| **3. Run backtests** | Path A: `backtesting/event_engine.py` replay of `lob_tick.db`. Path B: `backtesting/walk_forward.py` OHLCV walk-forward via VectorBT + Optuna | 🔜 Pending |
+| **4. Tune strategy config** | Optimise wall sigma (`LOB_WALL_SIGMA`), confidence threshold (`MIN_CONFIDENCE`), ATR multipliers via Optuna. Evaluate Sharpe, Sortino, MDD, PF across out-of-sample windows. | 🔜 Pending |
+| **5. Train XGBoost scorer** | Replace `RuleBasedScorer` in `strategy/executor.py` with trained XGBoost model on accumulated `signal_records` | 🔜 Pending |
+| **6. Freeze StrategySpec** | Write final params to `strategies/configs/v1.yaml` (Rule 6 — immutable after promotion) | 🔜 Pending |
+| **7. Promote to paper trading** | Set `DRY_RUN=False` in `.env`. Monitor Gate funnel and PnL via `dashboard.py`. | 🔜 Pending |
 
 ---
 
@@ -476,7 +501,8 @@ These rules are invariants. Any code that violates them is incorrect.
 
 | Phase | Weeks | Goal | Status |
 |-------|-------|------|--------|
-| **Phase 1A–1K** | 1–3 | Foundation (complete): LOB Recorder, HeartbeatMonitor, LOB state machine, FeatureComputer, Wall/Absorption/Sweep signals, 7-Gate executor, 5-tier Risk Engine, DailyBudget, PyramidController, GlobalKillswitch, signal telemetry | ✅ Done |
-| **Phase 1L–1N** | 3 | Foundation (pending): IOC limit orders (1L), startup reconciler + midnight reset (1M), integration test + killswitch wire-up (1N) | ⏳ Pending |
-| **Phase 2** | 4–8 | Backtesting: OHLCV Path B (VectorBT + Optuna), Tick Path A (replay `lob_tick.db`), XGBoost scorer, Strategy Builder + Registry | 🔜 Next |
+| **Phase 1A–1K** | 1–3 | Foundation: LOB Recorder, HeartbeatMonitor, LOB state machine, FeatureComputer, Wall/Absorption/Sweep signals, 7-Gate executor, 5-tier Risk Engine, DailyBudget, PyramidController, GlobalKillswitch, signal telemetry | ✅ Done |
+| **Phase 1L–1N** | 3 | Foundation: IOC limit orders (1L), startup reconciler + midnight reset (1M), integration test + killswitch wire-up (1N) | ✅ Done |
+| **Phase 2A** | 4–6 | Backtesting infrastructure: OHLCV Path B (VectorBT + Optuna), Tick Path A (event replay engine), walk-forward framework, transaction cost model, metrics suite | ✅ Done |
+| **Phase 2B** | 6–8 | Strategy config tuning: accumulate ≥30 days of LOB data, run walk-forward backtests, train XGBoost confidence scorer, freeze StrategySpec YAML, promote to paper trading | 🔜 Next |
 | **Phase 3** | 9–12 | Dashboard: Dash migration (5 pages: /live, /lob, /backtest, /registry, /config), decay monitoring, LIVE promotion pipeline | 🔜 Future |

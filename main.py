@@ -199,7 +199,7 @@ async def main() -> None:
     budget          = DailyBudget.from_equity(STARTING_EQUITY)
     pyramid         = PyramidController()
     cvd_calculator  = CVDCalculator()
-    lob_engine      = LocalOrderBook()
+    lob_engine      = LocalOrderBook(shared_state=shared_state)
     feature_computer = FeatureComputer()
 
     # Queues ──────────────────────────────────────────────────────────────────

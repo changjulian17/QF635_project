@@ -9,3 +9,11 @@ streamlit==1.35.0
 plotly==5.22.0
 pytest==8.2.2
 pytest-asyncio==0.23.7
+# Phase 2 — backtesting engine
+ccxt>=4.3
+vectorbt>=0.25
+optuna>=3.6
+xgboost>=2.1
+scikit-learn>=1.5
+pyyaml>=6.0
+joblib>=1.4

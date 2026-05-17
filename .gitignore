@@ -64,5 +64,9 @@ temp/
 .claude/
 .gitignore
 
+# XGBoost / ML model artefacts
+*.pkl
+strategies/models/
+
 # Notes
 research/
