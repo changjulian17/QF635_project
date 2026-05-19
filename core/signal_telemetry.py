@@ -44,6 +44,7 @@ class SignalRecord:
     spread_bps:       float = 0.0
     confidence:       float = 0.0
     direction:        str   = ""
+    features_json:    str   = ""   # JSON-encoded list from fv.to_ml_array(); "" if FV not available
 
     # Trade outcome — filled in after position closes
     outcome:          str   = ""    # "WIN" | "LOSS" | "FLAT"
@@ -139,8 +140,8 @@ class SignalTelemetry:
                         micro_signal, gate_passed, rejection_reason,
                         lob_status, heartbeat_status,
                         obi_zscore, cvd_delta, spread_bps, confidence, direction,
-                        outcome, pnl, pnl_pct, duration_min
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        outcome, pnl, pnl_pct, duration_min, features_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     [
                         (
@@ -150,6 +151,7 @@ class SignalTelemetry:
                             r.obi_zscore, r.cvd_delta, r.spread_bps,
                             r.confidence, r.direction,
                             r.outcome, r.pnl, r.pnl_pct, r.duration_min,
+                            r.features_json or None,
                         )
                         for r in rows
                     ],
@@ -239,7 +241,8 @@ class SignalTelemetry:
                 outcome          TEXT DEFAULT '',
                 pnl              REAL DEFAULT 0.0,
                 pnl_pct          REAL DEFAULT 0.0,
-                duration_min     REAL DEFAULT 0.0
+                duration_min     REAL DEFAULT 0.0,
+                features_json    TEXT DEFAULT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sigrecords_ts
                 ON signal_records(strategy_id, timestamp);
@@ -254,4 +257,10 @@ class SignalTelemetry:
             );
         """)
         conn.commit()
+        # Migrate existing databases that predate the features_json column.
+        try:
+            conn.execute("ALTER TABLE signal_records ADD COLUMN features_json TEXT DEFAULT NULL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         return conn

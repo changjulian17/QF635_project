@@ -94,6 +94,7 @@ def detect_sweep_with_protection(
     price_move_pct: float,
     cvd_spike_std: float,
     fresh_walls_behind: list[WallState],
+    now_ms: Optional[int] = None,
 ) -> tuple[bool, dict]:
     """
     Return (True, signal_info) when all four sweep+protection conditions are met:
@@ -102,21 +103,25 @@ def detect_sweep_with_protection(
       3. CVD spike > 1.5σ
       4. Fresh Wall appeared on the far side within 3 s
 
+    now_ms : override the current timestamp (ms epoch). When None, uses
+             time.time(). Pass the replay event timestamp for backtesting so
+             freshness checks use replay time, not wall-clock time.
+
     Returns (False, {}) if any condition fails.
     """
     consumed    = wall_consumed.reload_ratio < _CONSUMED_RATIO
     price_moved = abs(price_move_pct) > _PRICE_MOVE_THRESH
     cvd_spike   = cvd_spike_std > _CVD_SPIKE_STD
 
-    now_ms = int(time.time() * 1000)
+    _now = now_ms if now_ms is not None else int(time.time() * 1000)
     fresh_list = [
         w for w in fresh_walls_behind
-        if (now_ms - w.first_seen_ts) <= _FRESH_WALL_MS
+        if (_now - w.first_seen_ts) <= _FRESH_WALL_MS
     ]
     has_protection = len(fresh_list) > 0
 
     if consumed and price_moved and cvd_spike and has_protection:
-        newest = min(fresh_list, key=lambda w: now_ms - w.first_seen_ts)
+        newest = min(fresh_list, key=lambda w: _now - w.first_seen_ts)
         direction = "LONG" if wall_consumed.side == "ask" else "SHORT"
         return True, {
             "direction": direction,

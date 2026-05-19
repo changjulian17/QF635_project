@@ -13,6 +13,7 @@ Gates (master arch §5.5):
 """
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -219,7 +220,11 @@ class StrategyExecutor:
         self._fc            = feature_computer
         self._state         = shared_state
         self._budget        = budget
-        self._scorer        = rule_scorer or RuleBasedScorer()
+        if rule_scorer is not None:
+            self._scorer = rule_scorer
+        else:
+            from strategy.scorer import ScorerFactory   # lazy import — avoids circular dep at load time
+            self._scorer = ScorerFactory.load_or_fallback()
         self._risk_tier: str = "FULL"
         self._lob_engine    = lob_engine
         self._order_manager = order_manager
@@ -289,6 +294,7 @@ class StrategyExecutor:
         rec.obi_zscore       = fv.obi_zscore
         rec.cvd_delta        = fv.cvd_delta
         rec.spread_bps       = fv.spread_bps
+        rec.features_json    = json.dumps(fv.to_ml_array())
         rec.lob_status       = fv.lob_status
         rec.heartbeat_status = self._state.heartbeat_status
         if not ok:
