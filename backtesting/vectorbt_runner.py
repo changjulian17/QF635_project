@@ -302,12 +302,18 @@ def _run_vectorbt(
     entries_s = pd.Series(arrays.entries,     index=idx)
 
     # signals.py returns absolute price levels (e.g. sl=49 000, tp=51 500).
-    # VBT expects sl_stop/tp_stop as fractions of entry price (e.g. 0.02 = 2%).
-    # Convert: fraction = |close - level| / close at each signal bar (NaN elsewhere).
-    sl_abs = pd.Series(arrays.sl_stop, index=idx)
-    tp_abs = pd.Series(arrays.tp_stop, index=idx)
-    sl_s   = (close_s - sl_abs).abs() / close_s   # NaN where sl_abs is NaN
-    tp_s   = (tp_abs  - close_s).abs() / close_s  # NaN where tp_abs is NaN
+    # VBT expects sl_stop/tp_stop as fractions of the *entry price*, not close.
+    # VBT fills at close + slippage (for longs), so:
+    #   entry_price ≈ close × (1 + slippage)
+    #   sl_stop     = (entry_price − sl_abs) / entry_price
+    #   tp_stop     = (tp_abs − entry_price) / entry_price
+    # Using close instead of entry_approx understates the SL distance by ~slippage,
+    # biasing Optuna toward parameter sets with tighter-than-intended stops.
+    sl_abs       = pd.Series(arrays.sl_stop, index=idx)
+    tp_abs       = pd.Series(arrays.tp_stop, index=idx)
+    entry_approx = close_s * (1 + slippage)          # approximate VBT fill price
+    sl_s = (entry_approx - sl_abs).abs() / entry_approx   # NaN where sl_abs is NaN
+    tp_s = (tp_abs - entry_approx).abs() / entry_approx   # NaN where tp_abs is NaN
 
     # Pass high/low so VBT checks stops intrabar (not only against close).
     high_s = pd.Series(df["high"].values, index=idx) if "high" in df.columns else None

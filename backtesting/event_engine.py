@@ -331,7 +331,7 @@ class EventDrivenEngine:
         # ── Close any remaining open trade at last bar ────────────────────
         if open_trade is not None:
             last_close  = closes[-1]
-            last_dt     = datetimes[-1].to_pydatetime()
+            last_dt     = datetimes.iloc[-1].to_pydatetime()
             exit_fees   = self.costs.exit_cost(last_close, open_trade.quantity)
             net_pnl     = self._gross_pnl(open_trade, last_close) - exit_fees
 
@@ -458,8 +458,10 @@ class EventDrivenEngine:
         if daily_loss_pct >= 0.01:
             return False, 0.0
 
-        # Gate 2: cooldown after consecutive losses
-        if consec_losses >= 3 and current_bar <= cooldown_bar:
+        # Gate 2: cooldown window after 3 consecutive losses.
+        # consec_losses is reset to 0 when cooldown_bar is set (one-shot), so
+        # we check only cooldown_bar — not consec_losses — to gate new entries.
+        if current_bar <= cooldown_bar:
             return False, 0.0
 
         # Determine tier

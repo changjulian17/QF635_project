@@ -246,7 +246,9 @@ def calculate_metrics(
     )
 
     # ── Sortino (downside deviation only) ─────────────────────────────────────
-    downside = daily_returns[daily_returns < 0]
+    # Filter on returns < rfr_daily (the MAR), not < 0.  A day returning
+    # +0.005% still earns below the risk-free rate and belongs in the downside.
+    downside = daily_returns[daily_returns < rfr_daily]
     down_std = downside.std() if len(downside) > 1 else 0.0
     if down_std < 1e-9:
         # No negative returns — assign a capped value rather than ±inf

@@ -463,7 +463,8 @@ def _compute_buy_and_hold(
     # (without this, iloc[0] = starting_equity * close[0]/open[0], which uses
     # close[0] as the effective entry price — a small but systematic error).
     if isinstance(idx, pd.DatetimeIndex):
-        t_entry  = idx[0] - pd.Timedelta(minutes=1)
+        tf_ms   = TIMEFRAME_MS.get(timeframe, 60_000)
+        t_entry = idx[0] - pd.Timedelta(milliseconds=tf_ms)
         eq_curve = pd.concat([
             pd.Series([starting_equity],
                       index=pd.DatetimeIndex([t_entry], tz=idx.tz),
@@ -575,7 +576,8 @@ def _print_leaderboard(df: pd.DataFrame) -> None:
                       f"Sharpe={r['sharpe_ratio']:.2f}")
 
     # ── Recommended strategy ──────────────────────────────────────────────────
-    passing = strat_df[strat_df.get("passes_minimum_bar", pd.Series(False)) == True]   # noqa: E712
+    pmb     = strat_df.get("passes_minimum_bar")                        # None if column absent
+    passing = strat_df[pmb == True] if pmb is not None else strat_df.iloc[:0]  # noqa: E712
     if not passing.empty:
         best = passing.iloc[0]
         print(
