@@ -97,6 +97,8 @@ async def _portfolio_mtm_loop(
     """Check KS-1 budget breach every second. Exits after triggering emergency_close_all."""
     while True:
         await asyncio.sleep(1.0)
+        if killswitch.is_active:
+            return
         if killswitch.check_budget(budget.realised_pnl, budget.unrealised_pnl):
             await emergency_close_all(
                 order_manager, portfolio, telemetry, "KILLSWITCH_BUDGET"
@@ -224,6 +226,8 @@ async def main() -> None:
     # Killswitch callbacks — closures capture by reference; resolved at call-time
     # after all components are constructed and before the TaskGroup starts.
     async def _heartbeat_cb(status: str, delta_ms: float) -> None:
+        if killswitch.is_active:
+            return
         if killswitch.check_heartbeat(status, delta_ms):
             await emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_HEARTBEAT")
 

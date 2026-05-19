@@ -63,6 +63,7 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -85,6 +86,7 @@ DEFAULT_TIMEFRAMES  = ["1m", "5m", "15m"]
 DEFAULT_TRAIN_DAYS  = 90
 DEFAULT_TEST_DAYS   = 30
 DEFAULT_STEP_DAYS   = 30
+MIN_OOS_TRADES      = 10   # windows below this are excluded from aggregate metrics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +194,8 @@ def run_walk_forward(
     step_days:       int         = DEFAULT_STEP_DAYS,
     n_optuna_trials: int         = 300,
     starting_equity: float       = 10_000.0,
+    db_path:         str         = RESULTS_DB,
+    csv_path:        str         = RESULTS_CSV,
 ) -> pd.DataFrame:
     """
     Run the full walk-forward pipeline across all strategies and timeframes.
@@ -232,6 +236,7 @@ def run_walk_forward(
             dfs[tf] = fetcher.resample(df_1m, tf)
 
     all_results: list[dict] = []
+    windows_per_tf: dict[str, list[WalkForwardWindow]] = {}
 
     total_combinations = len(strategies) * len(timeframes)
     combination_idx    = 0
@@ -245,6 +250,7 @@ def run_walk_forward(
             step_days  = step_days,
             timeframe  = tf,
         )
+        windows_per_tf[tf] = windows
 
         if not windows:
             logger.warning("[WF] Skipping %s — no valid windows.", tf)
@@ -308,8 +314,16 @@ def run_walk_forward(
                     starting_equity = starting_equity,
                 )
                 eq_full, tr_full = engine_full.run(test_df)
-                oos_trades_full.extend(tr_full)
-                oos_equity_full.append(eq_full)
+
+                if len(tr_full) < MIN_OOS_TRADES:
+                    logger.warning(
+                        "  Window %d: only %d full-mode trades (< %d min) "
+                        "— excluded from aggregate.",
+                        w.window_idx + 1, len(tr_full), MIN_OOS_TRADES,
+                    )
+                else:
+                    oos_trades_full.extend(tr_full)
+                    oos_equity_full.append(eq_full)
 
                 logger.info(
                     "  Window %d done | raw_trades=%d full_trades=%d",
@@ -355,17 +369,36 @@ def run_walk_forward(
             })
             all_results.append(row)
 
+    # ── Buy-and-hold benchmark rows (one per timeframe, OOS period only) ─────
+    for tf in timeframes:
+        df  = dfs.get(tf)
+        wns = windows_per_tf.get(tf, [])   # reuse already-computed windows
+        if df is not None and wns:
+            oos_df  = df.iloc[wns[0].test_start : wns[-1].test_end].reset_index(drop=True)
+            bah_row = _compute_buy_and_hold(oos_df, starting_equity, tf)
+            if bah_row:
+                all_results.append(bah_row)
+
     if not all_results:
         logger.error("[WF] No results produced. Check data length and parameters.")
         return pd.DataFrame()
 
-    results_df = (
-        pd.DataFrame(all_results)
+    # Separate strategy rows from benchmark rows so they sort independently.
+    # Benchmarks always have is_benchmark=True; strategy rows never do.
+    strat_rows = [r for r in all_results if not r.get("is_benchmark")]
+    bm_rows    = [r for r in all_results if r.get("is_benchmark")]
+
+    strat_df = (
+        pd.DataFrame(strat_rows)
         .sort_values("composite_score", ascending=False)
         .reset_index(drop=True)
-    )
+    ) if strat_rows else pd.DataFrame()
 
-    _save_results(results_df)
+    bm_df = pd.DataFrame(bm_rows).reset_index(drop=True) if bm_rows else pd.DataFrame()
+
+    results_df = pd.concat([strat_df, bm_df], ignore_index=True)
+
+    _save_results(results_df, db_path=db_path, csv_path=csv_path)
     _print_leaderboard(results_df)
 
     return results_df
@@ -398,7 +431,67 @@ def _chain_equity_curves(
         scale = prev.iloc[-1] / curr.iloc[0] if curr.iloc[0] != 0 else 1.0
         chained.append(curr * scale)
 
-    return pd.concat(chained).sort_index()
+    # Windows are non-overlapping by construction (generate_windows guarantees
+    # test_end[i] == test_start[i+1]), so concat preserves chronological order.
+    # sort_index() is intentionally omitted — it would interleave curves if
+    # any window returned a RangeIndex equity series.
+    return pd.concat(chained)
+
+
+def _compute_buy_and_hold(
+    df:              pd.DataFrame,
+    starting_equity: float,
+    timeframe:       str,
+) -> dict:
+    """
+    Passive benchmark: buy at first bar open, hold to last bar close.
+    Computed over the same OOS slice as the strategies so the comparison is fair.
+    """
+    if len(df) < 2:
+        return {}
+
+    if "datetime" in df.columns:
+        idx = pd.DatetimeIndex(df["datetime"])
+    else:
+        idx = pd.RangeIndex(len(df))
+
+    entry_price = float(df["open"].iloc[0])
+    eq_values   = starting_equity * df["close"].values / entry_price
+
+    # Prepend starting_equity at the bar-open timestamp so the equity curve
+    # starts at exactly starting_equity and total_return = close[-1]/open[0]-1
+    # (without this, iloc[0] = starting_equity * close[0]/open[0], which uses
+    # close[0] as the effective entry price — a small but systematic error).
+    if isinstance(idx, pd.DatetimeIndex):
+        t_entry  = idx[0] - pd.Timedelta(minutes=1)
+        eq_curve = pd.concat([
+            pd.Series([starting_equity],
+                      index=pd.DatetimeIndex([t_entry], tz=idx.tz),
+                      name="equity"),
+            pd.Series(eq_values, index=idx, name="equity"),
+        ])
+    else:
+        eq_curve = pd.Series(eq_values, index=idx, name="equity")
+
+    total_minutes = len(df) * TIMEFRAME_MS.get(timeframe, 60_000) / 60_000
+    pnl_pct       = df["close"].iloc[-1] / entry_price - 1
+    trade = {
+        "pnl":              starting_equity * pnl_pct,
+        "pnl_pct":          pnl_pct,
+        "duration_minutes": total_minutes,
+    }
+
+    m   = calculate_metrics(eq_curve, [trade], "BUY_AND_HOLD", timeframe)
+    row = m.to_dict()
+    row.update({
+        "raw_sharpe":     m.sharpe_ratio,
+        "raw_return_pct": m.total_return_pct,
+        "raw_trades":     1,
+        "best_params":    {},
+        "n_wf_windows":   1,
+        "is_benchmark":   True,   # excluded from strategy sort and minimum-bar gate
+    })
+    return row
 
 
 def _trades_to_dicts(trades: list[SimulatedTrade]) -> list[dict]:
@@ -413,38 +506,76 @@ def _trades_to_dicts(trades: list[SimulatedTrade]) -> list[dict]:
     ]
 
 
-def _save_results(df: pd.DataFrame) -> None:
+def _save_results(
+    df:       pd.DataFrame,
+    db_path:  str = RESULTS_DB,
+    csv_path: str = RESULTS_CSV,
+) -> None:
     """Persist results to SQLite and CSV."""
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
 
-    # Drop non-serialisable columns for DB
-    db_df = df.drop(columns=["best_params"], errors="ignore")
+    # JSON-serialize best_params so it is queryable in both SQLite and CSV.
+    # Without this, dicts are dropped from DB and stored as unparse-able repr
+    # strings in CSV.
+    out = df.copy()
+    if "best_params" in out.columns:
+        out["best_params"] = out["best_params"].apply(
+            lambda x: json.dumps(x) if isinstance(x, dict) else str(x)
+        )
 
-    with sqlite3.connect(RESULTS_DB) as conn:
-        db_df.to_sql("results", conn, if_exists="replace", index=True)
+    with sqlite3.connect(db_path) as conn:
+        out.to_sql("results", conn, if_exists="replace", index=True)
 
-    df.to_csv(RESULTS_CSV, index=False)
-    logger.info("[WF] Results saved → %s | %s", RESULTS_DB, RESULTS_CSV)
+    out.to_csv(csv_path, index=False)
+    logger.info("[WF] Results saved → %s | %s", db_path, csv_path)
 
 
 def _print_leaderboard(df: pd.DataFrame) -> None:
     """Print a formatted leaderboard table to stdout."""
-    display_cols = [
+    is_bm    = df.get("is_benchmark", pd.Series(False, index=df.index, dtype=bool))
+    is_bm    = is_bm.map(lambda x: x is True)   # True→True, NaN/False→False; no downcasting
+    strat_df = df[~is_bm]
+    bm_df    = df[is_bm]
+
+    strat_cols = [
         "strategy", "timeframe",
         "total_return_pct", "sharpe_ratio", "sortino_ratio",
         "max_drawdown_pct", "profit_factor", "win_rate_pct",
         "total_trades", "composite_score", "passes_minimum_bar",
     ]
-    cols = [c for c in display_cols if c in df.columns]
+    bm_cols = [
+        "strategy", "timeframe",
+        "total_return_pct", "sharpe_ratio", "sortino_ratio",
+        "max_drawdown_pct",
+    ]
 
     sep = "=" * 100
     print(f"\n{sep}")
     print("STRATEGY LEADERBOARD — Out-of-Sample Walk-Forward Results")
     print(sep)
-    print(df[cols].to_string(index=True, float_format="%.2f"))
+
+    if not strat_df.empty:
+        cols = [c for c in strat_cols if c in strat_df.columns]
+        print(strat_df[cols].to_string(index=True, float_format="%.2f"))
+    else:
+        print("  (no strategy results)")
+
     print(sep)
 
-    passing = df[df["passes_minimum_bar"] == True]   # noqa: E712
+    # ── Suspicious Sharpe flag ────────────────────────────────────────────────
+    if "sharpe_ratio" in strat_df.columns:
+        suspicious = strat_df[strat_df["sharpe_ratio"] > 5.0]
+        if not suspicious.empty:
+            print(
+                "\n⚠️  SUSPICIOUS: Sharpe > 5.0 detected — possible overfitting "
+                "or lookahead bias. Investigate before deploying."
+            )
+            for _, r in suspicious.iterrows():
+                print(f"    {r['strategy']} | {r['timeframe']} | "
+                      f"Sharpe={r['sharpe_ratio']:.2f}")
+
+    # ── Recommended strategy ──────────────────────────────────────────────────
+    passing = strat_df[strat_df.get("passes_minimum_bar", pd.Series(False)) == True]   # noqa: E712
     if not passing.empty:
         best = passing.iloc[0]
         print(
@@ -460,4 +591,13 @@ def _print_leaderboard(df: pd.DataFrame) -> None:
             "\n⚠️   No strategy passed the minimum bar. "
             "Review signal quality or adjust thresholds."
         )
+
+    # ── Benchmark reference section ───────────────────────────────────────────
+    if not bm_df.empty:
+        print(f"\n{'─' * 100}")
+        print("BENCHMARK REFERENCE (passive buy-and-hold, same OOS period)")
+        print(f"{'─' * 100}")
+        cols = [c for c in bm_cols if c in bm_df.columns]
+        print(bm_df[cols].to_string(index=False, float_format="%.2f"))
+
     print()

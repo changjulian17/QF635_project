@@ -229,6 +229,7 @@ class EventDrivenEngine:
                     day_open_eq   = equity
                     daily_loss    = 0.0
                     current_day   = bar_day
+                    consec_losses = 0
 
             # ── Check SL/TP on open trade ─────────────────────────────────
             if open_trade is not None:
@@ -262,6 +263,9 @@ class EventDrivenEngine:
                     if not self.raw_mode:
                         if net_pnl < 0:
                             consec_losses += 1
+                            if consec_losses >= 3:
+                                cooldown_bar  = i + 20
+                                consec_losses = 0   # one-shot: reset so a new streak needs 3 fresh losses
                         else:
                             consec_losses = 0
 

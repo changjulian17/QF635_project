@@ -128,13 +128,16 @@ class BacktestMetrics:
         if self.total_trades < 10:
             return -999.0
 
-        trade_bonus = min(1.0, self.total_trades / 50)
-        dd_penalty  = max(0.0, (self.max_drawdown_pct - 10.0) / 10.0)
+        trade_bonus   = min(1.0, self.total_trades / 50)
+        dd_penalty    = max(0.0, (self.max_drawdown_pct - 10.0) / 10.0)
+        # Cap Calmar at 3.0: short OOS windows (30d) annualise small returns
+        # to very large Calmar values, corrupting the leaderboard ranking.
+        calmar_capped = min(self.calmar_ratio, 3.0)
 
         return (
             self.sharpe_ratio    * 0.35
             + self.profit_factor * 0.25
-            + self.calmar_ratio  * 0.20
+            + calmar_capped      * 0.20
             + trade_bonus        * 0.10
             - dd_penalty         * 0.10
         )
@@ -243,9 +246,13 @@ def calculate_metrics(
     )
 
     # ── Sortino (downside deviation only) ─────────────────────────────────────
-    downside     = daily_returns[daily_returns < 0]
-    down_std     = downside.std() if len(downside) > 1 else 1e-9
-    sortino      = excess.mean() / down_std * ann_factor
+    downside = daily_returns[daily_returns < 0]
+    down_std = downside.std() if len(downside) > 1 else 0.0
+    if down_std < 1e-9:
+        # No negative returns — assign a capped value rather than ±inf
+        sortino = 10.0 if excess.mean() > 0 else 0.0
+    else:
+        sortino = excess.mean() / down_std * ann_factor
 
     # ── Total & annualised return ─────────────────────────────────────────────
     initial_equity = equity_curve.iloc[0]
@@ -262,23 +269,18 @@ def calculate_metrics(
     drawdown_curve = (equity_curve - rolling_peak) / rolling_peak
     max_dd         = float(abs(drawdown_curve.min()))
 
-    # Max drawdown duration
-    in_dd      = drawdown_curve < -1e-8
-    dd_start   = None
-    max_dd_dur = timedelta(0)
-    for ts, val in in_dd.items():
-        if val and dd_start is None:
-            dd_start = ts
-        elif not val and dd_start is not None:
-            dur = ts - dd_start
-            if dur > max_dd_dur:
-                max_dd_dur = dur
-            dd_start = None
-    # Handle drawdown that extends to the end
-    if dd_start is not None:
-        dur = equity_curve.index[-1] - dd_start
-        if dur > max_dd_dur:
-            max_dd_dur = dur
+    # Max drawdown duration — vectorised to avoid O(n) Python iteration
+    in_dd = drawdown_curve < -1e-8
+    if in_dd.any():
+        # Each time we leave a drawdown, the cumsum increments, labelling
+        # each consecutive drawdown episode with a unique integer.
+        episode_id = (~in_dd).cumsum()[in_dd]
+        durations  = in_dd[in_dd].groupby(episode_id).apply(
+            lambda g: g.index[-1] - g.index[0]
+        )
+        max_dd_dur = durations.max()
+    else:
+        max_dd_dur = timedelta(0)
 
     # ── Calmar ───────────────────────────────────────────────────────────────
     calmar = float(ann_return / max_dd) if max_dd > 1e-10 else 0.0

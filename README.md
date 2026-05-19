@@ -57,7 +57,7 @@ FILTER — Confidence Scorer
 CryptoSentinel/
 │
 ├── main.py                    # Async orchestrator — all coroutines
-├── backtest.py                # CLI backtest runner (Phase 2 — not yet implemented)
+├── backtest.py                # CLI backtest runner — VectorBT + Optuna two-phase pipeline
 ├── config.py                  # Pydantic V2 settings from .env
 ├── models.py                  # Shared dataclasses and enums
 ├── requirements.txt

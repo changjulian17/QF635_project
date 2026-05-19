@@ -154,9 +154,11 @@ def repair_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
     Repairs applied (in order):
       1. Remove duplicate timestamps (keep first occurrence).
-      2. Remove rows with non-positive prices.
+      2. Remove rows with non-positive or null prices.
       3. Fix OHLC violations by clamping high/low to valid ranges.
-      4. Forward-fill small timestamp gaps (≤ 3 missing candles).
+      4. Forward-fill small timestamp gaps (≤ 3 consecutive missing candles).
+         Only genuine exchange gaps are filled — timestamps removed by steps
+         1–2 are never re-introduced.
 
     Returns a repaired copy. Does NOT modify the input DataFrame.
     """
@@ -166,23 +168,64 @@ def repair_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     # 1. Remove duplicates
     df = df.drop_duplicates(subset=["timestamp"], keep="first")
 
-    # 2. Remove non-positive prices
-    price_cols = ["open", "high", "low", "close"]
-    mask       = (df[price_cols] > 0).all(axis=1)
-    df         = df[mask]
+    # 2. Remove non-positive / null prices
+    price_cols   = ["open", "high", "low", "close"]
+    mask         = (df[price_cols] > 0).all(axis=1)
+    removed_ts   = set(df.loc[~mask, "timestamp"].tolist())   # intentionally removed
+    df           = df[mask]
 
     # 3. Fix OHLC violations
-    # high must be >= max(open, close)
     df["high"] = df[["high", "open", "close"]].max(axis=1)
-    # low must be <= min(open, close)
     df["low"]  = df[["low",  "open", "close"]].min(axis=1)
 
-    # 4. Sort by timestamp and reset index
+    # 4. Sort by timestamp
     df = df.sort_values("timestamp").reset_index(drop=True)
 
+    # 5. Forward-fill genuine exchange gaps (≤ 3 consecutive missing candles).
+    #    Timestamps that were deliberately dropped in step 2 are excluded so
+    #    we do not silently re-introduce rows with bad data.
+    if len(df) > 1:
+        # Use min positive diff rather than mode: during outages, mode() can
+        # return 2×interval (most common diff becomes a 2-bar gap), making the
+        # gap-fill grid twice as coarse and silently under-filling missing bars.
+        _diffs = pd.Series(df["timestamp"].values).diff().dropna()
+        tf_ms  = int(_diffs[_diffs > 0].min())
+
+        full_ts = np.arange(
+            int(df["timestamp"].iloc[0]),
+            int(df["timestamp"].iloc[-1]) + tf_ms,
+            tf_ms,
+            dtype=np.int64,
+        )
+
+        df_idx = df.set_index("timestamp").reindex(full_ts)
+        is_na  = df_idx["close"].isna()
+
+        # Exclude timestamps that were intentionally removed
+        is_intentional = pd.Index(full_ts).isin(removed_ts)
+        is_gap         = is_na & ~is_intentional
+
+        if is_gap.any():
+            group_id = (is_gap != is_gap.shift()).cumsum()
+            run_len  = is_gap.groupby(group_id).transform("sum")
+
+            df_filled = df_idx.ffill()
+            # Restore: intentional removals + gaps longer than 3 bars
+            bad_mask = is_na & (is_intentional | (run_len > 3))
+            df_filled[bad_mask] = np.nan
+
+            n_filled = int((is_gap & (run_len <= 3)).sum())
+            if n_filled:
+                logger.info("[Validator] Repair forward-filled %d gap candle(s).", n_filled)
+
+            df = df_filled.dropna(subset=["close"]).reset_index()
+            df = df.rename(columns={"index": "timestamp"})
+            df["timestamp"] = df["timestamp"].astype(np.int64)
+            df["datetime"]  = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+
     removed = initial_len - len(df)
-    if removed:
-        logger.info("[Validator] Repair removed %d invalid rows.", removed)
+    if removed > 0:
+        logger.info("[Validator] Repair removed %d invalid row(s).", removed)
 
     return df
 
