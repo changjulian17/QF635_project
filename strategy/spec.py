@@ -137,7 +137,7 @@ class StrategySpec:
             name                  = d["name"],
             version               = d["version"],
             status                = d.get("status", "RESEARCH"),
-            strategy_id           = d.get("strategy_id", str(uuid.uuid4())),
+            strategy_id           = d["strategy_id"],
             created_at            = d.get("created_at", datetime.now(timezone.utc).isoformat()),
             backtest_results_path = d.get("backtest_results_path"),
             entry_rules = EntryRules(

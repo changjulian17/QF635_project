@@ -2,7 +2,7 @@
 
 Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on the Binance Spot Testnet.
 
-**Current phase:** Phase 1 complete (1A–1N done). 273 tests passing.
+**Current phase:** Phase 2I complete (2A–2I done). 380 tests passing.
 
 ## Project layout
 
@@ -24,6 +24,10 @@ strategy/
   features.py          — FeatureComputer + WelfordOnline (15 features, no look-ahead)
   microstructure.py    — Wall Identification / Absorption / Sweep + Fresh Wall detector
   executor.py          — StrategyExecutor — 7-Gate pipeline + RuleBasedScorer
+  scorer.py            — XGBoostScorer + ScorerFactory (ML confidence gate, falls back to RuleBasedScorer)
+  spec.py              — StrategySpec, EntryRules, StatisticalValidity dataclasses
+  registry.py          — StrategyRegistry — dual-store (YAML + SQLite) lifecycle + promotion gates
+  builder.py           — StrategyBuilder — 3-stage pipeline: load metrics → validate → register
 
 risk/
   engine.py            — RiskEngine — 5-tier throttling, DOV, circuit breakers
@@ -46,7 +50,7 @@ scripts/
   test_connection.py — verify Binance testnet connectivity and auth
   test_orders.py     — BUY + SELL round-trip execution test
 
-tests/               — pytest unit tests (273 tests across 18 files)
+tests/               — pytest unit tests (380 tests across 28 files)
 ```
 
 ## Quick actions
@@ -105,3 +109,6 @@ Run unit tests:
 | 1L — IOC execution layer | ✅ | execution/order_manager.py rewrite |
 | 1M — Startup reconciler | ✅ | core/startup_reconciler.py + main.py rewrite |
 | 1N — Integration test | ✅ | tests/test_integration.py |
+| 2G — Tick Replay Engine | ✅ | backtesting/tick_replay.py |
+| 2H — XGBoost Confidence Scorer | ✅ | strategy/scorer.py + ScorerFactory wired into Gate 2 |
+| 2I — Strategy Registry | ✅ | strategy/spec.py, registry.py, builder.py + tests/test_registry.py |
