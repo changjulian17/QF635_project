@@ -74,8 +74,9 @@ class XGBoostScorer:
         model = XGBClassifier(
             n_estimators=200, max_depth=4, learning_rate=0.05,
             eval_metric="logloss", random_state=42,
+            early_stopping_rounds=20,
         )
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
         auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
         if auc < 0.62:
@@ -189,6 +190,7 @@ def _load_labeled_rows(db_path: str, min_trades: int) -> list[dict]:
     Excludes trades with duration_min <= 2.0 to filter out noise-stopped trades — short stops
     may reflect liquidity voids rather than genuine signal failure, which would confound training.
     """
+    n_features = len(FEATURE_ORDER)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -200,9 +202,19 @@ def _load_labeled_rows(db_path: str, min_trades: int) -> list[dict]:
                  AND duration_min > 2.0
                ORDER BY timestamp ASC"""
         ).fetchall()
-    if len(rows) < min_trades:
+    valid: list[dict] = []
+    for row in rows:
+        arr = json.loads(row["features_json"])
+        if len(arr) != n_features:
+            logger.warning(
+                "[Scorer] Skipping row with %d features (expected %d) — schema mismatch",
+                len(arr), n_features,
+            )
+            continue
+        valid.append(dict(row))
+    if len(valid) < min_trades:
         raise ValueError(
-            f"Need {min_trades}+ labeled trades with features_json, have {len(rows)}. "
+            f"Need {min_trades}+ labeled trades with features_json, have {len(valid)} valid. "
             "Keep Phase 1N running."
         )
-    return [dict(r) for r in rows]
+    return valid

@@ -241,7 +241,7 @@ class TickReplayEngine:
         bid_levels = sorted(bids_raw.items(), reverse=True)
         ask_levels = sorted(asks_raw.items())
 
-        sigma = self._fc._p.wall_sigma
+        sigma = self._fc.wall_sigma
         new_walls: dict[float, dict] = {
             w["price"]: w
             for w in (
@@ -489,7 +489,9 @@ class TickReplayEngine:
             hit_tp = trade_price <= tp
 
         if hit_sl:
-            self._close_position(sl, ts_ms, "SL")
+            # Fill at the trade print that triggered the stop, not the exact SL level.
+            # The SL level is the floor/ceiling; the actual fill is the tick that crossed it.
+            self._close_position(trade_price, ts_ms, "SL")
         elif hit_tp:
             self._close_position(tp, ts_ms, "TP")
 

@@ -5,18 +5,22 @@ StrategyBuilder — 3-stage pipeline that produces a deployable StrategySpec
 from pre-computed walk-forward metrics.
 
 Stage 1: Load  — accept OOS metrics dict
-Stage 2: Validate — check minimum viability (trade count, no NaN Sharpe)
+Stage 2: Validate — check minimum viability (trade count, Sharpe, drawdown, profit factor)
 Stage 3: Register — construct StrategySpec and register with StrategyRegistry
-
-Connection to backtest_results.db is TBD (Phase 2F/2G completion required).
 """
 
 from __future__ import annotations
 
+import logging
 import math
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from strategy.spec import EntryRules, StatisticalValidity, StrategySpec
+
+if TYPE_CHECKING:
+    from backtesting.tick_replay import TickReplayEngine
+
+logger = logging.getLogger(__name__)
 
 # Import lazily to allow use without a registry (e.g. tests that only need build())
 try:
@@ -110,6 +114,108 @@ class StrategyBuilder:
         return spec
 
     # ------------------------------------------------------------------ #
+    # Walk-forward backtesting                                             #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def walk_forward_metrics(
+        engine: "TickReplayEngine",
+        start_ms: int,
+        end_ms: int,
+        n_folds: int = 5,
+    ) -> dict:
+        """
+        Rolling walk-forward: splits [start_ms, end_ms] into n_folds equal windows
+        and runs replay_window on each independently. All OOS trades are pooled to
+        produce stable aggregate metrics.
+
+        Returns a metrics dict with all keys required by StrategyBuilder.build().
+
+        Raises ValueError if the combined OOS result has no closed trades.
+
+        Notes
+        -----
+        Each fold starts with a fresh (cold) feature state. For tick data with
+        dense candle history this warms up within a few minutes of replay time,
+        so the first 1-2 trades per fold may use slightly sparse ATR/RSI history.
+        This is a conservative bias — it does not inflate backtest metrics.
+        """
+        if n_folds < 2:
+            raise ValueError("n_folds must be >= 2 to produce meaningful OOS splits.")
+        fold_ms = (end_ms - start_ms) // n_folds
+
+        all_pnl_usd: list[float] = []
+        equity_checkpoints: list[float] = [10_000.0]  # track running equity for drawdown
+
+        for i in range(n_folds):
+            fold_start = start_ms + i * fold_ms
+            fold_end   = fold_start + fold_ms
+            eq_curve, trades = engine.replay_window(fold_start, fold_end)
+
+            for t in trades:
+                all_pnl_usd.append(t.pnl_usd)
+
+            if len(eq_curve) > 0:
+                equity_checkpoints.extend(eq_curve.tolist())
+
+            logger.info(
+                "[WalkForward] Fold %d/%d: %d trades, fold equity Δ=%.2f",
+                i + 1, n_folds, len(trades),
+                (eq_curve.iloc[-1] - eq_curve.iloc[0]) if len(eq_curve) > 1 else 0.0,
+            )
+
+        if not all_pnl_usd:
+            raise ValueError(
+                "Walk-forward produced zero closed trades across all folds — "
+                "extend the date range or review signal thresholds."
+            )
+
+        wins        = [p for p in all_pnl_usd if p > 0]
+        losses      = [p for p in all_pnl_usd if p <= 0]
+        n_total     = len(all_pnl_usd)
+        win_rate    = len(wins) / n_total * 100.0
+        gross_win   = sum(wins)
+        gross_loss  = abs(sum(losses)) if losses else 0.0
+        pf          = gross_win / gross_loss if gross_loss > 1e-9 else float("inf")
+
+        # Max drawdown from the equity checkpoint series
+        peak        = equity_checkpoints[0]
+        max_dd_pct  = 0.0
+        for eq in equity_checkpoints:
+            peak = max(peak, eq)
+            dd   = (peak - eq) / peak * 100.0 if peak > 0 else 0.0
+            max_dd_pct = max(max_dd_pct, dd)
+
+        # Trade-level Sharpe: mean/std of pnl_usd, annualised by trade frequency.
+        # Assumes crypto runs 24/7 and uses the actual fold span for frequency.
+        mean_pnl = sum(all_pnl_usd) / n_total
+        if n_total > 1:
+            variance = sum((p - mean_pnl) ** 2 for p in all_pnl_usd) / (n_total - 1)
+            std_pnl  = math.sqrt(variance)
+        else:
+            std_pnl = 0.0
+
+        if std_pnl > 1e-9:
+            total_days  = (end_ms - start_ms) / 86_400_000
+            trades_per_day = n_total / max(total_days, 1)
+            ann_factor  = math.sqrt(trades_per_day * 365)
+            sharpe      = (mean_pnl / std_pnl) * ann_factor
+        else:
+            sharpe = 0.0
+
+        # Composite score rewards Sharpe and profit factor, penalises drawdown.
+        composite = sharpe * pf / (1.0 + max_dd_pct / 100.0) if math.isfinite(pf) else 0.0
+
+        return {
+            "oos_trade_count":  n_total,
+            "sharpe_oos":       round(sharpe, 4),
+            "max_drawdown_pct": round(max_dd_pct, 2),
+            "profit_factor":    round(pf, 4) if math.isfinite(pf) else 999.0,
+            "win_rate_pct":     round(win_rate, 2),
+            "composite_score":  round(composite, 4),
+        }
+
+    # ------------------------------------------------------------------ #
     # Internal helpers                                                      #
     # ------------------------------------------------------------------ #
 
@@ -129,9 +235,22 @@ class StrategyBuilder:
                 "no OOS trades to validate against."
             )
 
-        sharpe = metrics["sharpe_oos"]
-        if math.isnan(float(sharpe)):
+        sharpe = float(metrics["sharpe_oos"])
+        if math.isnan(sharpe):
             raise ValueError("sharpe_oos is NaN — backtest produced no valid returns.")
+
+        drawdown = float(metrics["max_drawdown_pct"])
+        if drawdown < 0:
+            raise ValueError(
+                f"max_drawdown_pct={drawdown:.1f}% is negative — "
+                "pass the absolute drawdown percentage."
+            )
+
+        pf = float(metrics["profit_factor"])
+        if pf < 0:
+            raise ValueError(
+                f"profit_factor={pf:.3f} is negative — check gross loss calculation."
+            )
 
     def _next_version(self, name: str) -> int:
         """Return 1 if no existing spec, or max(existing versions) + 1."""

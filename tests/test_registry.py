@@ -7,6 +7,7 @@ All tests use tmp_path — no shared filesystem state.
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -289,3 +290,183 @@ def test_builder_raises_on_zero_trade_count(tmp_path):
 
     with pytest.raises(ValueError, match="oos_trade_count=0"):
         builder.build("Zero Trades", "1m", metrics=metrics)
+
+
+def test_builder_raises_on_negative_drawdown(tmp_path):
+    builder = StrategyBuilder()
+    metrics = _valid_metrics()
+    metrics["max_drawdown_pct"] = -5.0
+
+    with pytest.raises(ValueError, match="negative"):
+        builder.build("Bad Drawdown", "1m", metrics=metrics)
+
+
+def test_builder_raises_on_negative_profit_factor(tmp_path):
+    builder = StrategyBuilder()
+    metrics = _valid_metrics()
+    metrics["profit_factor"] = -1.0
+
+    with pytest.raises(ValueError, match="negative"):
+        builder.build("Bad PF", "1m", metrics=metrics)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 8 — promote() enforces PAPER gate automatically
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_promote_to_paper_blocked_by_gate(tmp_path):
+    """promote('PAPER') must raise when the spec fails can_promote_to_paper()."""
+    registry = _make_registry(tmp_path)
+    spec = _make_spec(oos_trade_count=10)   # below PAPER_MIN_OOS_TRADES=50
+    registry.register(spec)
+
+    with pytest.raises(ValueError, match="Promotion to PAPER blocked"):
+        registry.promote(spec.strategy_id, "PAPER")
+
+
+def test_promote_to_live_requires_paper_metrics(tmp_path):
+    """promote('LIVE') without paper_metrics must raise immediately."""
+    registry = _make_registry(tmp_path)
+    spec = _make_spec(name="LiveTest", oos_trade_count=60)
+    registry.register(spec)
+    registry.promote(spec.strategy_id, "PAPER")
+
+    with pytest.raises(ValueError, match="paper_metrics is required"):
+        registry.promote(spec.strategy_id, "LIVE")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 9 — count_paper_trades and compute_rolling_sharpe
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _seed_signal_records(db_path: str, strategy_id: str, n: int = 10) -> None:
+    """Insert synthetic APPROVED WIN/LOSS records into signal_records."""
+    import sqlite3, json
+    from datetime import datetime, timezone, timedelta
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_records (
+            signal_id TEXT PRIMARY KEY, strategy_id TEXT, timestamp TEXT,
+            micro_signal TEXT, gate_passed TEXT, rejection_reason TEXT,
+            lob_status TEXT, heartbeat_status TEXT,
+            obi_zscore REAL, cvd_delta REAL, spread_bps REAL,
+            confidence REAL, direction TEXT,
+            outcome TEXT DEFAULT '', pnl REAL DEFAULT 0.0,
+            pnl_pct REAL DEFAULT 0.0, duration_min REAL DEFAULT 0.0,
+            features_json TEXT DEFAULT NULL
+        )
+    """)
+    base = datetime.now(timezone.utc) - timedelta(days=5)
+    for i in range(n):
+        outcome = "WIN" if i % 2 == 0 else "LOSS"
+        pnl_pct = 0.005 if outcome == "WIN" else -0.003
+        ts = (base + timedelta(hours=i)).isoformat()
+        conn.execute(
+            "INSERT INTO signal_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(i), strategy_id, ts, "SWEEP_WITH_PROTECTION", "APPROVED",
+             "", "SYNCED", "HEALTHY", 1.5, 0.8, 3.0, 0.7, "LONG",
+             outcome, pnl_pct * 1000, pnl_pct, 5.0, None),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_count_paper_trades_returns_correct_count(tmp_path):
+    registry = _make_registry(tmp_path)
+    spec = _make_spec()
+    registry.register(spec)
+    _seed_signal_records(str(tmp_path / "registry.db"), spec.strategy_id, n=12)
+
+    count = registry.count_paper_trades(spec.strategy_id)
+    assert count == 12
+
+
+def test_count_paper_trades_returns_zero_for_unknown_id(tmp_path):
+    registry = _make_registry(tmp_path)
+    assert registry.count_paper_trades("nonexistent-id") == 0
+
+
+def test_compute_rolling_sharpe_returns_float(tmp_path):
+    registry = _make_registry(tmp_path)
+    spec = _make_spec()
+    registry.register(spec)
+    _seed_signal_records(str(tmp_path / "registry.db"), spec.strategy_id, n=20)
+
+    sharpe = registry.compute_rolling_sharpe(spec.strategy_id, days=30)
+    assert isinstance(sharpe, float)
+    assert math.isfinite(sharpe)
+
+
+def test_compute_rolling_sharpe_returns_zero_with_no_trades(tmp_path):
+    registry = _make_registry(tmp_path)
+    sharpe = registry.compute_rolling_sharpe("no-trades-id", days=30)
+    assert sharpe == 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 10 — walk_forward_metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _MockEngine:
+    """Minimal replay engine stub — returns fixed trades regardless of window."""
+
+    def __init__(self, trades_per_fold: int = 8):
+        self._trades_per_fold = trades_per_fold
+        self._call_count = 0
+
+    def replay_window(self, start_ms: int, end_ms: int):
+        import pandas as pd
+        from backtesting.tick_replay import ReplayTrade
+        from models import MicroSignal
+        self._call_count += 1
+        sig = MicroSignal(signal_type="SWEEP_WITH_PROTECTION", direction="LONG", timestamp_ms=start_ms)
+        trades = []
+        for i in range(self._trades_per_fold):
+            pnl = 10.0 if i % 3 != 0 else -5.0   # ~67% win rate
+            trades.append(ReplayTrade(
+                entry_ts_ms=start_ms + i * 1000,
+                exit_ts_ms=start_ms + i * 1000 + 500,
+                direction="LONG",
+                entry_price=50_000.0,
+                exit_price=50_010.0 if pnl > 0 else 49_990.0,
+                qty=0.001,
+                pnl_usd=pnl,
+                exit_reason="TP" if pnl > 0 else "SL",
+                signal=sig,
+            ))
+        eq = pd.Series(
+            [10_000.0, 10_000.0 + sum(t.pnl_usd for t in trades)],
+            index=pd.to_datetime([start_ms, end_ms], unit="ms", utc=True),
+        )
+        return eq, trades
+
+
+def test_walk_forward_metrics_returns_valid_dict(tmp_path):
+    engine = _MockEngine(trades_per_fold=10)
+    start_ms = 1_700_000_000_000
+    end_ms   = start_ms + 5 * 24 * 3_600_000   # 5 days
+
+    metrics = StrategyBuilder.walk_forward_metrics(engine, start_ms, end_ms, n_folds=5)
+
+    assert metrics["oos_trade_count"] == 50   # 5 folds × 10 trades
+    assert 0.0 < metrics["win_rate_pct"] < 100.0
+    assert metrics["profit_factor"] > 0
+    assert metrics["max_drawdown_pct"] >= 0.0
+    assert math.isfinite(metrics["sharpe_oos"])
+    assert math.isfinite(metrics["composite_score"])
+    assert engine._call_count == 5   # one call per fold
+
+
+def test_walk_forward_metrics_raises_on_zero_trades(tmp_path):
+    class _EmptyEngine:
+        def replay_window(self, s, e):
+            import pandas as pd
+            return pd.Series(dtype=float), []
+
+    with pytest.raises(ValueError, match="zero closed trades"):
+        StrategyBuilder.walk_forward_metrics(_EmptyEngine(), 0, 86_400_000, n_folds=3)
+
+
+def test_walk_forward_metrics_raises_on_single_fold(tmp_path):
+    with pytest.raises(ValueError, match="n_folds must be >= 2"):
+        StrategyBuilder.walk_forward_metrics(_MockEngine(), 0, 86_400_000, n_folds=1)

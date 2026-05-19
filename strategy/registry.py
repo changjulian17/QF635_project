@@ -16,10 +16,11 @@ Specs are frozen once they reach PAPER status: re-registering the same
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import yaml
@@ -174,8 +175,23 @@ class StrategyRegistry:
             )
         return (not reasons, reasons)
 
-    def promote(self, strategy_id: str, new_status: str) -> None:
-        """Update status in DB (commits first) then rewrites YAML. Manual call required."""
+    def promote(
+        self,
+        strategy_id: str,
+        new_status: str,
+        paper_metrics: Optional[dict] = None,
+    ) -> None:
+        """
+        Update status in DB (commits first) then rewrites YAML.
+
+        Promotion gates are enforced automatically:
+          PAPER: must pass can_promote_to_paper().
+          LIVE:  must pass can_promote_to_live(); caller must supply paper_metrics.
+
+        DB is written before YAML so the DB is always the authoritative forward record.
+        A crash after DB commit but before YAML rewrite leaves YAML at old status;
+        re-running promote() will recover.
+        """
         if new_status not in _STATUS_RANK:
             raise ValueError(f"Unknown status '{new_status}'")
         name = version = None
@@ -193,22 +209,41 @@ class StrategyRegistry:
                     f"Cannot demote '{row['name']}' v{row['version']} "
                     f"from {row['status']} to {new_status}."
                 )
+            name, version = row["name"], row["version"]
+
+        # Load the spec and enforce gates before touching the DB.
+        spec = self._load_yaml(name, version)
+        if new_status == "PAPER":
+            ok, reasons = self.can_promote_to_paper(spec)
+            if not ok:
+                raise ValueError(
+                    f"Promotion to PAPER blocked for '{name}' v{version}: {reasons}"
+                )
+        elif new_status == "LIVE":
+            if paper_metrics is None:
+                raise ValueError(
+                    "paper_metrics is required to promote to LIVE. "
+                    "Supply weeks_running, total_trades, sharpe_rolling."
+                )
+            ok, reasons = self.can_promote_to_live(spec, paper_metrics)
+            if not ok:
+                raise ValueError(
+                    f"Promotion to LIVE blocked for '{name}' v{version}: {reasons}"
+                )
+
+        with self._conn() as conn:
             promoted_at = datetime.now(timezone.utc).isoformat()
             conn.execute(
                 "UPDATE strategies SET status=?, promoted_at=? WHERE strategy_id=?",
                 (new_status, promoted_at, strategy_id),
             )
-            name, version = row["name"], row["version"]
-        # DB committed — write YAML last so the DB is always the forward record.
-        # A crash here leaves DB at new_status and YAML at old; re-run promote to recover.
-        spec = self._load_yaml(name, version)
         self._write_yaml(dataclasses.replace(spec, status=new_status))
 
     def get_active_strategy(self) -> Optional[StrategySpec]:
         """Return highest-status spec. Ties broken by most-recent created_at."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT name, version, status, created_at FROM strategies ORDER BY created_at DESC"
+                "SELECT name, version, status, created_at FROM strategies"
             ).fetchall()
         if not rows:
             return None
@@ -237,11 +272,53 @@ class StrategyRegistry:
         return row[0]
 
     def count_paper_trades(self, strategy_id: str) -> int:
-        raise NotImplementedError(
-            "count_paper_trades requires signal_records wiring — not yet available."
-        )
+        """Count APPROVED trades with a WIN/LOSS outcome for this strategy.
+
+        Returns 0 if signal_records has not been created by SignalTelemetry yet.
+        """
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    """SELECT COUNT(*) FROM signal_records
+                       WHERE strategy_id = ?
+                         AND gate_passed = 'APPROVED'
+                         AND outcome IN ('WIN', 'LOSS')""",
+                    (strategy_id,),
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            return 0
 
     def compute_rolling_sharpe(self, strategy_id: str, days: int) -> float:
-        raise NotImplementedError(
-            "compute_rolling_sharpe requires signal_records wiring — not yet available."
-        )
+        """
+        Trade-level annualised Sharpe over the last `days` calendar days.
+
+        Uses pnl_pct (net return per trade) from signal_records.
+        Returns 0.0 if fewer than 2 closed trades are found.
+        Annualisation factor = sqrt(trades_per_day × 365).
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        try:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    """SELECT pnl_pct FROM signal_records
+                       WHERE strategy_id = ?
+                         AND gate_passed = 'APPROVED'
+                         AND outcome IN ('WIN', 'LOSS')
+                         AND timestamp >= ?
+                       ORDER BY timestamp ASC""",
+                    (strategy_id, cutoff),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return 0.0
+        if len(rows) < 2:
+            return 0.0
+        returns = [r[0] for r in rows]
+        n = len(returns)
+        mean_r = sum(returns) / n
+        variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
+        std_r = math.sqrt(variance)
+        if std_r < 1e-9:
+            return 0.0
+        ann_factor = math.sqrt((n / days) * 365)
+        return (mean_r / std_r) * ann_factor

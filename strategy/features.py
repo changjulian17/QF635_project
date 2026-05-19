@@ -79,6 +79,10 @@ class FeatureComputer:
         self._prev_close:        float = 0.0
         self._cur_close:         float = 0.0
 
+    @property
+    def wall_sigma(self) -> float:
+        return self._p.wall_sigma
+
     # ── Candle update ─────────────────────────────────────────────────────────
 
     def update_candle(self, candle: Candle) -> None:
