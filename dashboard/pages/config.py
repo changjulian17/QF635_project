@@ -1,11 +1,12 @@
 import requests
 
 import dash
-from dash import dcc, html, Input, Output, State, callback
+from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 
 from config import settings
-from dashboard._db import fetch_system_events
+from dashboard._db import fetch_system_events, DBOffline
+from dashboard._logic import fire_killswitch as _fire_ks, validate_ks_confirm as _validate_ks
 
 dash.register_page(__name__, path="/config", name="Config")
 
@@ -98,6 +99,7 @@ layout = html.Div([
             ),
             dbc.Label("Type CONFIRM to proceed:"),
             dbc.Input(id="cfg-ks-confirm-input", placeholder="CONFIRM", type="text"),
+            html.Div(id="cfg-ks-fire-error", className="mt-2"),
         ]),
         dbc.ModalFooter([
             dbc.Button("Cancel", id="cfg-ks-cancel", color="secondary", className="me-2"),
@@ -138,8 +140,9 @@ def update_config_page(n, engine_state):
         ks_disabled = False
 
     events = fetch_system_events(limit=50)
-    if events:
-        import json
+    if isinstance(events, DBOffline):
+        event_table = dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
+    elif events:
         event_table = dbc.Table([
             html.Thead(html.Tr([html.Th("Timestamp"), html.Th("Event Type"), html.Th("Payload")])),
             html.Tbody([
@@ -162,6 +165,8 @@ def update_config_page(n, engine_state):
 
 @callback(
     Output("cfg-ks-modal", "is_open"),
+    Output("cfg-ks-confirm-input", "value"),   # C3: clear input on close
+    Output("cfg-ks-fire-error", "children"),   # C4: surface POST failure
     Input("cfg-ks-open-modal", "n_clicks"),
     Input("cfg-ks-cancel", "n_clicks"),
     Input("cfg-ks-confirm-btn", "n_clicks"),
@@ -172,19 +177,20 @@ def update_config_page(n, engine_state):
 def toggle_cfg_ks_modal(open_clicks, cancel_clicks, confirm_clicks, confirm_text, is_open):
     ctx = dash.callback_context
     if not ctx.triggered:
-        return is_open
+        return is_open, no_update, no_update
     trigger = ctx.triggered[0]["prop_id"].split(".")[0]
     if trigger == "cfg-ks-open-modal":
-        return True
+        return True, "", no_update
     if trigger == "cfg-ks-cancel":
-        return False
+        return False, "", no_update
     if trigger == "cfg-ks-confirm-btn" and confirm_text == "CONFIRM":
-        try:
-            requests.post(f"{_API_BASE}/api/killswitch", timeout=3)
-        except Exception:
-            pass
-        return False
-    return is_open
+        success = _fire_ks(_API_BASE)
+        if not success:
+            return True, no_update, dbc.Alert(
+                "Failed to reach engine — check that main.py is running.", color="danger"
+            )
+        return False, "", no_update
+    return is_open, no_update, no_update
 
 
 @callback(
@@ -192,4 +198,4 @@ def toggle_cfg_ks_modal(open_clicks, cancel_clicks, confirm_clicks, confirm_text
     Input("cfg-ks-confirm-input", "value"),
 )
 def validate_cfg_ks_confirm(value):
-    return value != "CONFIRM"
+    return _validate_ks(value)

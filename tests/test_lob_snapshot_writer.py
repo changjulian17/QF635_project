@@ -1,4 +1,4 @@
-"""Tests for the _lob_snapshot_writer coroutine and DBWriter.write_lob_snapshot."""
+"""Tests for engine.lob_snapshot_writer and DBWriter.write_lob_snapshot."""
 import asyncio
 import json
 import sqlite3
@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import LOBSnapshot, LOBLevel
 from engine.db_writer import DBWriter
+from engine.lob_snapshot_writer import lob_snapshot_writer
 
 
 def _make_snapshot(n_levels: int = 5) -> LOBSnapshot:
@@ -50,25 +51,6 @@ def _make_writer(db_file, monkeypatch):
         ),
         ms_bar_queue=q,
     )
-
-
-# ── Inline version of _lob_snapshot_writer to avoid importing main.py ─────────
-
-async def _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer, interval=1.0):
-    """Same logic as main._lob_snapshot_writer — tested without importing main.py."""
-    while True:
-        await asyncio.sleep(interval)
-        if lob_engine.lob_status != "SYNCED":
-            continue
-        snapshot = await lob_engine.get_snapshot()
-        if snapshot is None:
-            continue
-        total_bid = sum(l.qty for l in snapshot.bids)
-        total_ask = sum(l.qty for l in snapshot.asks)
-        obi = (total_bid - total_ask) / (total_bid + total_ask) if (total_bid + total_ask) > 0 else 0.0
-        mid = (snapshot.bids[0].price + snapshot.asks[0].price) / 2 if snapshot.bids and snapshot.asks else 0.0
-        spread = (snapshot.asks[0].price - snapshot.bids[0].price) if snapshot.bids and snapshot.asks else 0.0
-        await db_writer.write_lob_snapshot(snapshot, obi, spread, mid, cvd_calculator.get_cvd_delta())
 
 
 @pytest.mark.asyncio
@@ -120,7 +102,7 @@ async def test_rolling_retention_enforced(db_conn, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_lob_snapshot_writer_skips_when_not_synced():
-    """_lob_snapshot_writer should not write when lob_status != SYNCED."""
+    """Writer should not write when lob_status != SYNCED."""
     lob_engine = MagicMock()
     lob_engine.lob_status = "UNINITIALISED"
     lob_engine.get_snapshot = AsyncMock()
@@ -136,9 +118,9 @@ async def test_lob_snapshot_writer_skips_when_not_synced():
         if call_count >= 2:
             raise asyncio.CancelledError()
 
-    with patch("asyncio.sleep", fake_sleep):
+    with patch("engine.lob_snapshot_writer.asyncio.sleep", fake_sleep):
         try:
-            await _lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
+            await lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
         except asyncio.CancelledError:
             pass
 
@@ -148,7 +130,7 @@ async def test_lob_snapshot_writer_skips_when_not_synced():
 
 @pytest.mark.asyncio
 async def test_lob_snapshot_writer_skips_when_snapshot_none():
-    """_lob_snapshot_writer should handle None snapshot gracefully."""
+    """Writer should handle None snapshot gracefully."""
     lob_engine = MagicMock()
     lob_engine.lob_status = "SYNCED"
     lob_engine.get_snapshot = AsyncMock(return_value=None)
@@ -164,9 +146,9 @@ async def test_lob_snapshot_writer_skips_when_snapshot_none():
         if call_count >= 2:
             raise asyncio.CancelledError()
 
-    with patch("asyncio.sleep", fake_sleep):
+    with patch("engine.lob_snapshot_writer.asyncio.sleep", fake_sleep):
         try:
-            await _lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
+            await lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
         except asyncio.CancelledError:
             pass
 
@@ -175,7 +157,7 @@ async def test_lob_snapshot_writer_skips_when_snapshot_none():
 
 @pytest.mark.asyncio
 async def test_lob_snapshot_writer_writes_when_synced():
-    """_lob_snapshot_writer should call write_lob_snapshot when LOB is SYNCED."""
+    """Writer should call write_lob_snapshot when LOB is SYNCED, with OBI in [-1, 1]."""
     snapshot = _make_snapshot()
     lob_engine = MagicMock()
     lob_engine.lob_status = "SYNCED"
@@ -193,14 +175,43 @@ async def test_lob_snapshot_writer_writes_when_synced():
         if call_count >= 2:
             raise asyncio.CancelledError()
 
-    with patch("asyncio.sleep", fake_sleep):
+    with patch("engine.lob_snapshot_writer.asyncio.sleep", fake_sleep):
         try:
-            await _lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
+            await lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
         except asyncio.CancelledError:
             pass
 
     db_writer.write_lob_snapshot.assert_called_once()
-    args = db_writer.write_lob_snapshot.call_args
-    assert args[0][0] is snapshot
-    obi = args[0][1]
+    args = db_writer.write_lob_snapshot.call_args[0]
+    assert args[0] is snapshot
+    obi = args[1]
     assert -1.0 <= obi <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_lob_snapshot_writer_tolerates_exception():
+    """A transient exception should be logged and the loop should continue, not crash."""
+    lob_engine = MagicMock()
+    lob_engine.lob_status = "SYNCED"
+    lob_engine.get_snapshot = AsyncMock(side_effect=RuntimeError("transient"))
+    db_writer = MagicMock()
+    db_writer.write_lob_snapshot = AsyncMock()
+    cvd = MagicMock()
+
+    call_count = 0
+
+    async def fake_sleep(t):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 3:
+            raise asyncio.CancelledError()
+
+    with patch("engine.lob_snapshot_writer.asyncio.sleep", fake_sleep):
+        try:
+            await lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
+        except asyncio.CancelledError:
+            pass
+
+    # Should have been called twice (2 iterations before cancel), not crashed
+    assert lob_engine.get_snapshot.call_count == 2
+    db_writer.write_lob_snapshot.assert_not_called()

@@ -4,8 +4,8 @@ from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 
 from config import settings
-from dashboard._db import fetch_portfolio_history, fetch_signal_funnel
-from dashboard._logic import validate_ks_confirm as _validate_ks, fire_killswitch as _fire_ks, decay_badge_color
+from dashboard._db import fetch_signal_funnel, DBOffline
+from dashboard._logic import validate_ks_confirm as _validate_ks, fire_killswitch as _fire_ks
 
 dash.register_page(__name__, path="/live", name="Live")
 
@@ -74,6 +74,7 @@ layout = html.Div([
                     ),
                     dbc.Label("Type CONFIRM to proceed:"),
                     dbc.Input(id="live-ks-confirm-input", placeholder="CONFIRM", type="text"),
+                    html.Div(id="live-ks-fire-error", className="mt-2"),
                 ]),
                 dbc.ModalFooter([
                     dbc.Button("Cancel", id="live-ks-cancel", color="secondary", className="me-2"),
@@ -95,7 +96,6 @@ layout = html.Div([
     Input("engine-state-store", "data"),
 )
 def update_live_page(n, engine_state):
-    # ── Engine state ───────────────────────────────────────────────────────
     ks_active = engine_state.get("killswitch_active", False) if engine_state else False
     engine_online = engine_state is not None
 
@@ -108,21 +108,22 @@ def update_live_page(n, engine_state):
     except Exception:
         pass
 
-    equity = portfolio["equity"] if portfolio else "—"
-    daily_pnl = portfolio["daily_pnl"] if portfolio else "—"
-    drawdown = portfolio["drawdown_pct"] if portfolio else "—"
-    consec = portfolio["consecutive_losses"] if portfolio else "—"
+    equity   = portfolio.get("equity")    if portfolio else None
+    daily_pnl = portfolio.get("daily_pnl") if portfolio else None
+    drawdown  = portfolio.get("drawdown_pct") if portfolio else None
     risk_tier = engine_state.get("risk_tier", "—") if engine_state else "—"
     tier_color = _TIER_COLORS.get(risk_tier, "light")
 
-    equity_str = f"${equity:,.2f}" if isinstance(equity, (int, float)) else equity
-    pnl_str = f"${daily_pnl:+,.2f}" if isinstance(daily_pnl, (int, float)) else daily_pnl
-    dd_str = f"{drawdown * 100:.2f}%" if isinstance(drawdown, (int, float)) else drawdown
+    equity_str = f"${equity:,.2f}"          if isinstance(equity,    (int, float)) else "—"
+    pnl_str    = f"${daily_pnl:+,.2f}"      if isinstance(daily_pnl, (int, float)) else "—"
+    dd_str     = f"{drawdown * 100:.2f}%"   if isinstance(drawdown,  (int, float)) else "—"
+    pnl_color  = "success" if isinstance(daily_pnl, (int, float)) and daily_pnl >= 0 else "danger"
+    dd_color   = "success" if isinstance(drawdown,  (int, float)) and drawdown < 0.02 else "warning"
 
     metrics_row = [
         _metric_card("Equity", equity_str),
-        _metric_card("Daily PnL", pnl_str, "success" if isinstance(daily_pnl, float) and daily_pnl >= 0 else "danger"),
-        _metric_card("Drawdown", dd_str, "success" if isinstance(drawdown, float) and drawdown < 0.02 else "warning"),
+        _metric_card("Daily PnL", pnl_str, pnl_color),
+        _metric_card("Drawdown", dd_str, dd_color),
         dbc.Col(
             dbc.Card([
                 dbc.CardBody([
@@ -135,18 +136,20 @@ def update_live_page(n, engine_state):
     ]
 
     # ── Signal funnel ──────────────────────────────────────────────────────
-    funnel_rows = fetch_signal_funnel(hours=24)
-    if funnel_rows:
-        total = sum(r["cnt"] for r in funnel_rows)
+    funnel_result = fetch_signal_funnel(hours=24)
+    if isinstance(funnel_result, DBOffline):
+        funnel_table = dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
+    elif funnel_result:
+        total = sum(r["cnt"] for r in funnel_result) or 1
         funnel_table = dbc.Table([
             html.Thead(html.Tr([html.Th("Gate"), html.Th("Count"), html.Th("% of Total")])),
             html.Tbody([
                 html.Tr([
                     html.Td(r["gate_passed"]),
                     html.Td(r["cnt"]),
-                    html.Td(f"{r['cnt'] / total * 100:.1f}%" if total else "—"),
+                    html.Td(f"{r['cnt'] / total * 100:.1f}%"),
                 ])
-                for r in sorted(funnel_rows, key=lambda x: x["gate_passed"])
+                for r in sorted(funnel_result, key=lambda x: x["gate_passed"])
             ]),
         ], striped=True, bordered=True, hover=True, dark=True, size="sm")
     else:
@@ -162,12 +165,12 @@ def update_live_page(n, engine_state):
             ])),
             html.Tbody([
                 html.Tr([
-                    html.Td(p["side"]),
-                    html.Td(f"{p['entry_price']:.2f}"),
-                    html.Td(f"{p['quantity']:.6f}"),
-                    html.Td(f"{p['stop_loss']:.2f}"),
-                    html.Td(f"{p['take_profit']:.2f}"),
-                    html.Td(f"{p['unrealised_pnl']:+.4f}"),
+                    html.Td(p.get("side", "—")),
+                    html.Td(f"{p['entry_price']:.2f}" if p.get("entry_price") is not None else "—"),
+                    html.Td(f"{p['quantity']:.6f}"    if p.get("quantity")    is not None else "—"),
+                    html.Td(f"{p['stop_loss']:.2f}"   if p.get("stop_loss")   is not None else "—"),
+                    html.Td(f"{p['take_profit']:.2f}" if p.get("take_profit") is not None else "—"),
+                    html.Td(f"{p['unrealised_pnl']:+.4f}" if p.get("unrealised_pnl") is not None else "—"),
                 ])
                 for p in positions
             ]),
@@ -194,6 +197,8 @@ def update_live_page(n, engine_state):
 
 @callback(
     Output("live-ks-modal", "is_open"),
+    Output("live-ks-confirm-input", "value"),   # C3: always clear input on close
+    Output("live-ks-fire-error", "children"),   # C4: surface POST failures
     Input("live-ks-open-modal", "n_clicks"),
     Input("live-ks-cancel", "n_clicks"),
     Input("live-ks-confirm-btn", "n_clicks"),
@@ -204,16 +209,20 @@ def update_live_page(n, engine_state):
 def toggle_ks_modal(open_clicks, cancel_clicks, confirm_clicks, confirm_text, is_open):
     ctx = dash.callback_context
     if not ctx.triggered:
-        return is_open
+        return is_open, no_update, no_update
     trigger = ctx.triggered[0]["prop_id"].split(".")[0]
     if trigger == "live-ks-open-modal":
-        return True
+        return True, "", no_update
     if trigger == "live-ks-cancel":
-        return False
+        return False, "", no_update
     if trigger == "live-ks-confirm-btn" and confirm_text == "CONFIRM":
-        _fire_ks(_API_BASE)
-        return False
-    return is_open
+        success = _fire_ks(_API_BASE)
+        if not success:
+            return True, no_update, dbc.Alert(
+                "Failed to reach engine — check that main.py is running.", color="danger"
+            )
+        return False, "", no_update
+    return is_open, no_update, no_update
 
 
 @callback(

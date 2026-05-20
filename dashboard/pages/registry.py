@@ -5,7 +5,7 @@ from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 
 from config import settings
-from dashboard._db import fetch_strategies, fetch_gate_funnel_drift
+from dashboard._db import fetch_strategies, fetch_gate_funnel_drift, DBOffline
 from dashboard._logic import decay_badge_color, decay_badge_label
 from strategy.registry import StrategyRegistry
 
@@ -63,7 +63,13 @@ def _decay_badge(rolling_sharpe: float, backtest_sharpe: float) -> dbc.Badge:
     Input("reg-interval", "n_intervals"),
 )
 def update_registry(n):
-    strategies = fetch_strategies()
+    strategies_result = fetch_strategies()
+
+    if isinstance(strategies_result, DBOffline):
+        offline_alert = dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
+        return offline_alert, offline_alert, offline_alert, offline_alert, {}
+
+    strategies = strategies_result
 
     # ── Lifecycle table ────────────────────────────────────────────────────
     status_color = {
@@ -126,10 +132,12 @@ def update_registry(n):
     )
 
     # ── Gate funnel drift ──────────────────────────────────────────────────
-    drift_rows = fetch_gate_funnel_drift()
-    if drift_rows:
+    drift_result = fetch_gate_funnel_drift()
+    if isinstance(drift_result, DBOffline):
+        funnel_drift = dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
+    elif drift_result:
         drift_table_rows = []
-        for r in sorted(drift_rows, key=lambda x: x["gate_passed"]):
+        for r in sorted(drift_result, key=lambda x: x["gate_passed"]):
             cnt_7d = r.get("cnt_7d") or 0
             cnt_30d = r.get("cnt_30d") or 0
             if cnt_30d > 0:

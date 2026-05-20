@@ -55,13 +55,14 @@ def test_gate_funnel_counts_last_24h(registry_db, monkeypatch):
     assert gate_map.get("GATE_2", 0) == 1
 
 
-def test_gate_funnel_empty_db(tmp_path, monkeypatch):
+def test_gate_funnel_missing_schema_returns_db_offline(tmp_path, monkeypatch):
+    """fetch_signal_funnel should return DBOffline when schema not yet created."""
     db_path = str(tmp_path / "empty.db")
     monkeypatch.setattr("dashboard._db.REGISTRY_DB", db_path)
-    from dashboard._db import fetch_signal_funnel
+    from dashboard._db import fetch_signal_funnel, DBOffline
 
-    rows = fetch_signal_funnel(hours=24)
-    assert rows == []
+    result = fetch_signal_funnel(hours=24)
+    assert isinstance(result, DBOffline)
 
 
 def test_ks_confirm_requires_exact_string():

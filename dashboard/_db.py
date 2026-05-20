@@ -1,6 +1,7 @@
+import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Union
 
 from config import settings
 
@@ -9,9 +10,14 @@ REGISTRY_DB = settings.REGISTRY_DB
 BACKTEST_DB = settings.BACKTEST_RESULTS_DB
 
 
+class DBOffline(Exception):
+    """Raised when a registry/backtest DB query fails due to schema not yet created."""
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=100")  # checkpoint every 100 pages
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -63,7 +69,7 @@ def fetch_lob_snapshots(limit: int = 3600) -> list[dict]:
     return [dict(r) for r in reversed(rows)]
 
 
-def fetch_signal_funnel(hours: int = 24) -> list[dict]:
+def fetch_signal_funnel(hours: int = 24) -> Union[list[dict], DBOffline]:
     with registry_db() as conn:
         try:
             rows = conn.execute(
@@ -71,12 +77,12 @@ def fetch_signal_funnel(hours: int = 24) -> list[dict]:
                 "WHERE timestamp >= datetime('now', ?) GROUP BY gate_passed",
                 (f"-{hours} hours",),
             ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            return DBOffline(str(e))
     return [dict(r) for r in rows]
 
 
-def fetch_gate_funnel_drift() -> list[dict]:
+def fetch_gate_funnel_drift() -> Union[list[dict], DBOffline]:
     with registry_db() as conn:
         try:
             rows = conn.execute(
@@ -86,23 +92,23 @@ def fetch_gate_funnel_drift() -> list[dict]:
                    FROM signal_records
                    GROUP BY gate_passed""",
             ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            return DBOffline(str(e))
     return [dict(r) for r in rows]
 
 
-def fetch_strategies() -> list[dict]:
+def fetch_strategies() -> Union[list[dict], DBOffline]:
     with registry_db() as conn:
         try:
             rows = conn.execute(
                 "SELECT * FROM strategies ORDER BY created_at DESC"
             ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            return DBOffline(str(e))
     return [dict(r) for r in rows]
 
 
-def fetch_system_events(limit: int = 50) -> list[dict]:
+def fetch_system_events(limit: int = 50) -> Union[list[dict], DBOffline]:
     with registry_db() as conn:
         try:
             rows = conn.execute(
@@ -110,13 +116,12 @@ def fetch_system_events(limit: int = 50) -> list[dict]:
                 "ORDER BY occurred_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            return DBOffline(str(e))
     return [dict(r) for r in rows]
 
 
 def fetch_backtest_results() -> list[dict]:
-    import os
     if not os.path.exists(BACKTEST_DB):
         return []
     with backtest_db() as conn:
