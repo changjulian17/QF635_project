@@ -189,3 +189,12 @@ async def test_health_risk_tier_reflects_circuit_breaker(client, portfolio):
 async def test_unknown_endpoint_returns_404(client):
     resp = await client.get("/api/nonexistent")
     assert resp.status == 404
+
+
+def test_server_binds_localhost_only():
+    """REST API source must hardcode 127.0.0.1 — never 0.0.0.0 (no-auth endpoint)."""
+    main_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+    with open(main_path) as f:
+        src = f.read()
+    assert "127.0.0.1" in src, "_api_server must bind to 127.0.0.1"
+    assert "0.0.0.0" not in src, "_api_server must not bind to 0.0.0.0 (all interfaces)"

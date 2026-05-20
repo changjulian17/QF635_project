@@ -49,23 +49,29 @@ def backtest_db() -> Generator[sqlite3.Connection, None, None]:
         conn.close()
 
 
-def fetch_portfolio_history(limit: int = 300) -> list[dict]:
+def fetch_portfolio_history(limit: int = 300) -> Union[list[dict], DBOffline]:
     with main_db() as conn:
-        rows = conn.execute(
-            "SELECT ts, equity, daily_pnl, drawdown_pct, circuit_breaker "
-            "FROM portfolio ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT ts, equity, daily_pnl, drawdown_pct, circuit_breaker "
+                "FROM portfolio ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            return DBOffline(str(e))
     return [dict(r) for r in reversed(rows)]
 
 
-def fetch_lob_snapshots(limit: int = 3600) -> list[dict]:
+def fetch_lob_snapshots(limit: int = 3600) -> Union[list[dict], DBOffline]:
     with main_db() as conn:
-        rows = conn.execute(
-            "SELECT ts, mid_price, spread, obi, cvd_delta, bid_levels_json, ask_levels_json "
-            "FROM lob_snapshots ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT ts, mid_price, spread, obi, cvd_delta, bid_levels_json, ask_levels_json "
+                "FROM lob_snapshots ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            return DBOffline(str(e))
     return [dict(r) for r in reversed(rows)]
 
 
@@ -74,7 +80,7 @@ def fetch_signal_funnel(hours: int = 24) -> Union[list[dict], DBOffline]:
         try:
             rows = conn.execute(
                 "SELECT gate_passed, COUNT(*) as cnt FROM signal_records "
-                "WHERE timestamp >= datetime('now', ?) GROUP BY gate_passed",
+                "WHERE datetime(timestamp) >= datetime('now', ?) GROUP BY gate_passed",
                 (f"-{hours} hours",),
             ).fetchall()
         except sqlite3.OperationalError as e:
@@ -87,8 +93,8 @@ def fetch_gate_funnel_drift() -> Union[list[dict], DBOffline]:
         try:
             rows = conn.execute(
                 """SELECT gate_passed,
-                       COUNT(*) FILTER (WHERE timestamp >= datetime('now','-7 day')) as cnt_7d,
-                       COUNT(*) FILTER (WHERE timestamp >= datetime('now','-30 day')) as cnt_30d
+                       COUNT(*) FILTER (WHERE datetime(timestamp) >= datetime('now','-7 day')) as cnt_7d,
+                       COUNT(*) FILTER (WHERE datetime(timestamp) >= datetime('now','-30 day')) as cnt_30d
                    FROM signal_records
                    GROUP BY gate_passed""",
             ).fetchall()
@@ -121,12 +127,12 @@ def fetch_system_events(limit: int = 50) -> Union[list[dict], DBOffline]:
     return [dict(r) for r in rows]
 
 
-def fetch_backtest_results() -> list[dict]:
+def fetch_backtest_results() -> Union[list[dict], DBOffline]:
     if not os.path.exists(BACKTEST_DB):
         return []
     with backtest_db() as conn:
         try:
             rows = conn.execute("SELECT * FROM results ORDER BY composite_score DESC").fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            return DBOffline(str(e))
     return [dict(r) for r in rows]

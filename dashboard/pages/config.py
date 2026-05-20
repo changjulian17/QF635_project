@@ -63,6 +63,12 @@ def _build_settings_table():
 layout = html.Div([
     dcc.Interval(id="cfg-interval", interval=30000),
 
+    # ── Live engine metadata (dynamic, from engine-state-store) ────────────
+    html.H4("Engine Status", className="mb-2"),
+    html.Div(id="cfg-engine-meta", className="mb-3"),
+
+    html.Hr(),
+
     # ── Config reference ───────────────────────────────────────────────────
     html.H4("System Configuration", className="mb-3"),
     html.Div([
@@ -115,7 +121,39 @@ layout = html.Div([
 ])
 
 
+def _build_engine_meta(engine_state: dict | None) -> html.Div:
+    if engine_state is None:
+        return dbc.Alert("Engine offline — start main.py first.", color="secondary", className="mb-0")
+
+    def _chip(label, value, color="secondary"):
+        return dbc.Col(dbc.Card([
+            dbc.CardBody([
+                html.P(label, className="text-muted mb-1 small"),
+                html.H5(dbc.Badge(value, color=color), className="mb-0"),
+            ], className="py-2 px-3"),
+        ], color="dark", outline=True), width="auto")
+
+    ks_active = engine_state.get("killswitch_active", False)
+    lob = engine_state.get("lob_status", "—")
+    hb  = engine_state.get("heartbeat_status", "—")
+    tier = engine_state.get("risk_tier", "—")
+    dry  = engine_state.get("dry_run", True)
+
+    return dbc.Row([
+        _chip("Engine", "KILLSWITCH" if ks_active else "ONLINE",
+              "danger" if ks_active else "success"),
+        _chip("LOB Status", lob,
+              "success" if lob == "SYNCED" else "warning"),
+        _chip("Heartbeat", hb,
+              "success" if hb == "OK" else ("warning" if hb == "WARN" else "danger")),
+        _chip("Risk Tier", tier,
+              "success" if tier in ("ACTIVE",) else ("warning" if tier in ("REDUCED", "MINIMAL") else "danger")),
+        _chip("Mode", "DRY RUN" if dry else "LIVE", "warning" if dry else "danger"),
+    ], className="g-2")
+
+
 @callback(
+    Output("cfg-engine-meta", "children"),
     Output("cfg-ks-status", "children"),
     Output("cfg-ks-open-modal", "disabled"),
     Output("cfg-event-log", "children"),
@@ -160,7 +198,7 @@ def update_config_page(n, engine_state):
     else:
         event_table = html.P("No system events recorded yet.", className="text-muted")
 
-    return ks_status, ks_disabled, event_table
+    return _build_engine_meta(engine_state), ks_status, ks_disabled, event_table
 
 
 @callback(

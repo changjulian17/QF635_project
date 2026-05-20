@@ -95,27 +95,42 @@ class DBWriter:
     async def _candle_loop(self) -> None:
         while True:
             candle: Candle = await self._candle_queue.get()
-            await asyncio.to_thread(self._write_candle, candle)
+            try:
+                await asyncio.to_thread(self._write_candle, candle)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _signal_loop(self) -> None:
         while True:
             signal: PatternSignal = await self._signal_queue.get()
-            await asyncio.to_thread(self._write_signal, signal)
+            try:
+                await asyncio.to_thread(self._write_signal, signal)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _ms_bar_loop(self) -> None:
         while True:
             bar: MicrostructureBar = await self._ms_bar_queue.get()
-            await asyncio.to_thread(self._write_ms_bar, bar)
+            try:
+                await asyncio.to_thread(self._write_ms_bar, bar)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _portfolio_loop(self) -> None:
         while True:
             await asyncio.sleep(self.PORTFOLIO_INTERVAL)
-            await asyncio.to_thread(self._write_portfolio, self._portfolio)
+            try:
+                await asyncio.to_thread(self._write_portfolio, self._portfolio)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _cleanup_loop(self) -> None:
         while True:
             await asyncio.sleep(self.CLEANUP_INTERVAL)
-            await asyncio.to_thread(self._purge_old_records)
+            try:
+                await asyncio.to_thread(self._purge_old_records)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     def _purge_old_records(self) -> None:
         cutoff = f"-{self.RETENTION_DAYS} days"

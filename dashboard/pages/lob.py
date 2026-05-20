@@ -10,7 +10,7 @@ import dash_bootstrap_components as dbc
 from plotly.subplots import make_subplots
 
 from config import settings
-from dashboard._db import fetch_lob_snapshots
+from dashboard._db import fetch_lob_snapshots, DBOffline
 
 dash.register_page(__name__, path="/lob", name="LOB")
 
@@ -86,6 +86,9 @@ def update_lob_chart(n, hm_minutes, half_range, contrast_pctile):
     rows_needed = hm_minutes * 60
     snapshots = fetch_lob_snapshots(limit=max(rows_needed, 3600))
 
+    if isinstance(snapshots, DBOffline):
+        return _empty_fig("LOB DB offline — start engine first")
+
     if not snapshots:
         return _empty_fig("Waiting for LOB snapshot data…")
 
@@ -145,6 +148,16 @@ def update_lob_chart(n, hm_minutes, half_range, contrast_pctile):
             valid_cols.append(col_ok)
 
         ts_labels = hm_df["ts"].dt.strftime("%H:%M:%S").tolist()
+        mid_prices = hm_df["mid_price"].tolist()
+
+        # H3: drop columns where both bid and ask JSON failed — prevents x-axis misalignment
+        if not all(valid_cols):
+            vm = np.array(valid_cols, dtype=bool)
+            bid_matrix = bid_matrix[:, vm]
+            ask_matrix = ask_matrix[:, vm]
+            ts_labels  = [t for t, ok in zip(ts_labels, valid_cols) if ok]
+            mid_prices = [p for p, ok in zip(mid_prices, valid_cols) if ok]
+
         all_nonzero = np.concatenate([bid_matrix[bid_matrix > 0], ask_matrix[ask_matrix > 0]])
         max_vol = np.percentile(all_nonzero, contrast_pctile) if len(all_nonzero) else 1.0
 
@@ -167,7 +180,7 @@ def update_lob_chart(n, hm_minutes, half_range, contrast_pctile):
         ), row=1, col=1)
 
         fig.add_trace(go.Scatter(
-            x=ts_labels, y=hm_df["mid_price"].tolist(), mode="lines",
+            x=ts_labels, y=mid_prices, mode="lines",
             line=dict(color="white", width=1.5), name="Mid price", hoverinfo="skip",
         ), row=1, col=1)
 
