@@ -12,18 +12,27 @@ from unittest.mock import patch
 
 import pytest
 
-from core.lob_recorder import LOBRecorder, _MAX_BUFFER_SIZE, _RETENTION_DAYS
+from core.lob_recorder import (
+    LOBRecorder,
+    _BUCKET_WIDTH,
+    _DEPTH_LEVELS,
+    _MAX_BUFFER_SIZE,
+    _RETENTION_DAYS,
+)
 
 
-def _make_depth_msg(last_id: int = 1000, exchange_ts: int | None = None) -> str:
-    data: dict = {
-        "lastUpdateId": last_id,
-        "bids": [["30000.00", "1.5"], ["29999.00", "0.8"]],
-        "asks": [["30001.00", "1.2"], ["30002.00", "0.5"]],
+def _make_depth_msg(exchange_ts: int | None = None) -> str:
+    """Build a combined-stream depthUpdate message."""
+    ts = exchange_ts or int(time.time() * 1000)
+    data = {
+        "e": "depthUpdate",
+        "E": ts,
+        "U": 1000,
+        "u": 1001,
+        "b": [["30000.00", "1.5"], ["29999.00", "0.8"]],
+        "a": [["30001.00", "1.2"], ["30002.00", "0.5"]],
     }
-    if exchange_ts is not None:
-        data["T"] = exchange_ts
-    return json.dumps({"stream": "btcusdt@depth20@100ms", "data": data})
+    return json.dumps({"stream": "btcusdt@depth@100ms", "data": data})
 
 
 def _make_trade_msg(price: float = 30000.5, qty: float = 0.1, buyer_maker: bool = False) -> str:
@@ -145,15 +154,183 @@ def test_buffer_capped_on_db_failure():
         os.unlink(tmp)
 
 
+# ── Local order book — _apply_diff ───────────────────────────────────────────
+
+def test_apply_diff_adds_levels():
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        rec._apply_diff({
+            "b": [["30000.00", "1.5"], ["29999.00", "0.8"]],
+            "a": [["30001.00", "1.2"]],
+            "u": 1,
+        })
+        assert rec._bid_book[30000.0] == 1.5
+        assert rec._bid_book[29999.0] == 0.8
+        assert rec._ask_book[30001.0] == 1.2
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_apply_diff_updates_existing_level():
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        rec._bid_book[30000.0] = 1.0
+        rec._apply_diff({"b": [["30000.00", "3.5"]], "a": [], "u": 2})
+        assert rec._bid_book[30000.0] == 3.5
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_apply_diff_removes_zero_qty():
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        rec._bid_book[30000.0] = 1.5
+        rec._ask_book[30001.0] = 1.2
+        rec._apply_diff({
+            "b": [["30000.00", "0"]],
+            "a": [["30001.00", "0.0"]],
+            "u": 3,
+        })
+        assert 30000.0 not in rec._bid_book
+        assert 30001.0 not in rec._ask_book
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_apply_diff_updates_last_update_id():
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        rec._apply_diff({"b": [], "a": [], "u": 999})
+        assert rec._last_update_id == 999
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+# ── Local order book — _bucket_levels ────────────────────────────────────────
+
+def test_bucket_levels_aggregates_same_bucket():
+    """Two levels that fall in the same $25 bucket must sum their qty."""
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        # Both 30000 and 30010 fall in the [30000, 30025) bucket
+        levels = [(30000.0, 1.0), (30010.0, 2.0)]
+        result = rec._bucket_levels(levels)
+        assert len(result) == 1
+        bucket_price = float(result[0][0])
+        bucket_qty   = float(result[0][1])
+        assert bucket_price == 30000.0  # math.floor(30000 / 25) * 25
+        assert abs(bucket_qty - 3.0) < 1e-9
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_bucket_levels_respects_boundaries():
+    """Levels in different $25 buckets produce separate entries."""
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        # 30000 → bucket 30000; 30025 → bucket 30025
+        levels = [(30000.0, 1.0), (30025.0, 2.0)]
+        result = rec._bucket_levels(levels)
+        assert len(result) == 2
+        prices = [float(r[0]) for r in result]
+        assert 30000.0 in prices
+        assert 30025.0 in prices
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_bucket_levels_empty_input():
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        assert rec._bucket_levels([]) == []
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_bucket_levels_output_sorted():
+    """Output must be sorted by bucket price ascending."""
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        levels = [(30050.0, 1.0), (30000.0, 2.0), (30100.0, 0.5)]
+        result = rec._bucket_levels(levels)
+        prices = [float(r[0]) for r in result]
+        assert prices == sorted(prices)
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+# ── Local order book — _snapshot_levels ──────────────────────────────────────
+
+def test_snapshot_levels_returns_top_n():
+    """Book with more than _DEPTH_LEVELS entries must be capped at _DEPTH_LEVELS."""
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        # Populate 150 bid levels and 150 ask levels
+        for i in range(150):
+            rec._bid_book[30000.0 - i * 0.01] = 1.0
+            rec._ask_book[30001.0 + i * 0.01] = 1.0
+        bids, asks = rec._snapshot_levels()
+        # After bucketing a $0.01-spaced book, many levels collapse into few buckets.
+        # The pre-bucket selection must cap at _DEPTH_LEVELS before bucketing.
+        # Check: total qty in bids ≤ _DEPTH_LEVELS (each level is qty=1.0)
+        total_bid_qty = sum(float(r[1]) for r in bids)
+        total_ask_qty = sum(float(r[1]) for r in asks)
+        assert total_bid_qty <= _DEPTH_LEVELS
+        assert total_ask_qty <= _DEPTH_LEVELS
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_snapshot_levels_bids_highest_first_selection():
+    """Snapshot must select the highest bid levels (closest to mid), not lowest."""
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        rec._bid_book = {float(p): 1.0 for p in range(29000, 29200)}  # 200 levels
+        bids, _ = rec._snapshot_levels()
+        total_qty = sum(float(r[1]) for r in bids)
+        # Top 100 bid levels are 29100–29199; their bucket is floor(29100/25)*25=29100
+        # All 100 levels fall in at most 4 buckets; total qty = 100
+        assert abs(total_qty - _DEPTH_LEVELS) < 1e-9
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_snapshot_levels_asks_lowest_first_selection():
+    """Snapshot must select the lowest ask levels (closest to mid), not highest."""
+    rec, tmp = _recorder_with_tmpdb()
+    try:
+        rec._ask_book = {float(p): 1.0 for p in range(30001, 30201)}  # 200 levels
+        _, asks = rec._snapshot_levels()
+        total_qty = sum(float(r[1]) for r in asks)
+        assert abs(total_qty - _DEPTH_LEVELS) < 1e-9
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
 # ── Message parsing ───────────────────────────────────────────────────────────
 
 def test_receive_loop_buffers_depth_snapshot():
-    """Feed a depth20 message through the receive loop; verify it lands in _depth_buf."""
+    """Feed a depthUpdate message through the receive loop; verify it lands in _depth_buf."""
     rec, tmp = _recorder_with_tmpdb()
 
     async def _run():
         rec._running = True
-        await rec._receive_loop(_fake_ws([_make_depth_msg(1001)], rec))
+        rec._synced = True
+        # Seed a minimal book so _snapshot_levels returns non-empty
+        rec._bid_book = {30000.0: 1.5, 29999.0: 0.8}
+        rec._ask_book = {30001.0: 1.2, 30002.0: 0.5}
+        await rec._receive_loop(_fake_ws([_make_depth_msg()], rec))
 
     try:
         asyncio.run(_run())
@@ -182,13 +359,16 @@ def test_receive_loop_buffers_agg_trade():
 
 
 def test_depth_uses_exchange_timestamp():
-    """Depth snapshots must store the exchange timestamp from msg["T"], not local wall clock."""
+    """Depth snapshots must store the exchange timestamp from msg['E']."""
     rec, tmp = _recorder_with_tmpdb()
     exchange_ts = 1_700_000_000_000  # fixed, far from any local time.time()
 
     async def _run():
         rec._running = True
-        await rec._receive_loop(_fake_ws([_make_depth_msg(1001, exchange_ts=exchange_ts)], rec))
+        rec._synced = True
+        rec._bid_book = {30000.0: 1.5}
+        rec._ask_book = {30001.0: 1.2}
+        await rec._receive_loop(_fake_ws([_make_depth_msg(exchange_ts=exchange_ts)], rec))
 
     try:
         asyncio.run(_run())
@@ -205,28 +385,86 @@ def test_depth_uses_exchange_timestamp():
 
 
 def test_depth_falls_back_to_event_time():
-    """When msg["T"] is absent, fall back to msg["E"]."""
+    """When msg['E'] is absent, fall back to wall-clock time (not crash)."""
     rec, tmp = _recorder_with_tmpdb()
-    event_ts = 1_600_000_000_000
 
     msg_str = json.dumps({
-        "stream": "btcusdt@depth20@100ms",
-        "data": {"lastUpdateId": 1002, "E": event_ts, "bids": [], "asks": []},
+        "stream": "btcusdt@depth@100ms",
+        "data": {
+            "e": "depthUpdate",
+            # 'E' deliberately omitted
+            "U": 1002, "u": 1003,
+            "b": [["30000.00", "1.0"]],
+            "a": [["30001.00", "1.0"]],
+        },
     })
+
+    before_ms = int(time.time() * 1000)
 
     async def _run():
         rec._running = True
+        rec._synced = True
+        rec._bid_book = {30000.0: 1.0}
+        rec._ask_book = {30001.0: 1.0}
         await rec._receive_loop(_fake_ws([msg_str], rec))
 
     try:
         asyncio.run(_run())
+        after_ms = int(time.time() * 1000) + 1000
         if rec._depth_buf:
             stored_ts = rec._depth_buf[0][0]
         else:
             stored_ts = rec._conn.execute(
                 "SELECT ts_event FROM depth_snapshots ORDER BY id DESC LIMIT 1"
             ).fetchone()[0]
-        assert stored_ts == event_ts
+        assert before_ms <= stored_ts <= after_ms
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+# ── Sync gating ───────────────────────────────────────────────────────────────
+
+def test_unsynced_events_buffered_not_written():
+    """While _synced=False, depthUpdate events go to _pending_diffs, not _depth_buf."""
+    rec, tmp = _recorder_with_tmpdb()
+
+    async def _run():
+        rec._running = True
+        rec._synced = False
+        await rec._receive_loop(_fake_ws([_make_depth_msg()], rec))
+
+    try:
+        asyncio.run(_run())
+        assert len(rec._depth_buf) == 0
+        assert len(rec._pending_diffs) == 1
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_synced_events_write_bucketed_snapshot():
+    """After _synced=True, a depthUpdate writes a bucketed snapshot to _depth_buf."""
+    rec, tmp = _recorder_with_tmpdb()
+
+    async def _run():
+        rec._running = True
+        rec._synced = True
+        rec._bid_book = {30000.0: 1.5, 29999.0: 0.8}
+        rec._ask_book = {30001.0: 1.2, 30002.0: 0.5}
+        await rec._receive_loop(_fake_ws([_make_depth_msg()], rec))
+
+    try:
+        asyncio.run(_run())
+        assert len(rec._depth_buf) == 1
+        ts, bids_json, asks_json = rec._depth_buf[0]
+        bids = json.loads(bids_json)
+        asks = json.loads(asks_json)
+        # Verify bucket prices are multiples of _BUCKET_WIDTH
+        for price_str, _ in bids:
+            assert float(price_str) % _BUCKET_WIDTH == 0.0
+        for price_str, _ in asks:
+            assert float(price_str) % _BUCKET_WIDTH == 0.0
     finally:
         rec._conn.close()
         os.unlink(tmp)

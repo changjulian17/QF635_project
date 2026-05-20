@@ -2,7 +2,7 @@
 
 Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on the Binance Spot Testnet.
 
-**Current phase:** Phase 2I complete (2A–2I done). 380 tests passing.
+**Current phase:** Phase 2I complete (2A–2I done). 404 tests passing.
 
 ## Project layout
 
