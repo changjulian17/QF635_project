@@ -1,3 +1,5 @@
+# DEPRECATED: This Streamlit dashboard is superseded by the Dash dashboard in dashboard/app.py.
+# Retained for reference. Do not extend — add new pages to dashboard/pages/ instead.
 import json
 import sqlite3
 

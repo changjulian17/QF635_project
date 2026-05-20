@@ -17,3 +17,6 @@ xgboost>=2.1
 scikit-learn>=1.5
 pyyaml>=6.0
 joblib>=1.4
+# Phase 3 — Dash dashboard
+dash>=2.17
+dash-bootstrap-components>=1.6

@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from config import settings
-from models import Candle, MicrostructureBar, PatternSignal, PortfolioState
+from models import Candle, LOBSnapshot, MicrostructureBar, PatternSignal, PortfolioState
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,17 @@ def init_db() -> None:
                 liq_flip_to_res INTEGER, liq_flip_to_sup INTEGER,
                 break_protect_long INTEGER, break_protect_short INTEGER,
                 bid_levels TEXT, ask_levels TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lob_snapshots (
+                ts              TEXT PRIMARY KEY,
+                mid_price       REAL,
+                spread          REAL,
+                obi             REAL,
+                cvd_delta       REAL,
+                bid_levels_json TEXT,
+                ask_levels_json TEXT
             )
         """)
         conn.commit()
@@ -148,6 +159,48 @@ class DBWriter:
                 "INSERT OR REPLACE INTO portfolio VALUES (?,?,?,?,?)",
                 (datetime.now(timezone.utc).isoformat(), pf.equity,
                  pf.daily_pnl, pf.drawdown_pct, pf.circuit_breaker.name),
+            )
+            conn.commit()
+
+    async def write_lob_snapshot(
+        self,
+        snapshot: LOBSnapshot,
+        obi: float,
+        spread: float,
+        mid_price: float,
+        cvd_delta: float,
+    ) -> None:
+        await asyncio.to_thread(
+            self._write_lob_snapshot_sync, snapshot, obi, spread, mid_price, cvd_delta
+        )
+
+    @staticmethod
+    def _write_lob_snapshot_sync(
+        snapshot: LOBSnapshot,
+        obi: float,
+        spread: float,
+        mid_price: float,
+        cvd_delta: float,
+    ) -> None:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO lob_snapshots
+                   (ts, mid_price, spread, obi, cvd_delta, bid_levels_json, ask_levels_json)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    snapshot.timestamp.isoformat(),
+                    mid_price, spread, obi, cvd_delta,
+                    json.dumps([[l.price, l.qty] for l in snapshot.bids]),
+                    json.dumps([[l.price, l.qty] for l in snapshot.asks]),
+                ),
+            )
+            conn.execute(
+                """DELETE FROM lob_snapshots
+                   WHERE rowid NOT IN (
+                       SELECT rowid FROM lob_snapshots
+                       ORDER BY ts DESC LIMIT ?
+                   )""",
+                (settings.LOB_HISTORY,),
             )
             conn.commit()
 

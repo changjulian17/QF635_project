@@ -2,7 +2,7 @@
 
 Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on the Binance Spot Testnet.
 
-**Current phase:** Phase 2I complete (2A–2I done). 404 tests passing.
+**Current phase:** Phase 3 in progress (REST API + LOB snapshot writer + Dash dashboard).
 
 ## Project layout
 
@@ -39,9 +39,21 @@ execution/
   order_manager.py     — IOC aggressive limit orders + OCO brackets
 
 engine/              — legacy shim directory (re-exports to new locations)
-  db_writer.py       — SQLite persistence + rolling cleanup (kept here)
+  db_writer.py       — SQLite persistence + rolling cleanup + lob_snapshots writer
   microstructure_engine.py — legacy (superseded by strategy/microstructure.py)
   risk_engine.py     — re-exports risk.engine.RiskEngine
+
+dashboard/           — Dash multi-page dashboard (Phase 3)
+  app.py             — entry point; dark theme, nav, engine status badge
+  _db.py             — WAL-mode SQLite helpers shared by all pages
+  pages/
+    live.py          — /live: portfolio metrics, signal funnel, kill switch
+    lob.py           — /lob: LOB heatmap, OBI/CVD/Spread subplots
+    backtest.py      — /backtest: strategy leaderboard from backtest results
+    registry.py      — /registry: strategy lifecycle, decay monitoring, LIVE promotion
+    config.py        — /config: settings reference, emergency stop, event log
+
+dashboard.py         — DEPRECATED Streamlit UI (retained for reference)
 
 pages/               — Streamlit multi-page app
   health.py          — system health checker (auto-refreshes every 10 s)
@@ -75,7 +87,11 @@ Start the trading engine (terminal 2):
 
 	python main.py
 
-Start the Streamlit dashboard (terminal 3):
+Start the Dash dashboard (terminal 3 — Phase 3):
+
+	python dashboard/app.py
+
+Start the legacy Streamlit dashboard (deprecated):
 
 	streamlit run dashboard.py
 
@@ -112,3 +128,7 @@ Run unit tests:
 | 2G — Tick Replay Engine | ✅ | backtesting/tick_replay.py |
 | 2H — XGBoost Confidence Scorer | ✅ | strategy/scorer.py + ScorerFactory wired into Gate 2 |
 | 2I — Strategy Registry | ✅ | strategy/spec.py, registry.py, builder.py + tests/test_registry.py |
+| 3A — REST API | ✅ | _api_server coroutine in main.py (aiohttp, /api/health, /api/portfolio, /api/killswitch) |
+| 3B — LOB snapshot writer | ✅ | _lob_snapshot_writer in main.py + lob_snapshots table in db_writer.py |
+| 3C–3H — Dash dashboard | ✅ | dashboard/ app with 5 pages: live, lob, backtest, registry, config |
+| 3I — Phase 3 tests | ✅ | test_rest_api.py (10), test_lob_snapshot_writer.py (6), test_dashboard_live.py (5), test_dashboard_registry.py (4) |

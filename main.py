@@ -18,6 +18,7 @@ import logging
 import signal
 from datetime import datetime, timedelta
 
+from aiohttp import web
 from binance import AsyncClient
 
 from config import settings
@@ -30,7 +31,7 @@ from core.startup_reconciler import reconcile_on_startup
 from core.ws_consumer import BinanceWebSocketConsumer
 from engine.db_writer import DBWriter, init_db
 from execution.order_manager import OrderManager
-from models import FillDetail, PortfolioState, SharedState
+from models import FillDetail, LOBSnapshot, PortfolioState, SharedState
 from risk.budget import DailyBudget
 from risk.engine import RiskEngine
 from risk.killswitch import GlobalKillswitch
@@ -163,6 +164,89 @@ async def _drain_queue(queue: asyncio.Queue) -> None:
     """Consume and discard all messages so the queue never backs up."""
     while True:
         await queue.get()
+
+
+async def _lob_snapshot_writer(
+    lob_engine: LocalOrderBook,
+    cvd_calculator: CVDCalculator,
+    db_writer: DBWriter,
+    interval: float = 1.0,
+) -> None:
+    """Write LOB snapshots to DB at ~1 Hz for dashboard /lob page."""
+    while True:
+        await asyncio.sleep(interval)
+        if lob_engine.lob_status != "SYNCED":
+            continue
+        snapshot: LOBSnapshot | None = await lob_engine.get_snapshot()
+        if snapshot is None:
+            continue
+        total_bid = sum(l.qty for l in snapshot.bids)
+        total_ask = sum(l.qty for l in snapshot.asks)
+        obi = (total_bid - total_ask) / (total_bid + total_ask) if (total_bid + total_ask) > 0 else 0.0
+        mid = (snapshot.bids[0].price + snapshot.asks[0].price) / 2 if snapshot.bids and snapshot.asks else 0.0
+        spread = (snapshot.asks[0].price - snapshot.bids[0].price) if snapshot.bids and snapshot.asks else 0.0
+        await db_writer.write_lob_snapshot(snapshot, obi, spread, mid, cvd_calculator.get_cvd_delta())
+
+
+async def _api_server(
+    killswitch: GlobalKillswitch,
+    portfolio: PortfolioState,
+    shared_state: SharedState,
+    order_manager: OrderManager,
+    telemetry: SignalTelemetry,
+    port: int,
+) -> None:
+    """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
+
+    async def _handle_health(request: web.Request) -> web.Response:
+        return web.json_response({
+            "lob_status": shared_state.lob_status,
+            "heartbeat_status": shared_state.heartbeat_status,
+            "risk_tier": portfolio.circuit_breaker.name,
+            "killswitch_active": killswitch.is_active,
+            "dry_run": settings.DRY_RUN,
+        })
+
+    async def _handle_portfolio(request: web.Request) -> web.Response:
+        positions = [
+            {
+                "symbol": p.symbol,
+                "side": p.side.name,
+                "entry_price": p.entry_price,
+                "quantity": p.quantity,
+                "stop_loss": p.stop_loss,
+                "take_profit": p.take_profit,
+                "unrealised_pnl": p.unrealised_pnl,
+            }
+            for p in portfolio.positions
+        ]
+        return web.json_response({
+            "equity": portfolio.equity,
+            "daily_pnl": portfolio.daily_pnl,
+            "drawdown_pct": portfolio.drawdown_pct,
+            "consecutive_losses": portfolio.consecutive_losses,
+            "positions": positions,
+        })
+
+    async def _handle_killswitch(request: web.Request) -> web.Response:
+        if killswitch.is_active:
+            return web.json_response({"fired": True, "already_active": True})
+        asyncio.create_task(
+            emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_UI")
+        )
+        return web.json_response({"fired": True})
+
+    app = web.Application()
+    app.router.add_get("/api/health", _handle_health)
+    app.router.add_get("/api/portfolio", _handle_portfolio)
+    app.router.add_post("/api/killswitch", _handle_killswitch)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+    logger.info("[API] REST API listening on http://127.0.0.1:%d", port)
+    await asyncio.Future()  # run until TaskGroup cancels this task
 
 
 async def _process_fills(
@@ -339,6 +423,17 @@ async def main() -> None:
             tg.create_task(
                 _portfolio_mtm_loop(killswitch, budget, order_manager, portfolio, telemetry),
                 name="portfolio_mtm_loop",
+            )
+            tg.create_task(
+                _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer),
+                name="lob_snapshot_writer",
+            )
+            tg.create_task(
+                _api_server(
+                    killswitch, portfolio, shared_state,
+                    order_manager, telemetry, settings.DASHBOARD_API_PORT,
+                ),
+                name="api_server",
             )
     except* asyncio.CancelledError:
         pass

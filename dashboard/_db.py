@@ -1,0 +1,127 @@
+import sqlite3
+from contextlib import contextmanager
+from typing import Generator
+
+from config import settings
+
+MAIN_DB = "cryptosentinel.db"
+REGISTRY_DB = settings.REGISTRY_DB
+BACKTEST_DB = settings.BACKTEST_RESULTS_DB
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def main_db() -> Generator[sqlite3.Connection, None, None]:
+    conn = _connect(MAIN_DB)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def registry_db() -> Generator[sqlite3.Connection, None, None]:
+    conn = _connect(REGISTRY_DB)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def backtest_db() -> Generator[sqlite3.Connection, None, None]:
+    conn = _connect(BACKTEST_DB)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def fetch_portfolio_history(limit: int = 300) -> list[dict]:
+    with main_db() as conn:
+        rows = conn.execute(
+            "SELECT ts, equity, daily_pnl, drawdown_pct, circuit_breaker "
+            "FROM portfolio ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def fetch_lob_snapshots(limit: int = 3600) -> list[dict]:
+    with main_db() as conn:
+        rows = conn.execute(
+            "SELECT ts, mid_price, spread, obi, cvd_delta, bid_levels_json, ask_levels_json "
+            "FROM lob_snapshots ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def fetch_signal_funnel(hours: int = 24) -> list[dict]:
+    with registry_db() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT gate_passed, COUNT(*) as cnt FROM signal_records "
+                "WHERE timestamp >= datetime('now', ?) GROUP BY gate_passed",
+                (f"-{hours} hours",),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    return [dict(r) for r in rows]
+
+
+def fetch_gate_funnel_drift() -> list[dict]:
+    with registry_db() as conn:
+        try:
+            rows = conn.execute(
+                """SELECT gate_passed,
+                       COUNT(*) FILTER (WHERE timestamp >= datetime('now','-7 day')) as cnt_7d,
+                       COUNT(*) FILTER (WHERE timestamp >= datetime('now','-30 day')) as cnt_30d
+                   FROM signal_records
+                   GROUP BY gate_passed""",
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    return [dict(r) for r in rows]
+
+
+def fetch_strategies() -> list[dict]:
+    with registry_db() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT * FROM strategies ORDER BY created_at DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    return [dict(r) for r in rows]
+
+
+def fetch_system_events(limit: int = 50) -> list[dict]:
+    with registry_db() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT occurred_at, event_type, payload FROM system_events "
+                "ORDER BY occurred_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    return [dict(r) for r in rows]
+
+
+def fetch_backtest_results() -> list[dict]:
+    import os
+    if not os.path.exists(BACKTEST_DB):
+        return []
+    with backtest_db() as conn:
+        try:
+            rows = conn.execute("SELECT * FROM results ORDER BY composite_score DESC").fetchall()
+        except sqlite3.OperationalError:
+            return []
+    return [dict(r) for r in rows]

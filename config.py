@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # Persistence
     REGISTRY_DB: str = "strategies/registry.db"
     LOB_TICK_DB: str = "data/lob_tick.db"
+    BACKTEST_RESULTS_DB: str = "data/backtest_results.db"
+
+    # Dashboard
+    DASHBOARD_API_PORT: int = 8080
 
     @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":
