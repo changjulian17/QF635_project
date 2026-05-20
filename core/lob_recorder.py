@@ -1,9 +1,12 @@
 """
-LOB Recorder — always-on collector that writes raw order book snapshots
-and aggTrades to a local SQLite database for later analysis and backtesting.
+LOB Recorder — always-on collector that writes order book snapshots and
+aggTrades to a local SQLite database for later analysis and backtesting.
 
-Connects to the real Binance public WebSocket stream (no API key required).
-Runs as a standalone process alongside the main trading engine.
+Connects to the real Binance public WebSocket diff-depth stream (no API key
+required) and maintains a local order book up to _DEPTH_LEVELS levels per
+side.  Before writing, levels are aggregated into _BUCKET_WIDTH USD price
+buckets to reduce storage by 60–80% while preserving the LOB shape at the
+distances relevant for wall detection ($50–500 from mid).
 
 Usage:
     python -m core.lob_recorder
@@ -12,10 +15,12 @@ Usage:
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
 
+import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
@@ -23,22 +28,34 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+_DEPTH_LEVELS        = 100     # levels per side kept in local book before bucketing
+_BUCKET_WIDTH        = 25.0    # USD — price bucket width for storage compression
+_FLUSH_RECORDS       = 100
+_FLUSH_SECONDS       = 5.0
+_MAX_RECONNECT_DELAY = 60.0
+_MAX_BUFFER_SIZE     = 10_000
+_RETENTION_DAYS      = 7
+_CLEANUP_INTERVAL    = 86_400.0
+
 _STREAMS = (
-    f"{settings.SYMBOL.lower()}@depth20@100ms",
+    f"{settings.SYMBOL.lower()}@depth@100ms",
     f"{settings.SYMBOL.lower()}@aggTrade",
 )
-_FLUSH_RECORDS = 100
-_FLUSH_SECONDS = 5.0
-_MAX_RECONNECT_DELAY = 60.0
-_MAX_BUFFER_SIZE = 10_000
-_RETENTION_DAYS = 7
-_CLEANUP_INTERVAL = 86_400.0
 
 
 class LOBRecorder:
     """
-    Buffers depth snapshots and aggTrades then flushes them to SQLite in batches.
+    Buffers depth snapshots (derived from the incremental diff stream) and
+    aggTrades, then flushes them to SQLite in batches.
     WAL mode ensures the trading engine can read concurrently without blocking.
+
+    LOB maintenance
+    ---------------
+    On each WebSocket connect the recorder fetches a REST depth snapshot to
+    seed the local book, buffers any diffs that arrive during the fetch, then
+    merges them in order.  Subsequent diff events update the book in-place;
+    zero-qty entries are removed.  The top _DEPTH_LEVELS bid/ask levels are
+    bucketed and written to depth_snapshots after each diff event.
     """
 
     def __init__(self, db_path: str = settings.LOB_TICK_DB) -> None:
@@ -50,6 +67,13 @@ class LOBRecorder:
         self._running: bool = False
         self._conn: sqlite3.Connection | None = None
         self._flush_lock = asyncio.Lock()
+
+        # Local order book
+        self._bid_book:       dict[float, float] = {}
+        self._ask_book:       dict[float, float] = {}
+        self._last_update_id: int                = 0
+        self._synced:         bool               = False
+        self._pending_diffs:  list[dict]         = []
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -80,22 +104,36 @@ class LOBRecorder:
         symbol = settings.SYMBOL.lower()
         uri = (
             f"{settings.LOB_RECORDER_WS}/stream"
-            f"?streams={symbol}@depth20@100ms/{symbol}@aggTrade"
+            f"?streams={symbol}@depth@100ms/{symbol}@aggTrade"
         )
         attempt = 0
         while self._running:
             try:
                 logger.info("[LOBRec] Connecting (attempt %d)…", attempt + 1)
+                self._bid_book.clear()
+                self._ask_book.clear()
+                self._last_update_id = 0
+                self._synced = False
+                self._pending_diffs = []
+
                 async with websockets.connect(
                     uri,
                     ping_interval=20,
                     ping_timeout=60,
                     close_timeout=10,
                 ) as ws:
-                    logger.info("[LOBRec] Connected.")
+                    logger.info("[LOBRec] Connected, syncing LOB snapshot…")
                     self._reconnect_delay = 1.0
                     attempt = 0
-                    await self._receive_loop(ws)
+                    sync_task = asyncio.create_task(self._sync_snapshot())
+                    try:
+                        await self._receive_loop(ws)
+                    finally:
+                        sync_task.cancel()
+                        try:
+                            await sync_task
+                        except asyncio.CancelledError:
+                            pass
 
             except (ConnectionClosedError, ConnectionClosedOK) as exc:
                 logger.warning("[LOBRec] Connection closed: %s", exc)
@@ -110,23 +148,66 @@ class LOBRecorder:
             await asyncio.sleep(self._reconnect_delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, _MAX_RECONNECT_DELAY)
 
+    async def _sync_snapshot(self) -> None:
+        """Fetch a REST depth snapshot to seed the local LOB, then apply any buffered diffs."""
+        url = "https://api.binance.com/api/v3/depth"
+        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    resp.raise_for_status()
+                    snap = await resp.json()
+
+            self._bid_book = {
+                float(p): float(q) for p, q in snap["bids"] if float(q) > 0
+            }
+            self._ask_book = {
+                float(p): float(q) for p, q in snap["asks"] if float(q) > 0
+            }
+            last_uid = snap["lastUpdateId"]
+
+            # Apply buffered diffs that arrived during the REST call
+            for event in self._pending_diffs:
+                if event["u"] <= last_uid:
+                    continue  # stale — discard
+                self._apply_diff(event)
+
+            self._pending_diffs.clear()
+            self._last_update_id = last_uid
+            self._synced = True
+            logger.info(
+                "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
+                last_uid, len(self._bid_book), len(self._ask_book),
+            )
+        except Exception as exc:
+            logger.error("[LOBRec] Snapshot sync failed (%s); continuing unsynced.", exc)
+            self._pending_diffs.clear()
+            self._synced = True  # allow data to flow even if REST call failed
+
     async def _receive_loop(self, ws) -> None:
         async for raw in ws:
             if not self._running:
                 break
             try:
                 outer = json.loads(raw)
-                stream = outer.get("stream", "")
                 msg = outer.get("data", outer)
                 event_type = msg.get("e")
 
-                if "depth20" in stream:
-                    ts = int(msg.get("T") or msg.get("E") or time.time() * 1000)
-                    self._depth_buf.append((
-                        ts,
-                        json.dumps(msg.get("bids", [])),
-                        json.dumps(msg.get("asks", [])),
-                    ))
+                if event_type == "depthUpdate":
+                    if not self._synced:
+                        self._pending_diffs.append(msg)
+                    else:
+                        self._apply_diff(msg)
+                        ts = int(msg.get("E") or time.time() * 1000)
+                        bids, asks = self._snapshot_levels()
+                        if bids and asks:
+                            self._depth_buf.append((
+                                ts,
+                                json.dumps(bids),
+                                json.dumps(asks),
+                            ))
 
                 elif event_type == "aggTrade":
                     self._trade_buf.append((
@@ -140,6 +221,38 @@ class LOBRecorder:
 
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning("[LOBRec] Malformed message: %s", exc)
+
+    # ── Local order book ──────────────────────────────────────────────────────
+
+    def _apply_diff(self, event: dict) -> None:
+        """Apply a depthUpdate diff event to the local bid/ask books."""
+        for price_str, qty_str in event.get("b", []):
+            price, qty = float(price_str), float(qty_str)
+            if qty == 0.0:
+                self._bid_book.pop(price, None)
+            else:
+                self._bid_book[price] = qty
+        for price_str, qty_str in event.get("a", []):
+            price, qty = float(price_str), float(qty_str)
+            if qty == 0.0:
+                self._ask_book.pop(price, None)
+            else:
+                self._ask_book[price] = qty
+        self._last_update_id = event.get("u", self._last_update_id)
+
+    def _snapshot_levels(self) -> tuple[list, list]:
+        """Return top _DEPTH_LEVELS bid/ask levels bucketed into _BUCKET_WIDTH USD buckets."""
+        bids = sorted(self._bid_book.items(), reverse=True)[:_DEPTH_LEVELS]
+        asks = sorted(self._ask_book.items())[:_DEPTH_LEVELS]
+        return self._bucket_levels(bids), self._bucket_levels(asks)
+
+    def _bucket_levels(self, levels: list[tuple[float, float]]) -> list[list]:
+        """Aggregate (price, qty) pairs into fixed-width USD price buckets."""
+        buckets: dict[float, float] = {}
+        for price, qty in levels:
+            key = math.floor(price / _BUCKET_WIDTH) * _BUCKET_WIDTH
+            buckets[key] = buckets.get(key, 0.0) + qty
+        return [[str(p), str(q)] for p, q in sorted(buckets.items())]
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
