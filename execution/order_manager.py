@@ -79,19 +79,27 @@ class OrderManager:
         equity_fn: Callable[[], float],
         book_fn: Callable[[], tuple[float, float]] | None = None,
         ks_fire_cb: Callable[[str], Awaitable[None]] | None = None,
+        update_outcome_cb: Callable[[str, str, float, float, float], Awaitable[None]] | None = None,
+        budget_update_cb: Callable[[float], None] | None = None,
     ) -> None:
         """
         book_fn: optional callable returning (best_bid, best_ask) without a REST
         round-trip — wire to the LOB engine's current top-of-book for lowest latency
         and accurate DRY_RUN position sizing. Falls back to REST when None.
         ks_fire_cb: called with a reason string when KS-3 slippage fires.
+        update_outcome_cb: called with (signal_id, outcome, pnl, pnl_pct, duration_min)
+        after each position closes — wire to SignalTelemetry.update_outcome.
+        budget_update_cb: called with realised pnl (float) on every close — wire to
+        increment DailyBudget.realised_pnl so KS-1 budget checks reflect actual trades.
         """
-        self._signal_q   = signal_queue
-        self.fill_queue  = fill_queue
-        self._killswitch = killswitch
-        self._equity_fn  = equity_fn
-        self._book_fn    = book_fn
-        self._ks_fire_cb = ks_fire_cb
+        self._signal_q          = signal_queue
+        self.fill_queue         = fill_queue
+        self._killswitch        = killswitch
+        self._equity_fn         = equity_fn
+        self._book_fn           = book_fn
+        self._ks_fire_cb        = ks_fire_cb
+        self._update_outcome_cb = update_outcome_cb
+        self._budget_update_cb  = budget_update_cb
         self._client: AsyncClient | None = None
 
         # Graceful-shutdown gate: set False before draining the queue.
@@ -105,6 +113,10 @@ class OrderManager:
         self._open_position_qty:          float               = 0.0
         self._open_oco_list_id:           int | None          = None
         self._open_position_closed_event: asyncio.Event | None = None
+        self._open_signal_id:             str | None          = None
+        self._open_entry_price:           float               = 0.0
+        self._open_entry_time:            float               = 0.0   # time.monotonic()
+        self._oco_watcher_task:           asyncio.Task | None = None  # polls OCO until natural fill
 
         # ── OCO placement race flags (S1 fix) ────────────────────────────────────
         # _placing_oco:            True while create_oco_order REST call is in-flight.
@@ -345,6 +357,9 @@ class OrderManager:
             self._open_position_side         = side
             self._open_position_qty          = fill_qty
             self._open_position_closed_event = req.position_closed_event
+            self._open_signal_id             = req.signal_id
+            self._open_entry_price           = fill_price
+            self._open_entry_time            = time.monotonic()
 
         logger.info(
             "[Exec] FILLED — %s %.6f @ %.2f slippage=%.2fbps | signal_id=%s",
@@ -429,18 +444,34 @@ class OrderManager:
                         logger.error(
                             "[Exec] Deferred OCO cancel failed: %s", cancel_exc
                         )
-                closed = await self._emergency_close(
+                closed, close_p = await self._emergency_close(
                     fill_qty, entry_side, reason="WALL_REMOVED_DURING_OCO"
                 )
-                if closed and req.position_closed_event:
-                    req.position_closed_event.set()
                 async with self._position_lock:
+                    entry_t = self._open_entry_time
                     self._reset_open_position()
+                if closed:
+                    self._record_outcome(req.signal_id, entry_side, fill_price, close_p, fill_qty, entry_t)
+                    if req.position_closed_event:
+                        req.position_closed_event.set()
             else:
                 logger.info(
                     "[Exec] OCO placed — TP=%.2f SL=%.2f listId=%s",
                     tp_price, sl_price, self._open_oco_list_id,
                 )
+                if self._open_oco_list_id is not None:
+                    self._oco_watcher_task = asyncio.create_task(
+                        self._watch_oco_outcome(
+                            oco_list_id        = self._open_oco_list_id,
+                            signal_id          = req.signal_id,
+                            entry_side         = entry_side,
+                            entry_price        = fill_price,
+                            fill_qty           = fill_qty,
+                            entry_time         = self._open_entry_time,
+                            position_closed_event = req.position_closed_event,
+                        ),
+                        name=f"oco_watcher_{req.signal_id[:8]}",
+                    )
 
         except Exception as exc:
             # C1: naked position — emergency-close immediately.
@@ -448,22 +479,135 @@ class OrderManager:
                 self._placing_oco             = False
                 self._cancel_oco_on_placement = False
             logger.error("[Exec] OCO failed: %s", exc, exc_info=True)
-            closed = await self._emergency_close(fill_qty, entry_side, reason="OCO_FAILED")
+            closed, close_p = await self._emergency_close(fill_qty, entry_side, reason="OCO_FAILED")
             # S2: reset state after confirmed close so Gate 6 cannot double-close.
             if closed:
+                async with self._position_lock:
+                    entry_t = self._open_entry_time
+                    self._reset_open_position()
+                self._record_outcome(req.signal_id, entry_side, fill_price, close_p, fill_qty, entry_t)
                 if req.position_closed_event:
                     req.position_closed_event.set()
+
+    # ── OCO natural-fill watcher ──────────────────────────────────────────────
+
+    async def _watch_oco_outcome(
+        self,
+        oco_list_id: int,
+        signal_id: str,
+        entry_side: str,
+        entry_price: float,
+        fill_qty: float,
+        entry_time: float,
+        position_closed_event: asyncio.Event,
+        poll_interval_s: float = 2.0,
+    ) -> None:
+        """
+        Background task: polls OCO status every poll_interval_s until:
+          a) position_closed_event fires (Gate 6 / killswitch closed it) → exit quietly, or
+          b) OCO reaches ALL_DONE (natural TP or SL fill) → record outcome, set event.
+
+        Runs only in live mode (not spawned when DRY_RUN=True).
+        Cancelled automatically by _reset_open_position() on any other close path.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(position_closed_event.wait(), timeout=poll_interval_s)
+                return  # position closed via another path — exit cleanly
+            except asyncio.TimeoutError:
+                pass
+
+            if not self._client:
+                return
+
+            try:
+                resp = await self._client.get_oco_order(orderListId=oco_list_id)
+            except Exception as exc:
+                logger.warning("[Exec] OCO poll failed (id=%d): %s", oco_list_id, exc)
+                continue
+
+            if resp.get("listStatusType") != "ALL_DONE":
+                continue
+
+            # OCO filled — identify the executed leg and its exit price.
+            exit_price = 0.0
+            for order_ref in resp.get("orders", []):
+                try:
+                    detail = await self._client.get_order(
+                        symbol=settings.SYMBOL, orderId=order_ref["orderId"]
+                    )
+                    if float(detail.get("executedQty", 0)) > 0:
+                        exit_price = float(detail.get("avgPrice") or detail.get("price", 0))
+                        break
+                except Exception as exc:
+                    logger.warning("[Exec] OCO leg detail fetch failed: %s", exc)
+
+            if exit_price <= 0:
+                # All leg-fetch calls failed — position is closed on exchange but we can't
+                # determine the exit price. Unblock Gate 6 so it doesn't hang; outcome not recorded.
+                logger.warning(
+                    "[Exec] OCO ALL_DONE but exit price unknown (leg fetch failed) — signal=%s",
+                    signal_id[:8],
+                )
+                if not position_closed_event.is_set():
+                    async with self._position_lock:
+                        if self._open_signal_id == signal_id:
+                            self._reset_open_position()
+                    position_closed_event.set()
+                return
+
+            if not position_closed_event.is_set():
                 async with self._position_lock:
-                    self._reset_open_position()
+                    # Guard: only reset if this watcher's signal still owns the position.
+                    et = self._open_entry_time if self._open_signal_id == signal_id else entry_time
+                    if self._open_signal_id == signal_id:
+                        self._reset_open_position()
+                self._record_outcome(signal_id, entry_side, entry_price, exit_price, fill_qty, et)
+                position_closed_event.set()
+                logger.info(
+                    "[Exec] OCO natural fill — %s exit=%.2f signal=%s",
+                    "WIN" if (exit_price > entry_price) == (entry_side == "BUY") else "LOSS",
+                    exit_price, signal_id[:8],
+                )
+            return
+
+    # ── Outcome recording ─────────────────────────────────────────────────────
+
+    def _record_outcome(
+        self,
+        signal_id: str | None,
+        entry_side: str,
+        entry_price: float,
+        close_price: float,
+        qty: float,
+        entry_time: float,
+    ) -> None:
+        """Record trade outcome: update budget and schedule telemetry write. No-op when not wired."""
+        if not signal_id or entry_price <= 0 or qty <= 0:
+            return
+        pnl = (close_price - entry_price) * qty if entry_side == "BUY" else (entry_price - close_price) * qty
+        pnl_pct = pnl / (entry_price * qty)
+        outcome = "WIN" if pnl > 0.0 else "LOSS" if pnl < 0.0 else "FLAT"
+        duration_min = (time.monotonic() - entry_time) / 60.0
+        if self._budget_update_cb is not None:
+            self._budget_update_cb(pnl)
+        if self._update_outcome_cb is None:
+            return
+        try:
+            asyncio.create_task(
+                self._update_outcome_cb(signal_id, outcome, pnl, pnl_pct, duration_min)
+            )
+        except RuntimeError:
+            logger.error("[Exec] No running event loop — outcome not scheduled for %s", signal_id)
 
     # ── Emergency close ───────────────────────────────────────────────────────
 
     async def _emergency_close(
         self, qty: float, entry_side: str, reason: str
-    ) -> bool:
+    ) -> tuple[bool, float]:
         """
         Aggressive IOC close for unprotected positions via IOCLimitOrder.
-        Returns True on confirmed fill, False if unfilled or an exception occurred.
+        Returns (True, close_price) on confirmed fill, (False, 0.0) otherwise.
         Callers must act on the return value — this method does not reset state.
         """
         close_side = "SELL" if entry_side == "BUY" else "BUY"
@@ -471,7 +615,7 @@ class OrderManager:
             "[Exec] Emergency close — %s %.6f reason=%s", close_side, qty, reason
         )
         if not self._client:
-            return False
+            return False, 0.0
         try:
             book = await self._client.get_order_book(symbol=settings.SYMBOL, limit=5)
             bids = book.get("bids", [])
@@ -497,15 +641,15 @@ class OrderManager:
                 logger.critical(
                     "[Exec] Emergency close IOC expired unfilled — position still open!"
                 )
-                return False
+                return False, 0.0
             logger.info(
                 "[Exec] Emergency close confirmed — %s %.6f @ %.2f",
                 close_side, qty, close_price,
             )
-            return True
+            return True, close_price
         except Exception as exc:
             logger.critical("[Exec] Emergency close failed: %s", exc, exc_info=True)
-            return False
+            return False, 0.0
 
     # ── Gate 6 callback ───────────────────────────────────────────────────────
 
@@ -545,10 +689,14 @@ class OrderManager:
 
         if settings.DRY_RUN:
             logger.info("[Exec] DRY RUN — would cancel OCO and close position")
+            async with self._position_lock:
+                sig_id  = self._open_signal_id
+                ep      = self._open_entry_price
+                et      = self._open_entry_time
+                self._reset_open_position()
+            self._record_outcome(sig_id, side or "", ep, ep, qty, et)
             if event:
                 event.set()
-            async with self._position_lock:
-                self._reset_open_position()
             return
 
         if oco_id is not None and self._client:
@@ -562,11 +710,18 @@ class OrderManager:
                 logger.error("[Exec] OCO cancel failed: %s", exc, exc_info=True)
 
         # S2 — fire position_closed_event only on confirmed fill.
-        closed = False
+        closed, close_p = False, 0.0
         if side and qty > 0:
-            closed = await self._emergency_close(qty, side, reason="WALL_REMOVED")
+            closed, close_p = await self._emergency_close(qty, side, reason="WALL_REMOVED")
+
+        async with self._position_lock:
+            sig_id = self._open_signal_id
+            ep     = self._open_entry_price
+            et     = self._open_entry_time
+            self._reset_open_position()
 
         if closed:
+            self._record_outcome(sig_id, side or "", ep, close_p, qty, et)
             if event:
                 event.set()
         else:
@@ -575,15 +730,18 @@ class OrderManager:
                 "position_closed_event NOT set; manual intervention required"
             )
 
-        async with self._position_lock:
-            self._reset_open_position()
-
     def _reset_open_position(self) -> None:
         """Must be called under _position_lock."""
+        if self._oco_watcher_task and not self._oco_watcher_task.done():
+            self._oco_watcher_task.cancel()
+        self._oco_watcher_task            = None
         self._open_position_side          = None
         self._open_position_qty           = 0.0
         self._open_oco_list_id            = None
         self._open_position_closed_event  = None
+        self._open_signal_id              = None
+        self._open_entry_price            = 0.0
+        self._open_entry_time             = 0.0
         self._placing_oco                 = False
         self._cancel_oco_on_placement     = False
 
@@ -612,10 +770,14 @@ class OrderManager:
 
         if settings.DRY_RUN:
             logger.info("[Exec] DRY RUN — force_close_all: resetting position state")
+            async with self._position_lock:
+                sig_id = self._open_signal_id
+                ep     = self._open_entry_price
+                et     = self._open_entry_time
+                self._reset_open_position()
+            self._record_outcome(sig_id, side or "", ep, ep, qty, et)
             if event:
                 event.set()
-            async with self._position_lock:
-                self._reset_open_position()
             return
 
         # Live: if OCO is still being placed, delegate to _place_oco (S1 fix).
@@ -635,13 +797,19 @@ class OrderManager:
             except Exception as exc:
                 logger.error("[Exec] force_close_all: OCO cancel failed: %s", exc)
 
-        closed = await self._emergency_close(qty, side, reason)
-        if closed and event:
-            event.set()
+        closed, close_p = await self._emergency_close(qty, side, reason)
+
+        async with self._position_lock:
+            sig_id = self._open_signal_id
+            ep     = self._open_entry_price
+            et     = self._open_entry_time
+            self._reset_open_position()
+
+        if closed:
+            self._record_outcome(sig_id, side or "", ep, close_p, qty, et)
+            if event:
+                event.set()
         elif not closed:
             logger.critical(
                 "[Exec] force_close_all: emergency close unfilled — manual intervention required"
             )
-
-        async with self._position_lock:
-            self._reset_open_position()

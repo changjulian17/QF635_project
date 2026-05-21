@@ -16,7 +16,7 @@ Startup sequence (master arch §9):
 import asyncio
 import logging
 import signal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 from binance import AsyncClient
@@ -65,7 +65,7 @@ async def shutdown_handler(
         logger.info("[Shutdown] Open position (OCO active): %s", pos)
     telemetry.write_system_event(
         "GRACEFUL_SHUTDOWN",
-        {"open_positions": len(portfolio.positions), "ts": datetime.utcnow().isoformat()},
+        {"open_positions": len(portfolio.positions), "ts": datetime.now(timezone.utc).isoformat()},
     )
     logger.info("[Shutdown] Graceful shutdown complete")
 
@@ -83,7 +83,7 @@ async def emergency_close_all(
     await order_manager.force_close_all(reason)
     telemetry.write_system_event(
         "KILLSWITCH_FIRED",
-        {"reason": reason, "equity": portfolio.equity, "ts": datetime.utcnow().isoformat()},
+        {"reason": reason, "equity": portfolio.equity, "ts": datetime.now(timezone.utc).isoformat()},
     )
 
 
@@ -116,7 +116,7 @@ async def midnight_reset_loop(
 ) -> None:
     """Sleep until next UTC midnight + 5 s, then reset all daily counters."""
     while True:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         next_midnight = (now + timedelta(days=1)).replace(
             hour=0, minute=0, second=5, microsecond=0
         )
@@ -211,8 +211,12 @@ async def _api_server(
     async def _handle_killswitch(request: web.Request) -> web.Response:
         if killswitch.is_active:
             return web.json_response({"fired": True, "already_active": True})
-        asyncio.create_task(
+        task = asyncio.create_task(
             emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_UI")
+        )
+        task.add_done_callback(
+            lambda t: logger.error("[KS] emergency_close_all failed: %s", t.exception())
+            if not t.cancelled() and t.exception() else None
         )
         return web.json_response({"fired": True})
 
@@ -232,11 +236,8 @@ async def _api_server(
         await runner.cleanup()  # guarantee socket release on any exit path
 
 
-async def _process_fills(
-    fill_q: asyncio.Queue,
-    portfolio: PortfolioState,
-) -> None:
-    """Log IOC entry fills. Realised P&L is tracked in DailyBudget via budget.realised_pnl."""
+async def _process_fills(fill_q: asyncio.Queue) -> None:
+    """Consume and log IOC entry fills. Outcome/PnL recording happens via update_outcome_cb."""
     while True:
         fill: FillDetail = await fill_q.get()
         logger.info(
@@ -331,6 +332,8 @@ async def main() -> None:
         killswitch=killswitch,
         equity_fn=lambda: portfolio.equity,
         ks_fire_cb=_ks_fire_cb,
+        update_outcome_cb=telemetry.update_outcome,
+        budget_update_cb=lambda pnl: setattr(budget, "realised_pnl", budget.realised_pnl + pnl),
     )
     strategy_executor = StrategyExecutor(
         micro_signal_queue=micro_signal_queue,
@@ -402,7 +405,7 @@ async def main() -> None:
             tg.create_task(midnight_reset_loop(risk_engine, cvd_calculator),                  name="midnight_reset")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
             tg.create_task(_drain_queue(re_order_queue),                                      name="re_order_drain")
-            tg.create_task(_process_fills(fill_queue, portfolio),                             name="fill_processor")
+            tg.create_task(_process_fills(fill_queue),                                        name="fill_processor")
             tg.create_task(
                 _portfolio_mtm_loop(killswitch, budget, order_manager, portfolio, telemetry),
                 name="portfolio_mtm_loop",

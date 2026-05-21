@@ -79,6 +79,12 @@ class FeatureComputer:
         self._prev_close:        float = 0.0
         self._cur_close:         float = 0.0
 
+        # Wilder ATR state (Wilder EMA, alpha = 1/period)
+        self._wilder_atr:       float = 0.0
+        self._wilder_atr_sum:   float = 0.0   # accumulator during init phase
+        self._wilder_atr_bars:  int   = 0
+        self._wilder_atr_ready: bool  = False
+
     @property
     def wall_sigma(self) -> float:
         return self._p.wall_sigma
@@ -105,12 +111,13 @@ class FeatureComputer:
         self._vol_sum += candle.volume
         self._vwap = self._tpv_sum / self._vol_sum if self._vol_sum > 0 else candle.close
 
-        # ATR
+        # ATR — Wilder EMA (alpha = 1/period), causal: prev_close captured before appending
+        prev_close = self._atr_closes[-1] if self._atr_closes else 0.0
         self._highs.append(candle.high)
         self._lows.append(candle.low)
         self._atr_closes.append(candle.close)
         self._closes.append(candle.close)
-        self._atr = self._compute_atr()
+        self._atr = self._step_wilder_atr(candle.high, candle.low, prev_close)
 
         # vol_ratio: score current volume against prior distribution (causal), then update
         if self._vol_stats.n > 0:
@@ -128,22 +135,61 @@ class FeatureComputer:
         # Wilder RSI
         self._update_rsi(candle.close)
 
-    def _compute_atr(self) -> float:
-        highs  = list(self._highs)
-        lows   = list(self._lows)
-        closes = list(self._atr_closes)
-        trs = []
-        for i in range(1, len(highs)):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            )
-            trs.append(tr)
-        if not trs:
+    def _step_wilder_atr(self, high: float, low: float, prev_close: float) -> float:
+        """Update and return Wilder smoothed ATR (alpha = 1/period).
+        Initialises with a simple average over the first `atr_period` bars."""
+        tr = (
+            max(high - low, abs(high - prev_close), abs(low - prev_close))
+            if prev_close > 0.0
+            else high - low
+        )
+        period = self._p.atr_period
+        self._wilder_atr_bars += 1
+        if self._wilder_atr_bars < period:
+            self._wilder_atr_sum += tr
             return 0.0
-        period = min(self._p.atr_period, len(trs))
-        return sum(trs[-period:]) / period
+        if self._wilder_atr_bars == period:
+            self._wilder_atr_sum += tr
+            self._wilder_atr = self._wilder_atr_sum / period
+            self._wilder_atr_ready = True
+            return self._wilder_atr
+        k = 1.0 / period
+        self._wilder_atr = self._wilder_atr * (1.0 - k) + tr * k
+        return self._wilder_atr
+
+    def reset(self) -> None:
+        """Reset all accumulated state. Called by TickReplayEngine between replay windows."""
+        self._obi_stats      = WelfordOnline()
+        self._vol_stats      = WelfordOnline()
+        self._atr_stats      = WelfordOnline()
+        self._highs.clear()
+        self._lows.clear()
+        self._atr_closes.clear()
+        self._closes.clear()
+        self._tpv_sum        = 0.0
+        self._vol_sum        = 0.0
+        self._vwap           = 0.0
+        self._last_vwap_day  = -1
+        self._avg_gain       = 0.0
+        self._avg_loss       = 0.0
+        self._rsi_ready      = False
+        self._rsi_bars       = 0
+        self._rsi_value      = 50.0
+        self._atr            = 0.0
+        self._vol_ratio      = 1.0
+        self._obi_zscore     = 0.0
+        self._atr_percentile = 0.5
+        self._spread_bps     = 0.0
+        self._mid_price      = 0.0
+        self._wall_detected      = 0
+        self._wall_distance_bps  = 0.0
+        self._absorption_ratio   = 0.0
+        self._prev_close     = 0.0
+        self._cur_close      = 0.0
+        self._wilder_atr       = 0.0
+        self._wilder_atr_sum   = 0.0
+        self._wilder_atr_bars  = 0
+        self._wilder_atr_ready = False
 
     def _update_rsi(self, close: float) -> None:
         closes = list(self._closes)

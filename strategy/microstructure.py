@@ -21,7 +21,6 @@ _CONSUMED_RATIO   = 0.15     # wall qty below this fraction of initial → consu
 _PRICE_MOVE_THRESH = 0.0003  # 0.03% price move required for sweep
 _CVD_SPIKE_STD    = 1.5      # CVD must spike > 1.5σ
 _FRESH_WALL_MS    = 3_000    # protection wall must appear within 3 s
-_WALL_PRICE_TOL   = 1.0      # USD tolerance for matching trade price to wall
 _STALE_WALL_MS    = 30_000   # prune wall states not seen for 30 s
 
 
@@ -72,18 +71,25 @@ def detect_absorption(
     wall: WallState,
     cvd_delta_1t: float,
     price_move_pct: float,
-    reload_ratio: float,
+    reload_ratio: float,   # explicit param (not wall.reload_ratio) so tests can inject arbitrary values
 ) -> bool:
     """
     Return True when all four absorption conditions are met:
       1. Wall has been visible >= 500 ms (is_persistent)
-      2. Some net aggression against the wall (|cvd_delta_1t| > 0)
+      2. Directional aggression against the wall:
+           bid wall → sellers aggressing (cvd_delta_1t < 0)
+           ask wall → buyers aggressing  (cvd_delta_1t > 0)
       3. Price barely moved (|price_move_pct| < 0.03%)
       4. Wall has reloaded to >= 70% of initial qty
     """
+    if wall.side == "bid":
+        directional_aggression = cvd_delta_1t < -1e-9
+    else:
+        directional_aggression = cvd_delta_1t > 1e-9
+
     return (
         wall.is_persistent
-        and abs(cvd_delta_1t) > 0
+        and directional_aggression
         and abs(price_move_pct) < _PRICE_MOVE_THRESH
         and reload_ratio >= 0.70
     )
@@ -138,8 +144,8 @@ def detect_sweep_with_protection(
 
 class MicrostructureDetector:
     """
-    Consumes depth20 snapshots and aggTrades; emits MicroSignal on
-    confirmed Sweep + Protection events.
+    Consumes depth100 snapshots (reconstructed from incremental diff stream)
+    and aggTrades; emits MicroSignal on confirmed Sweep + Protection events.
 
     Wall lifecycle:
       identify_walls() → WallState created/updated each tick
@@ -164,7 +170,7 @@ class MicrostructureDetector:
         self._window       = window
 
         self._wall_states: dict[float, WallState] = {}
-        self._absorption_armed: bool = False
+        self._absorption_armed: dict[float, bool] = {}  # keyed by wall price
         self._prev_mid: float = 0.0
 
     async def run(self) -> None:
@@ -184,7 +190,6 @@ class MicrostructureDetector:
             if not isinstance(item, AggTrade):
                 continue
             self._cvd.update(item)
-            self._check_wall_aggression(item)
 
     # ── Snapshot processing ───────────────────────────────────────────────────
 
@@ -235,19 +240,19 @@ class MicrostructureDetector:
                 ws.qty_current  = book.get(price, 0.0)
                 ws.last_seen_ts = now_ms
 
-        # Absorption check
-        price_move_pct  = (mid - self._prev_mid) / self._prev_mid if self._prev_mid > 0 else 0.0
-        cvd_delta_1t    = self._cvd.get_cvd_delta(1)
+        # Absorption check — 3-tick delta reduces single-trade noise while staying
+        # responsive enough to detect multi-trade aggression against a wall.
+        price_move_pct   = (mid - self._prev_mid) / self._prev_mid if self._prev_mid > 0 else 0.0
+        cvd_delta_3t     = self._cvd.get_cvd_delta(3)
         for ws in self._wall_states.values():
-            if detect_absorption(ws, cvd_delta_1t, price_move_pct, ws.reload_ratio):
-                self._absorption_armed = True
-                logger.debug("[MS] Absorption armed at price=%.2f", ws.price)
-                break
+            if detect_absorption(ws, cvd_delta_3t, price_move_pct, ws.reload_ratio):
+                self._absorption_armed[ws.price] = True
+                logger.debug("[MS] Absorption armed at price=%.2f side=%s", ws.price, ws.side)
 
-        # Sweep + Protection check
-        cvd_std = self._cvd.get_cvd_tick_std()
-        _cvd_n_ready = self._cvd._delta_stats.n >= 10
-        cvd_spike_std = (abs(cvd_delta_1t) / cvd_std if cvd_std > 1e-9 else 0.0) if _cvd_n_ready else 0.0
+        # Sweep + Protection check — 1-tick delta captures the momentary spike
+        cvd_delta_1t  = self._cvd.get_cvd_delta(1)
+        cvd_std       = self._cvd.get_cvd_tick_std()
+        cvd_spike_std = (abs(cvd_delta_1t) / cvd_std if cvd_std > 1e-9 else 0.0) if self._cvd.is_warmed_up else 0.0
 
         for price, ws in list(self._wall_states.items()):
             if ws.reload_ratio >= _CONSUMED_RATIO:
@@ -267,7 +272,7 @@ class MicrostructureDetector:
                     timestamp_ms     = now_ms,
                     consumed_wall    = ws,
                     protection_wall  = info.get("protection_wall"),
-                    prior_absorption = self._absorption_armed,
+                    prior_absorption = self._absorption_armed.get(price, False),
                     cvd_std          = cvd_spike_std,
                     price_move_pct   = price_move_pct,
                 )
@@ -276,19 +281,14 @@ class MicrostructureDetector:
                     "[MS] Sweep+Protection %s @ %.2f → signal emitted",
                     info["direction"], price,
                 )
-                self._absorption_armed = False
+                self._absorption_armed.pop(price, None)
                 del self._wall_states[price]
-                break
+                break  # one signal per depth tick — prevents cascade signals from simultaneous sweeps
 
-        # Prune stale walls
-        self._wall_states = {
-            p: w for p, w in self._wall_states.items()
-            if (now_ms - w.last_seen_ts) < _STALE_WALL_MS
-        }
+        # Prune stale walls and their absorption flags
+        stale = [p for p, w in self._wall_states.items() if (now_ms - w.last_seen_ts) >= _STALE_WALL_MS]
+        for p in stale:
+            del self._wall_states[p]
+            self._absorption_armed.pop(p, None)
         self._prev_mid = mid
 
-    def _check_wall_aggression(self, trade: AggTrade) -> None:
-        for ws in self._wall_states.values():
-            if abs(trade.price - ws.price) <= _WALL_PRICE_TOL:
-                ws.aggression_hits  += 1
-                ws.total_aggressed  += trade.qty

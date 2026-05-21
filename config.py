@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     MAX_CONSECUTIVE_LOSSES: int = 3
     RISK_PER_TRADE_PCT: float = 0.01
     KELLY_FRACTION: float = 0.25
-    ATR_MULTIPLIER_SL: float = 1.5
+    ATR_MULTIPLIER_SL: float = 1.5   # legacy — used by pattern_detector.py only; microstructure path uses wall-based SL
     ATR_MULTIPLIER_TP: float = 3.0
     PYRAMID_MAX_LEGS: int = 3
 
@@ -86,6 +86,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":
+        if not self.DRY_RUN and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
+            raise ValueError(
+                "BINANCE_API_KEY and BINANCE_API_SECRET must be set when DRY_RUN=False. "
+                "Add them to .env or set DRY_RUN=True for paper trading."
+            )
         assert self.TIER_REDUCED_PCT < self.TIER_MINIMAL_PCT, \
             f"TIER_REDUCED_PCT ({self.TIER_REDUCED_PCT}) must be < TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT})"
         assert self.TIER_MINIMAL_PCT < self.TIER_PASSIVE_PCT, \

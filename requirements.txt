@@ -9,6 +9,7 @@ streamlit==1.35.0
 plotly==5.22.0
 pytest==8.2.2
 pytest-asyncio==0.23.7
+pytest-aiohttp>=1.0
 # Phase 2 — backtesting engine
 ccxt>=4.3
 vectorbt>=0.25

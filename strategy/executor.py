@@ -245,6 +245,22 @@ class StrategyExecutor:
         self._gate6_tasks: set[asyncio.Task] = set()
         self._gate6_check_ms = gate6_check_interval_ms
 
+    def set_risk_tier(self, tier: str) -> None:
+        """
+        Sync the active risk tier from RiskEngine into Gate 3.
+        Call this after every fill via RiskEngine.record_trade_result so
+        REDUCED/MINIMAL/PASSIVE throttling applies to the microstructure path.
+
+        Valid tiers: FULL | REDUCED | MINIMAL | PASSIVE | HALTED
+        """
+        valid = {"FULL", "REDUCED", "MINIMAL", "PASSIVE", "HALTED"}
+        if tier not in valid:
+            logger.warning("[Executor] Ignoring unknown risk tier %r", tier)
+            return
+        if tier != self._risk_tier:
+            logger.info("[Executor] Risk tier updated: %s → %s", self._risk_tier, tier)
+            self._risk_tier = tier
+
     @property
     def _spread_p95(self) -> float:
         """Session-aware 95th-percentile spread via log-normal approximation."""

@@ -1,9 +1,12 @@
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from typing import Generator, Union
 
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 MAIN_DB = "cryptosentinel.db"
 REGISTRY_DB = settings.REGISTRY_DB
@@ -17,7 +20,7 @@ class DBOffline(Exception):
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA wal_autocheckpoint=100")  # checkpoint every 100 pages
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -58,6 +61,7 @@ def fetch_portfolio_history(limit: int = 300) -> Union[list[dict], DBOffline]:
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError as e:
+            logger.warning("[DB] main offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in reversed(rows)]
 
@@ -71,6 +75,7 @@ def fetch_lob_snapshots(limit: int = 3600) -> Union[list[dict], DBOffline]:
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError as e:
+            logger.warning("[DB] main offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in reversed(rows)]
 
@@ -84,6 +89,7 @@ def fetch_signal_funnel(hours: int = 24) -> Union[list[dict], DBOffline]:
                 (f"-{hours} hours",),
             ).fetchall()
         except sqlite3.OperationalError as e:
+            logger.warning("[DB] registry offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in rows]
 
@@ -99,6 +105,7 @@ def fetch_gate_funnel_drift() -> Union[list[dict], DBOffline]:
                    GROUP BY gate_passed""",
             ).fetchall()
         except sqlite3.OperationalError as e:
+            logger.warning("[DB] registry offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in rows]
 
@@ -110,6 +117,7 @@ def fetch_strategies() -> Union[list[dict], DBOffline]:
                 "SELECT * FROM strategies ORDER BY created_at DESC"
             ).fetchall()
         except sqlite3.OperationalError as e:
+            logger.warning("[DB] registry offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in rows]
 
@@ -123,8 +131,23 @@ def fetch_system_events(limit: int = 50) -> Union[list[dict], DBOffline]:
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError as e:
+            logger.warning("[DB] registry offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in rows]
+
+
+def fetch_candles(limit: int = 7200) -> Union[list[dict], DBOffline]:
+    with main_db() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT open_time, open, high, low, close, volume "
+                "FROM candles ORDER BY open_time DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] candles offline: %s", e)
+            return DBOffline(str(e))
+    return [dict(r) for r in reversed(rows)]
 
 
 def fetch_backtest_results() -> Union[list[dict], DBOffline]:
@@ -134,5 +157,6 @@ def fetch_backtest_results() -> Union[list[dict], DBOffline]:
         try:
             rows = conn.execute("SELECT * FROM results ORDER BY composite_score DESC").fetchall()
         except sqlite3.OperationalError as e:
+            logger.warning("[DB] backtest offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in rows]

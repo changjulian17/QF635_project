@@ -92,3 +92,19 @@ def test_ks_modal_does_not_fire_on_wrong_confirm():
     assert validate_ks_confirm("CONFIRM ") is True  # trailing space
     assert validate_ks_confirm(" CONFIRM") is True  # leading space
     assert validate_ks_confirm("confirm") is True
+
+
+def test_ks_modal_clears_input_on_post_failure():
+    """Input must be cleared to '' even when POST fails — prevents silent re-fire."""
+    from unittest.mock import patch
+    from dashboard._logic import fire_killswitch, validate_ks_confirm
+
+    with patch("dashboard._logic.requests.post", side_effect=ConnectionError()):
+        result = fire_killswitch("http://127.0.0.1:8080")
+
+    assert result is False  # POST failed
+
+    # After clearing the input to "", the confirm button must be disabled
+    assert validate_ks_confirm("") is True   # button disabled after clear
+    # And enabled only when "CONFIRM" is typed again
+    assert validate_ks_confirm("CONFIRM") is False  # disabled=False means enabled

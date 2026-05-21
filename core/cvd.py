@@ -97,6 +97,11 @@ class CVDCalculator:
         """Welford online std of per-trade signed quantity (each trade's contribution to CVD, i.e. per-tick CVD change)."""
         return self._delta_stats.std
 
+    @property
+    def is_warmed_up(self) -> bool:
+        """True once at least 10 trades have been processed (CVD spike z-score is meaningful)."""
+        return self._delta_stats.n >= 10
+
     def reset_daily(self) -> None:
         """Reset CVD at UTC midnight. History and stats are also cleared."""
         self._cvd = 0.0

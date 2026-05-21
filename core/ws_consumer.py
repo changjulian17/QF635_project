@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
+import aiohttp
 import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
@@ -71,11 +72,16 @@ class HeartbeatMonitor:
 
 
 class BinanceWebSocketConsumer:
-    # v3.0 stream set: snapshot depth (not diff), 5m candles, bookTicker for spread
+    # Incremental diff-depth stream: 100 levels per side vs the old 20-level snapshot.
+    # At BTC prices ~$77k, 100 levels spans ~$50–200 from mid — sufficient range for
+    # deep-book institutional wall detection above the transaction cost floor.
+    _DEPTH_LEVELS = 100
+    _MAX_PENDING_DIFFS = 500   # cap pending diff buffer during REST snapshot fetch
+
     STREAMS = [
         f"{settings.SYMBOL.lower()}@aggTrade",
         f"{settings.SYMBOL.lower()}@kline_{settings.TIMEFRAME}",
-        f"{settings.SYMBOL.lower()}@depth20@100ms",
+        f"{settings.SYMBOL.lower()}@depth@100ms",   # incremental diff — seeded by REST snapshot
         f"{settings.SYMBOL.lower()}@bookTicker",
     ]
 
@@ -99,6 +105,13 @@ class BinanceWebSocketConsumer:
         self._max_delay       = 60.0
         self.heartbeat        = HeartbeatMonitor()
 
+        # Local order book for diff-depth reconstruction
+        self._bid_book:       dict[float, float] = {}
+        self._ask_book:       dict[float, float] = {}
+        self._lob_update_id:  int  = 0
+        self._lob_synced:     bool = False
+        self._lob_pending:    list[dict] = []
+
     async def start(self) -> None:
         self._running = True
         await self._connect_loop()
@@ -120,11 +133,29 @@ class BinanceWebSocketConsumer:
                     ping_timeout=60,
                     close_timeout=10,
                 ) as ws:
-                    logger.info("[WS] Connected.")
+                    logger.info("[WS] Connected — seeding LOB from REST snapshot…")
                     self._reconnect_delay = 1.0
                     attempt = 0
                     self._shared_state.lob_status = "UNINITIALISED"
-                    await self._receive_loop(ws)
+
+                    # Reset local book and start async REST seed concurrently
+                    # with the receive loop so diffs are buffered during the fetch.
+                    self._bid_book.clear()
+                    self._ask_book.clear()
+                    self._lob_update_id = 0
+                    self._lob_synced    = False
+                    self._lob_pending   = []
+                    sync_task = asyncio.create_task(
+                        self._sync_lob_snapshot(), name="ws_lob_sync"
+                    )
+                    try:
+                        await self._receive_loop(ws)
+                    finally:
+                        sync_task.cancel()
+                        try:
+                            await sync_task
+                        except asyncio.CancelledError:
+                            pass
 
             except (ConnectionClosedError, ConnectionClosedOK) as exc:
                 logger.warning("[WS] Connection closed: %s", exc)
@@ -184,6 +215,73 @@ class BinanceWebSocketConsumer:
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning("[WS] Malformed message: %s", exc)
 
+    async def _sync_lob_snapshot(self) -> None:
+        """
+        Fetch a REST depth snapshot to seed the local book, then apply any
+        diffs that arrived during the fetch. Mirrors the LOBRecorder pattern.
+        Falls back to marking synced anyway so data continues to flow on failure.
+        """
+        url = f"{settings.REST_BASE}/api/v3/depth"
+        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    resp.raise_for_status()
+                    snap = await resp.json()
+
+            self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
+            self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
+            last_uid = int(snap["lastUpdateId"])
+
+            for event in self._lob_pending:
+                if int(event.get("u", 0)) <= last_uid:
+                    continue
+                self._apply_depth_diff(event)
+
+            self._lob_update_id = last_uid
+            logger.info(
+                "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
+                last_uid, len(self._bid_book), len(self._ask_book),
+            )
+        except Exception as exc:
+            logger.error("[WS] LOB REST seed failed (%s) — continuing with buffered diffs.", exc)
+        finally:
+            self._lob_pending.clear()
+            self._lob_synced = True
+
+    def _apply_depth_diff(self, event: dict) -> None:
+        for p, q in event.get("b", []):
+            price, qty = float(p), float(q)
+            if qty == 0.0:
+                self._bid_book.pop(price, None)
+            else:
+                self._bid_book[price] = qty
+        for p, q in event.get("a", []):
+            price, qty = float(p), float(q)
+            if qty == 0.0:
+                self._ask_book.pop(price, None)
+            else:
+                self._ask_book[price] = qty
+        self._lob_update_id = int(event.get("u", self._lob_update_id))
+
+    def _reconstruct_depth_msg(self, event_ms: int) -> dict:
+        """
+        Build a full-snapshot-style dict from the local book (top _DEPTH_LEVELS
+        per side) so downstream consumers (LOBEngine, MicrostructureDetector)
+        receive the same message format as the old depth20 stream, but with
+        100 levels instead of 20.
+        """
+        bids = sorted(self._bid_book.items(), reverse=True)[: self._DEPTH_LEVELS]
+        asks = sorted(self._ask_book.items())[: self._DEPTH_LEVELS]
+        return {
+            "lastUpdateId": self._lob_update_id,
+            "E": event_ms,
+            "bids": [[str(p), str(q)] for p, q in bids],
+            "asks": [[str(p), str(q)] for p, q in asks],
+        }
+
     async def _dispatch(self, stream: str, msg: dict) -> None:
         event_type = msg.get("e")
 
@@ -217,11 +315,16 @@ class BinanceWebSocketConsumer:
                     candle.open, candle.high, candle.low, candle.close, candle.volume,
                 )
 
-        elif "depth20" in stream:
-            # depth20@100ms delivers full snapshots (not diffs)
-            # msg format: {"lastUpdateId": int, "bids": [[price, qty]...], "asks": [...]}
-            if self._depth_queue is not None:
-                await self._depth_queue.put(msg)
+        elif event_type == "depthUpdate":
+            # Incremental diff — buffer during REST seed, then apply and reconstruct.
+            event_ms = int(msg.get("E") or time.time() * 1000)
+            if not self._lob_synced:
+                if len(self._lob_pending) < self._MAX_PENDING_DIFFS:
+                    self._lob_pending.append(msg)
+            else:
+                self._apply_depth_diff(msg)
+                if self._depth_queue is not None:
+                    await self._depth_queue.put(self._reconstruct_depth_msg(event_ms))
 
         elif event_type == "bookTicker":
             # Best bid/ask for spread calculation; route alongside trades

@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 
 class LocalOrderBook:
     """
-    Maintains a local copy of the Binance order book from the depth20@100ms
-    full-snapshot stream (not diff-depth).
+    Maintains a local copy of the Binance order book. Receives reconstructed
+    full-book snapshots (top 100 levels per side) produced by BinanceWebSocketConsumer
+    from the incremental diff stream (btcusdt@depth@100ms + REST seed).
 
     State machine:
       UNINITIALISED → SYNCED       : first valid snapshot applied
@@ -47,11 +48,12 @@ class LocalOrderBook:
         self._lock = asyncio.Lock()
         self._last_event_time: datetime | None = None
 
-    # ── Snapshot stream (depth20@100ms) ───────────────────────────────────────
+    # ── Snapshot interface ────────────────────────────────────────────────────
 
     async def apply_snapshot(self, msg: dict) -> bool:
         """
-        Apply a depth20@100ms full-snapshot message.
+        Apply a full-book snapshot message reconstructed by BinanceWebSocketConsumer
+        from the incremental diff stream (100 levels per side).
 
         Returns True if the snapshot was applied, False if it was rejected
         (stale lastUpdateId). On rejection the book is NOT cleared — it

@@ -74,36 +74,51 @@ def test_wall_side_field_correct():
 
 
 # ── detect_absorption ─────────────────────────────────────────────────────────
+# Directional convention: bid wall absorbs sellers (cvd_delta_1t < 0);
+#                         ask wall absorbs buyers  (cvd_delta_1t > 0).
 
-def test_absorption_when_wall_holds():
-    ws = _wall(qty_initial=50.0, qty_current=40.0, age_ms=600)  # reload=0.80, persistent
-    result = detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80)
-    assert result is True
+def test_absorption_bid_wall_with_sell_aggression():
+    # Bid wall, sell aggression (CVD negative) → should arm
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
+
+
+def test_absorption_ask_wall_with_buy_aggression():
+    # Ask wall, buy aggression (CVD positive) → should arm
+    ws = _wall(side="ask", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
+
+
+def test_absorption_false_wrong_direction_bid():
+    # Bid wall but buy aggression (positive CVD) → wrong direction → False
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
+
+
+def test_absorption_false_wrong_direction_ask():
+    # Ask wall but sell aggression (negative CVD) → wrong direction → False
+    ws = _wall(side="ask", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_not_persistent():
-    ws = _wall(qty_initial=50.0, qty_current=40.0, age_ms=100)  # < 500 ms — not persistent
-    result = detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80)
-    assert result is False
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=100)  # < 500 ms
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_price_breaks():
-    ws = _wall(qty_initial=50.0, qty_current=40.0, age_ms=600)
-    # price_move_pct > 0.03% → absorption fails
-    result = detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.001, reload_ratio=0.80)
-    assert result is False
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_no_aggression():
-    ws = _wall(age_ms=600)
-    result = detect_absorption(ws, cvd_delta_1t=0.0, price_move_pct=0.0001, reload_ratio=0.80)
-    assert result is False
+    ws = _wall(side="bid", age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=0.0, price_move_pct=0.0001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_reload_low():
-    ws = _wall(qty_initial=50.0, qty_current=25.0, age_ms=600)  # reload=0.50 < 0.70
-    result = detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.50)
-    assert result is False
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=25.0, age_ms=600)  # reload=0.50 < 0.70
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.50) is False
 
 
 # ── detect_sweep_with_protection ─────────────────────────────────────────────

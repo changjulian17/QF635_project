@@ -603,3 +603,180 @@ def _print_leaderboard(df: pd.DataFrame) -> None:
         print(bm_df[cols].to_string(index=False, float_format="%.2f"))
 
     print()
+
+
+# ── Tick Replay Walk-Forward ──────────────────────────────────────────────────
+
+_MS_PER_DAY = 86_400_000
+
+
+def _generate_ts_windows(
+    start_ms: int,
+    end_ms:   int,
+    train_ms: int,
+    test_ms:  int,
+    step_ms:  int,
+) -> list[dict]:
+    """Generate timestamp-based IS/OOS window pairs (milliseconds)."""
+    windows = []
+    ts  = start_ms
+    idx = 0
+    while ts + train_ms + test_ms <= end_ms:
+        windows.append({
+            "idx":       idx,
+            "is_start":  ts,
+            "is_end":    ts + train_ms,
+            "oos_start": ts + train_ms,
+            "oos_end":   ts + train_ms + test_ms,
+        })
+        ts  += step_ms
+        idx += 1
+    return windows
+
+
+def _ms_to_date(ms: int) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def run_tick_walk_forward(
+    db_path:         str   = "data/lob_tick.db",
+    start_ts=None,          # datetime | None — UTC start; defaults to earliest DB row
+    end_ts=None,            # datetime | None — UTC end;   defaults to latest  DB row
+    train_days:      int   = 30,
+    test_days:       int   = 10,
+    step_days:       int   = 10,
+    params:          dict  = None,
+    starting_equity: float = 10_000.0,
+    db_results_path: str   = RESULTS_DB,
+) -> pd.DataFrame:
+    """
+    Walk-forward validation for the primary microstructure strategy
+    (TickReplayEngine). Complements run_walk_forward() which covers the
+    legacy OHLCV EventDrivenEngine path.
+
+    Each window pair:
+      IS  pass — replay_window()     — warms up FeatureComputer Welford stats
+      OOS pass — replay_window_oos() — evaluates with IS distributions intact
+
+    FeatureComputer is NOT reset between IS and OOS so Welford z-scores and
+    percentile ranks are meaningful from the first OOS event rather than
+    starting cold. Equity, trades, and wall states ARE reset at each OOS
+    boundary to keep PnL accounting clean.
+
+    Parameters
+    ----------
+    db_path         : lob_tick.db produced by core.lob_recorder.
+    start_ts        : UTC start datetime (default: earliest row in DB).
+    end_ts          : UTC end datetime (default: latest row in DB).
+    train_days      : IS window length in calendar days (warm-up; no Optuna).
+    test_days       : OOS window length in calendar days.
+    step_days       : Rolling step between windows.
+    params          : Forwarded to TickReplayEngine (supports "feature" sub-dict).
+    starting_equity : Per-window equity reset value.
+
+    Returns
+    -------
+    pd.DataFrame with one aggregated-OOS row (Sharpe, MDD, PF, WR,
+    composite_score). Empty DataFrame if fewer than 2 windows have
+    enough trades.
+    """
+    import sqlite3 as _sqlite3
+    from backtesting.tick_replay import TickReplayEngine  # lazy — avoids circular dep
+
+    params = params or {}
+
+    with _sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT MIN(ts_event), MAX(ts_event) FROM depth_snapshots"
+        ).fetchone()
+
+    if row is None or row[0] is None:
+        logger.error("[WF-Tick] depth_snapshots is empty in %s.", db_path)
+        return pd.DataFrame()
+
+    db_start_ms, db_end_ms = int(row[0]), int(row[1])
+    start_ms = int(start_ts.timestamp() * 1000) if start_ts else db_start_ms
+    end_ms   = int(end_ts.timestamp()   * 1000) if end_ts   else db_end_ms
+
+    train_ms = train_days * _MS_PER_DAY
+    test_ms  = test_days  * _MS_PER_DAY
+    step_ms  = step_days  * _MS_PER_DAY
+
+    windows = _generate_ts_windows(start_ms, end_ms, train_ms, test_ms, step_ms)
+    if len(windows) < 2:
+        span_days = (end_ms - start_ms) // _MS_PER_DAY
+        logger.warning(
+            "[WF-Tick] Only %d window(s) available "
+            "(span=%dd, train=%dd, test=%dd). Collect more LOB data.",
+            len(windows), span_days, train_days, test_days,
+        )
+        return pd.DataFrame()
+
+    engine = TickReplayEngine(
+        params          = params,
+        db_path         = db_path,
+        starting_equity = starting_equity,
+    )
+
+    oos_trades:        list[dict]      = []
+    oos_equity_curves: list[pd.Series] = []
+
+    for w in windows:
+        logger.info(
+            "[WF-Tick] Window %d/%d | IS %s→%s | OOS %s→%s",
+            w["idx"] + 1, len(windows),
+            _ms_to_date(w["is_start"]),  _ms_to_date(w["is_end"]),
+            _ms_to_date(w["oos_start"]), _ms_to_date(w["oos_end"]),
+        )
+
+        # IS: full reset + warm-up run (trades discarded)
+        engine.replay_window(w["is_start"], w["is_end"])
+
+        # OOS: evaluation with IS Welford state preserved
+        eq_curve, trades = engine.replay_window_oos(w["oos_start"], w["oos_end"])
+
+        if len(trades) < MIN_OOS_TRADES:
+            logger.warning(
+                "[WF-Tick] Window %d: %d OOS trades < %d minimum — excluded.",
+                w["idx"] + 1, len(trades), MIN_OOS_TRADES,
+            )
+            continue
+
+        oos_equity_curves.append(eq_curve)
+        oos_trades.extend([
+            {
+                "pnl":              t.pnl_usd,
+                "pnl_pct":          t.pnl_usd / starting_equity,
+                "duration_minutes": (t.exit_ts_ms - t.entry_ts_ms) / 60_000,
+            }
+            for t in trades
+        ])
+
+    if not oos_equity_curves:
+        logger.error(
+            "[WF-Tick] No qualifying OOS windows — cannot evaluate strategy. "
+            "Lower MIN_OOS_TRADES or collect more data."
+        )
+        return pd.DataFrame()
+
+    chained    = _chain_equity_curves(oos_equity_curves, starting_equity)
+    n_windows  = len(windows)
+    oos_period = f"{test_days * n_windows}d OOS ({n_windows} windows) [tick]"
+    metrics    = calculate_metrics(
+        chained, oos_trades, "MICROSTRUCTURE_SWEEP", "tick", oos_period
+    )
+
+    logger.info("\n[WF-Tick] OOS result: %s", metrics.summary())
+
+    row_dict = metrics.to_dict()
+    row_dict.update({
+        "raw_sharpe":     metrics.sharpe_ratio,
+        "raw_return_pct": metrics.total_return_pct,
+        "raw_trades":     metrics.total_trades,
+        "best_params":    params,
+        "n_wf_windows":   n_windows,
+    })
+
+    _save_results(pd.DataFrame([row_dict]), db_path=db_results_path)
+    return pd.DataFrame([row_dict])
