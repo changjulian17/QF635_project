@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 
 from config import settings
 from dashboard._db import fetch_lob_snapshots, DBOffline
+from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/lob", name="LOB")
 
@@ -59,20 +60,6 @@ layout = html.Div([
     ),
 ])
 
-
-def _empty_fig(message: str) -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(
-        template="plotly_dark",
-        annotations=[{
-            "text": message,
-            "showarrow": False,
-            "font": {"size": 16},
-            "xref": "paper", "yref": "paper",
-            "x": 0.5, "y": 0.5,
-        }],
-    )
-    return fig
 
 
 @callback(
