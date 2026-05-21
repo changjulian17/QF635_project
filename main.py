@@ -331,6 +331,7 @@ async def main() -> None:
         killswitch=killswitch,
         equity_fn=lambda: portfolio.equity,
         ks_fire_cb=_ks_fire_cb,
+        update_outcome_cb=telemetry.update_outcome,
     )
     strategy_executor = StrategyExecutor(
         micro_signal_queue=micro_signal_queue,

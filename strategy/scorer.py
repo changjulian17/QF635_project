@@ -163,6 +163,13 @@ class ScorerFactory:
         if Path(path).exists():
             try:
                 scorer = XGBoostScorer.load(path)
+                auc = scorer.auc_on_test_set()
+                if auc < 0.62:
+                    logger.warning(
+                        "[ScorerFactory] Loaded model AUC=%.3f < 0.62 — falling back to RuleBasedScorer",
+                        auc,
+                    )
+                    return RuleBasedScorer()
                 age_days = (time.time() - scorer._trained_at) / 86_400
                 if age_days > _MODEL_STALE_DAYS:
                     logger.warning(
@@ -171,7 +178,7 @@ class ScorerFactory:
                     )
                 logger.info(
                     "[ScorerFactory] XGBoostScorer loaded from %s (AUC=%.3f, ECE=%.3f, age=%.0fd)",
-                    path, scorer.auc_on_test_set(), scorer.calibration_error(), age_days,
+                    path, auc, scorer.calibration_error(), age_days,
                 )
                 return scorer
             except Exception as exc:

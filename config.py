@@ -86,6 +86,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":
+        if not self.DRY_RUN and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
+            raise ValueError(
+                "BINANCE_API_KEY and BINANCE_API_SECRET must be set when DRY_RUN=False. "
+                "Add them to .env or set DRY_RUN=True for paper trading."
+            )
         assert self.TIER_REDUCED_PCT < self.TIER_MINIMAL_PCT, \
             f"TIER_REDUCED_PCT ({self.TIER_REDUCED_PCT}) must be < TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT})"
         assert self.TIER_MINIMAL_PCT < self.TIER_PASSIVE_PCT, \

@@ -296,7 +296,7 @@ async def test_oco_failure_triggers_emergency_close():
     original_emergency = om._emergency_close
     async def spy_emergency(qty, entry_side, reason):
         emergency_close_calls.append((qty, entry_side, reason))
-        return False  # simulate unfilled to avoid further side-effects
+        return False, 0.0  # simulate unfilled to avoid further side-effects
     om._emergency_close = spy_emergency
 
     with patch.object(settings, "DRY_RUN", False):
@@ -401,7 +401,7 @@ async def test_s2_closed_event_not_set_on_unfilled_exit():
     # Simulate: OCO cancel skipped (oco_id is None); emergency close returns unfilled
     om._client = AsyncMock()
     async def _unfilled_close(qty, entry_side, reason):
-        return False
+        return False, 0.0
     om._emergency_close = _unfilled_close
 
     with patch.object(settings, "DRY_RUN", False):
@@ -448,7 +448,7 @@ async def test_s1_placing_oco_defers_wall_removed_handler():
     async def spy_emergency(qty, entry_side, reason):
         nonlocal emergency_called
         emergency_called = True
-        return True
+        return True, 95_000.0
     om._emergency_close = spy_emergency
 
     with patch.object(settings, "DRY_RUN", False):
@@ -478,7 +478,7 @@ async def test_s1_deferred_cancel_executed_after_oco_placed():
     emergency_calls: list = []
     async def spy_emergency(qty, entry_side, reason):
         emergency_calls.append(reason)
-        return True  # simulate confirmed close
+        return True, 94_990.0  # simulate confirmed close
     om._emergency_close = spy_emergency
 
     # Simulate Gate 6 having set the deferred cancel flag before _place_oco runs
@@ -518,7 +518,7 @@ async def test_s2_state_reset_after_oco_failed_and_closed():
     om._client.create_oco_order = AsyncMock(side_effect=Exception("OCO_REJECT"))
 
     async def confirmed_close(qty, entry_side, reason):
-        return True  # position successfully closed
+        return True, 94_990.0  # position successfully closed
     om._emergency_close = confirmed_close
 
     with patch.object(settings, "DRY_RUN", False):
