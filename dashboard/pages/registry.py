@@ -261,9 +261,21 @@ def handle_promote_modal(promote_clicks, cancel, confirm, strategies_data, curre
         return False, no_update, no_update
 
     if "reg-promote-confirm" in trigger and current_target:
+        s = (strategies_data or {}).get(current_target, {})
+        total_trades = _REGISTRY.count_paper_trades(current_target)
+        rolling_sharpe = _REGISTRY.compute_rolling_sharpe(current_target, days=14)
+        weeks_running = 0
+        if s.get("promoted_at"):
+            try:
+                promoted_dt = datetime.fromisoformat(s["promoted_at"].replace("Z", "+00:00"))
+                weeks_running = max(0, (datetime.now(timezone.utc) - promoted_dt).days // 7)
+            except Exception:
+                pass
         try:
             _REGISTRY.promote(current_target, "LIVE", paper_metrics={
-                "weeks_running": 2, "total_trades": 20, "sharpe_rolling": 1.0,
+                "weeks_running": weeks_running,
+                "total_trades": total_trades,
+                "sharpe_rolling": rolling_sharpe,
             })
         except Exception:
             pass

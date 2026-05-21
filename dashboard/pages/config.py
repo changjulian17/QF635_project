@@ -224,7 +224,7 @@ def toggle_cfg_ks_modal(open_clicks, cancel_clicks, confirm_clicks, confirm_text
     if trigger == "cfg-ks-confirm-btn" and confirm_text == "CONFIRM":
         success = _fire_ks(_API_BASE)
         if not success:
-            return True, no_update, dbc.Alert(
+            return True, "", dbc.Alert(
                 "Failed to reach engine — check that main.py is running.", color="danger"
             )
         return False, "", no_update

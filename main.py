@@ -211,8 +211,12 @@ async def _api_server(
     async def _handle_killswitch(request: web.Request) -> web.Response:
         if killswitch.is_active:
             return web.json_response({"fired": True, "already_active": True})
-        asyncio.create_task(
+        task = asyncio.create_task(
             emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_UI")
+        )
+        task.add_done_callback(
+            lambda t: logger.error("[KS] emergency_close_all failed: %s", t.exception())
+            if not t.cancelled() and t.exception() else None
         )
         return web.json_response({"fired": True})
 
