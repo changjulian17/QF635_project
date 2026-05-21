@@ -100,14 +100,17 @@ CryptoSentinel/
 │   ├── fetcher.py             # OHLCVFetcher (CCXT + SQLite cache)
 │   └── validator.py           # 9-check data quality validator
 │
-├── dashboard/                 # Dash application — all pages (Phase 3 — not yet implemented)
-│   ├── app.py                 # Main Dash app + routing
+├── dashboard/                 # Dash multi-page application (Phase 3)
+│   ├── app.py                 # Entry point — dark theme, nav, engine status badge
+│   ├── _db.py                 # WAL-mode SQLite helpers shared by all pages
+│   ├── _utils.py              # Shared Plotly utilities (empty_fig)
 │   └── pages/
-│       ├── live.py            # /live — Trading monitor + kill switch
-│       ├── lob.py             # /lob  — LOB heatmap + CVD + OBI gauge
-│       ├── backtest.py        # /backtest — Research + leaderboard
-│       ├── registry.py        # /registry — Strategy lifecycle
-│       └── config.py          # /config — System settings + emergency stop
+│       ├── live.py            # /live     — Portfolio metrics, signal funnel, kill switch
+│       ├── lob.py             # /lob      — LOB heatmap + CVD + OBI + spread subplots
+│       ├── walls.py           # /walls    — 1s candlestick + rolling VWAP + liquidity wall heatmap
+│       ├── backtest.py        # /backtest — Strategy leaderboard from backtest results
+│       ├── registry.py        # /registry — Strategy lifecycle, decay monitoring, LIVE promotion
+│       └── config.py          # /config   — Settings reference, emergency stop, event log
 │
 ├── strategies/                # Strategy artifacts
 │   ├── registry.db            # SQLite: signal_records + system events
@@ -360,7 +363,10 @@ python -m core.lob_recorder
 # Start trading engine (terminal 2)
 python main.py
 
-# Start Streamlit dashboard (terminal 3 — active during Phase 1)
+# Start Dash dashboard (terminal 3 — Phase 3)
+python dashboard/app.py           # → http://127.0.0.1:8050
+
+# Start legacy Streamlit dashboard (Phase 1 only — deprecated)
 streamlit run dashboard.py        # → http://localhost:8501
 
 # Run tests
@@ -460,6 +466,12 @@ tests/test_ws_consumer.py            6 tests  — heartbeat states, shared state
 tests/test_models.py                 6 tests  — PortfolioState, WallState, FeatureVector
 tests/test_integration.py            2 tests  — end-to-end signal → execution pipeline
 
+Phase 3 — REST API + LOB snapshot writer + Dash dashboard
+tests/test_rest_api.py              10 tests  — /api/health, /api/portfolio, /api/killswitch
+tests/test_lob_snapshot_writer.py    6 tests  — snapshot writer, rolling cap, WAL mode
+tests/test_dashboard_live.py         5 tests  — /live page callback, engine badge, kill switch
+tests/test_dashboard_registry.py     4 tests  — /registry page, strategy lifecycle display
+
 Phase 2 — Backtesting + strategy lifecycle
 tests/test_bt_event_engine.py       23 tests  — event-driven engine: tiers, exits, full run
 tests/test_registry.py              16 tests  — lifecycle gates, YAML roundtrip, promotion
@@ -473,7 +485,7 @@ tests/test_bt_signals.py             6 tests  — signal arrays, no-lookahead, S
 tests/test_bt_vectorbt.py            5 tests  — Optuna optimisation, sensitivity
 tests/test_bt_costs.py               5 tests  — round-trip cost, maker/taker, zero qty
 ──────────────────────────────────────────────────────────────────────────────
-Total                              380 tests
+Total                              405 tests
 ```
 
 ---
@@ -510,8 +522,8 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 | Backtest fast | vectorbt | 0.26.x | OHLCV Path B (Phase 2) |
 | Optimiser | optuna | 3.6.x | Bayesian param search (Phase 2) |
 | Config | pydantic-settings | 2.3.x | .env management |
-| Dashboard | Dash + dash-bootstrap | 2.17 + 1.6 | All UI pages (Phase 3) |
-| Dashboard (current) | Streamlit | 1.35.0 | Active during Phase 1 |
+| Dashboard | Dash + dash-bootstrap | 2.17 + 1.6 | All UI pages (Phase 3 — primary) |
+| Dashboard (legacy) | Streamlit | 1.35.0 | Phase 1 only — deprecated |
 | Charts | plotly | 5.22.x | All visualisations |
 | Persistence | SQLite | stdlib | All databases |
 | Logging | loguru | 0.7.x | Structured logs |
@@ -552,4 +564,4 @@ These rules are invariants. Any code that violates them is incorrect.
 | **Phase 2H** | 6 | XGBoost Confidence Scorer: `strategy/scorer.py` — trains on APPROVED `signal_records`, AUC ≥ 0.62 gate, ECE calibration, staleness detection, wired into Gate 2 via `ScorerFactory` | ✅ Done |
 | **Phase 2I** | 7 | Strategy Registry: `strategy/spec.py`, `registry.py`, `builder.py` — full lifecycle RESEARCH→BACKTEST→PAPER→LIVE with dual-store (YAML+SQLite), 4-gate PAPER promotion, 3-gate LIVE promotion | ✅ Done |
 | **Phase 2J** | 7–8 | Strategy config tuning: accumulate ≥30 days of `depth@100` LOB data, run walk-forward backtests, tune params, run tick replay validation, promote first spec to PAPER | 🔜 Next |
-| **Phase 3** | 9–12 | Dashboard: Dash migration (5 pages: /live, /lob, /backtest, /registry, /config), decay monitoring, LIVE promotion pipeline | 🔜 Future |
+| **Phase 3** | 9–12 | Dashboard: Dash multi-page app (6 pages: /live, /lob, /walls, /backtest, /registry, /config), REST API, LOB snapshot writer, decay monitoring, LIVE promotion pipeline | ✅ Done |
