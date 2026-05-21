@@ -136,6 +136,20 @@ def fetch_system_events(limit: int = 50) -> Union[list[dict], DBOffline]:
     return [dict(r) for r in rows]
 
 
+def fetch_candles(limit: int = 7200) -> Union[list[dict], DBOffline]:
+    with main_db() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT open_time, open, high, low, close, volume "
+                "FROM candles ORDER BY open_time DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] candles offline: %s", e)
+            return DBOffline(str(e))
+    return [dict(r) for r in reversed(rows)]
+
+
 def fetch_backtest_results() -> Union[list[dict], DBOffline]:
     if not os.path.exists(BACKTEST_DB):
         return []
