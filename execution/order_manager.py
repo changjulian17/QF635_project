@@ -542,7 +542,21 @@ class OrderManager:
                 except Exception as exc:
                     logger.warning("[Exec] OCO leg detail fetch failed: %s", exc)
 
-            if exit_price > 0 and not position_closed_event.is_set():
+            if exit_price <= 0:
+                # All leg-fetch calls failed — position is closed on exchange but we can't
+                # determine the exit price. Unblock Gate 6 so it doesn't hang; outcome not recorded.
+                logger.warning(
+                    "[Exec] OCO ALL_DONE but exit price unknown (leg fetch failed) — signal=%s",
+                    signal_id[:8],
+                )
+                if not position_closed_event.is_set():
+                    async with self._position_lock:
+                        if self._open_signal_id == signal_id:
+                            self._reset_open_position()
+                    position_closed_event.set()
+                return
+
+            if not position_closed_event.is_set():
                 async with self._position_lock:
                     # Guard: only reset if this watcher's signal still owns the position.
                     et = self._open_entry_time if self._open_signal_id == signal_id else entry_time

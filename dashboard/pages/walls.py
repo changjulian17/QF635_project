@@ -53,7 +53,7 @@ layout = html.Div([
 )
 def update_walls_chart(n, window_min, half_range, contrast_pctile):
     candles = fetch_candles(limit=7200)
-    snapshots = fetch_lob_snapshots(limit=max(window_min * 60, 3600))
+    snapshots = fetch_lob_snapshots(limit=3600)
 
     if isinstance(candles, DBOffline) or isinstance(snapshots, DBOffline):
         return _empty_fig("DB offline — start engine first")
@@ -127,7 +127,7 @@ def update_walls_chart(n, window_min, half_range, contrast_pctile):
             text=f"{w['price']:,.0f} | {w['sigma']:.1f}σ",
             showarrow=False, xanchor="left",
             font=dict(color=color, size=10),
-            xref="x", yref="y",
+            xref="x1", yref="y1",
         )
 
     bucket_size = settings.LOB_HEATMAP_BUCKET
@@ -161,6 +161,9 @@ def update_walls_chart(n, window_min, half_range, contrast_pctile):
         bid_matrix = bid_matrix[:, vm]
         ask_matrix = ask_matrix[:, vm]
         sdf = sdf[vm].reset_index(drop=True)
+
+    if sdf.empty:
+        return _empty_fig("Insufficient data in selected window")
 
     hm_ts = sdf["ts"].tolist()
     mid_prices = sdf["mid_price"].tolist()
