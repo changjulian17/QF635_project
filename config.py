@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     MAX_CONSECUTIVE_LOSSES: int = 3
     RISK_PER_TRADE_PCT: float = 0.01
     KELLY_FRACTION: float = 0.25
-    ATR_MULTIPLIER_SL: float = 1.5
+    ATR_MULTIPLIER_SL: float = 1.5   # legacy — used by pattern_detector.py only; microstructure path uses wall-based SL
     ATR_MULTIPLIER_TP: float = 3.0
     PYRAMID_MAX_LEGS: int = 3
 

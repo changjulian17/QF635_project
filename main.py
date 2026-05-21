@@ -16,7 +16,7 @@ Startup sequence (master arch §9):
 import asyncio
 import logging
 import signal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 from binance import AsyncClient
@@ -65,7 +65,7 @@ async def shutdown_handler(
         logger.info("[Shutdown] Open position (OCO active): %s", pos)
     telemetry.write_system_event(
         "GRACEFUL_SHUTDOWN",
-        {"open_positions": len(portfolio.positions), "ts": datetime.utcnow().isoformat()},
+        {"open_positions": len(portfolio.positions), "ts": datetime.now(timezone.utc).isoformat()},
     )
     logger.info("[Shutdown] Graceful shutdown complete")
 
@@ -83,7 +83,7 @@ async def emergency_close_all(
     await order_manager.force_close_all(reason)
     telemetry.write_system_event(
         "KILLSWITCH_FIRED",
-        {"reason": reason, "equity": portfolio.equity, "ts": datetime.utcnow().isoformat()},
+        {"reason": reason, "equity": portfolio.equity, "ts": datetime.now(timezone.utc).isoformat()},
     )
 
 
@@ -116,7 +116,7 @@ async def midnight_reset_loop(
 ) -> None:
     """Sleep until next UTC midnight + 5 s, then reset all daily counters."""
     while True:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         next_midnight = (now + timedelta(days=1)).replace(
             hour=0, minute=0, second=5, microsecond=0
         )

@@ -343,7 +343,7 @@ def _check_timestamp_gaps(
 def _check_extreme_moves(
     df: pd.DataFrame, max_pct: float
 ) -> ValidationResult:
-    pct_moves = df["close"].pct_change().abs() * 100
+    pct_moves = df["close"].pct_change(fill_method=None).abs() * 100
     extreme   = (pct_moves > max_pct).sum()
     passed    = extreme == 0
     detail    = ""

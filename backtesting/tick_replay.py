@@ -21,6 +21,7 @@ from typing import Iterator, Literal, Optional
 import pandas as pd
 
 from backtesting.costs import TransactionCostModel
+from config import settings
 from core.cvd import CVDCalculator
 from models import (
     AggTrade,
@@ -159,6 +160,42 @@ class TickReplayEngine:
         dt_index = pd.to_datetime(ts_vals, unit="ms", utc=True)
         return pd.Series(eq_vals, index=dt_index), list(self._trades)
 
+    def replay_window_oos(
+        self, start_ms: int, end_ms: int
+    ) -> tuple[pd.Series, list[ReplayTrade]]:
+        """
+        OOS evaluation pass that preserves FeatureComputer warm-up state from a
+        preceding IS replay_window() call.
+
+        Use this as the second step of a walk-forward pair:
+            engine.replay_window(is_start, is_end)      # IS: warms up Welford stats
+            eq, trades = engine.replay_window_oos(oos_start, oos_end)  # OOS: evaluate
+
+        Resets equity, trades, wall states, and positions (so OOS PnL starts
+        fresh) but does NOT call fc.reset() — IS Welford distributions carry
+        forward so OBI z-scores, ATR percentiles, and vol_ratio are meaningful
+        from the very first OOS bar rather than starting cold.
+        """
+        self._reset_for_oos(start_ms)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            for event in self._stream_events(conn, start_ms, end_ms):
+                if event.kind == "depth":
+                    self._process_depth(event)
+                else:
+                    self._process_trade(event)
+
+        if self._open_position is not None and self._last_trade_price > 0:
+            self._close_position(self._last_trade_price, end_ms, "EOD")
+
+        self._equity_curve.append((end_ms, self._equity))
+
+        ts_vals  = [t for t, _ in self._equity_curve]
+        eq_vals  = [e for _, e in self._equity_curve]
+        dt_index = pd.to_datetime(ts_vals, unit="ms", utc=True)
+        return pd.Series(eq_vals, index=dt_index), list(self._trades)
+
     # ── Internal reset ────────────────────────────────────────────────────────
 
     def _reset(self, start_ms: int) -> None:
@@ -173,6 +210,26 @@ class TickReplayEngine:
         self._prev_mid         = 0.0
         self._last_trade_price = 0.0
         self.feature_history   = []
+        # Reset FeatureComputer so OOS windows don't inherit IS distribution state.
+        # CVD is not reset here — the midnight handler in _process_trade resets it at
+        # day boundaries naturally; resetting here would interfere with window-spanning sessions.
+        self._fc.reset()
+
+    def _reset_for_oos(self, start_ms: int) -> None:
+        """Reset evaluation state only — preserves FeatureComputer Welford distributions
+        accumulated during the preceding IS pass. Called by replay_window_oos()."""
+        self._equity           = self._starting_equity
+        self._equity_curve     = [(start_ms, self._equity)]
+        self._trades           = []
+        self._wall_states      = {}
+        self._absorption_flags = {}
+        self._open_position    = None
+        self._bar_start_ms     = 0
+        self._last_day         = -1
+        self._prev_mid         = 0.0
+        self._last_trade_price = 0.0
+        self.feature_history   = []
+        # _fc intentionally NOT reset — IS warm-up state is preserved
 
     # ── Event streaming ───────────────────────────────────────────────────────
 
@@ -354,10 +411,9 @@ class TickReplayEngine:
         )
         cvd_delta_1t = self._cvd.get_cvd_delta(1)
         cvd_std      = self._cvd.get_cvd_tick_std()
-        cvd_n_ready  = self._cvd._delta_stats.n >= 10
         cvd_spike_std = (
             abs(cvd_delta_1t) / cvd_std if cvd_std > 1e-9 else 0.0
-        ) if cvd_n_ready else 0.0
+        ) if self._cvd.is_warmed_up else 0.0
 
         # Absorption detection
         for ws in self._wall_states.values():
@@ -432,11 +488,13 @@ class TickReplayEngine:
     ) -> None:
         if self._open_position is not None:
             return
-        if signal.consumed_wall is None:
+        if signal.protection_wall is None:
             return
         if self._equity <= 0:
             return
-        sl_price = signal.consumed_wall.price
+        # SL at protection wall price — mirrors live order_manager which uses
+        # protection_wall.price (not the consumed wall that was swept).
+        sl_price = signal.protection_wall.price
         # Guard: SL must be on the correct side of entry price
         if signal.direction == "LONG" and sl_price >= entry_price:
             return
@@ -445,18 +503,20 @@ class TickReplayEngine:
         sl_dist = abs(entry_price - sl_price)
         if sl_dist < 1e-9:
             return
-        # Breakeven filter: at 2:1 R:R, TP gross = 2×sl_dist×qty; costs ≈ entry×qty×round_trip_pct.
-        # Viable when 2×sl_dist ≥ entry×round_trip_pct → sl_dist ≥ entry×round_trip_pct/2.
-        if sl_dist < entry_price * self._cost_model.round_trip_pct / 2:
+        # Breakeven filter: TP gross = ATR_MULTIPLIER_TP×sl_dist×qty; need that > round-trip cost.
+        rr = settings.ATR_MULTIPLIER_TP
+        if rr * sl_dist < entry_price * self._cost_model.round_trip_pct:
             return
 
-        risk_usd   = self._equity * 0.01
-        qty        = risk_usd / sl_dist
-        # 2:1 R:R — TP at 2× the SL distance on the favourable side
+        # Position sizing aligned with live: 1% equity risk × Kelly fraction.
+        # (Confidence is not scored in backtest; Kelly fraction alone is applied.)
+        risk_usd = self._equity * settings.RISK_PER_TRADE_PCT * settings.KELLY_FRACTION
+        qty      = risk_usd / sl_dist
+        # TP at ATR_MULTIPLIER_TP × sl_dist — mirrors live OCO bracket formula.
         if signal.direction == "LONG":
-            tp_price = entry_price + 2.0 * (entry_price - sl_price)
+            tp_price = entry_price + rr * sl_dist
         else:
-            tp_price = entry_price - 2.0 * (sl_price - entry_price)
+            tp_price = entry_price - rr * sl_dist
 
         entry_cost    = self._cost_model.entry_cost(entry_price, qty)
         self._equity -= entry_cost

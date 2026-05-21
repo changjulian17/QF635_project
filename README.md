@@ -147,39 +147,12 @@ CryptoSentinel/
 
 ### Stream Selection
 
-> ## ⚠️ CRITICAL DATA REQUIREMENT — depth@20 IS INSUFFICIENT FOR THIS STRATEGY
->
-> The current LOB Recorder subscribes to `btcusdt@depth@20@100ms` — only 20 price levels.
-> At BTC prices (~$77,000), 20 levels span just **$2–4 from mid**. All detected walls are
-> within $3 of the current price.
->
-> The Sweep + Fresh Wall strategy is designed to trade **deep-book institutional walls**
-> that sit far enough from mid to absorb aggressive flow without being immediately consumed.
-> The minimum viable SL distance at 30bps round-trip costs is **~$115 at $77k BTC**
-> (breakeven = entry_price × round_trip_pct / 2). No wall detected from depth@20 data
-> will ever exceed this threshold — **every signal generated from depth@20 data is
-> guaranteed to be a net loser after transaction costs.**
->
-> **Required change before backtesting is meaningful:**
-> Switch `core/lob_recorder.py` to subscribe to `btcusdt@depth@100@100ms`
-> (100 levels, spanning ~$50–200 from mid at current prices).
->
-> **Storage strategy — price bucketing:**
-> 100 levels recorded at full tick precision (~$0.01 granularity) is 5× the storage of
-> depth@20. To keep `lob_tick.db` manageable, aggregate levels into fixed-width price
-> buckets before writing (e.g., $25 buckets). Each bucket records total qty for all
-> levels within that $25 range. This reduces rows-per-snapshot by 60–80% while
-> preserving LOB shape at the distances relevant for wall detection. Sub-bucket
-> precision (exact price within a $25 range) is irrelevant for identifying walls
-> $50–500 from mid.
->
-> Existing `data/lob_tick.db` collected with depth@20 **cannot be used for strategy
-> validation**. It remains valid only for engine smoke-testing and infrastructure checks.
+The LOB Recorder subscribes to `btcusdt@depth@100ms` — the **incremental diff-depth stream** — and maintains a full local order book seeded from a REST `depth?limit=1000` snapshot on each connect. Buffered diffs received during the REST fetch are merged in sequence-ID order before the book is declared SYNCED. The top 100 levels per side are retained (`_DEPTH_LEVELS = 100`) and aggregated into $25 USD price buckets (`_BUCKET_WIDTH = 25.0`) before writing to `lob_tick.db`. At BTC prices (~$77k), 100 levels span ~$50–200 from mid — sufficient range to detect deep-book institutional walls above the transaction cost floor (~$115 at 30bps round-trip).
 
 | Stream | Purpose | Update Rate |
 |--------|---------|-------------|
 | `btcusdt@aggTrade` | CVD · aggressive volume | Per taker sweep |
-| `btcusdt@depth@100@100ms` | Wall detection · OBI · spread — **100 levels required** | 100ms |
+| `btcusdt@depth@100ms` | Wall detection · OBI · spread — incremental diff, 100 levels, $25 buckets | 100ms |
 | `btcusdt@bookTicker` | Best bid/ask for spread calc | Real-time |
 | `btcusdt@kline_5m` | OHLCV candles for patterns | On close (5m) |
 
@@ -223,9 +196,11 @@ Gate 6 is the only post-entry gate. It runs as an async task after fill confirma
 ### LOB Engine — State Machine (`core/lob_engine.py`)
 
 ```
-UNINITIALISED → SNAPSHOT_PENDING → BUFFERING → SYNCED
-                                                  │
-                                            GAP_DETECTED → REINITIALISING → SNAPSHOT_PENDING
+UNINITIALISED → SYNCED
+                  │
+            GAP_DETECTED → SYNCED (after re-seed)
+                  │
+            DISCONNECTED (set externally by HeartbeatMonitor on KS-2)
 ```
 
 Gap severity tiering:
@@ -319,7 +294,7 @@ Hard override that bypasses all other logic. Once fired, requires system restart
 |---------|-----------|
 | **KS-1 Budget Breach** | `(realised_pnl + unrealised_pnl) < −(DOV × 1%)` |
 | **KS-2 Heartbeat Loss** | `heartbeat_status == CRITICAL` (>500ms × 3 packets) |
-| **KS-3 Slippage Decay** | Rolling 5-trade avg slippage > `research_bps × 1.5` |
+| **KS-3 Slippage Decay** | Rolling 20-trade avg slippage > `research_bps × 1.5` |
 
 ### Order Manager (`execution/order_manager.py`)
 
@@ -403,7 +378,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 |---|---|---|
 | `LOB_WALL_SIGMA` | `2.5` | σ threshold for Wall identification |
 | `LOB_WALL_WINDOW` | `5` | Ticks each side for Wall median/std |
-| `LOB_DEPTH` | `20` | Order book levels fetched — **must be changed to `100`** (see ⚠️ above) |
+| `LOB_DEPTH` | `1000` | Levels in the live LOB Engine's local book (LOB Recorder uses `_DEPTH_LEVELS = 100` hardcoded) |
 | `LOB_HISTORY` | `18000` | In-memory bars retained (~5h) |
 
 ### Heartbeat
@@ -496,7 +471,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 
 | Step | Action | Status |
 |------|--------|--------|
-| **1. Accumulate LOB data** | ⚠️ **Switch recorder to `depth@100` with $25-bucket aggregation before collecting data for strategy use** (see Data Pipeline warning above). Then keep `lob_recorder` running continuously. Target ≥30 days for statistically robust walk-forward splits. Data collected at depth@20 is valid for infrastructure smoke tests only — not strategy validation. | 🔜 Blocked on recorder upgrade |
+| **1. Accumulate LOB data** | LOB Recorder is collecting at `btcusdt@depth@100ms` (incremental diff, 100 levels, $25-bucket aggregation). Keep `lob_recorder` running continuously. Target ≥30 days for statistically robust walk-forward splits. | ✅ Done (recorder operational) |
 | **2. Fetch OHLCV history** | Run `data/fetcher.py` to populate `ohlcv_cache.db` for Path B backtesting | 🔜 Pending |
 | **3. Run backtests** | Path A: `backtesting/event_engine.py` replay of `lob_tick.db`. Path B: `backtesting/walk_forward.py` OHLCV walk-forward via VectorBT + Optuna | 🔜 Pending |
 | **4. Tune strategy config** | Optimise wall sigma (`LOB_WALL_SIGMA`), confidence threshold (`MIN_CONFIDENCE`), ATR multipliers via Optuna. Evaluate Sharpe, Sortino, MDD, PF across out-of-sample windows. | 🔜 Pending |

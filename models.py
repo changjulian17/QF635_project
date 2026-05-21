@@ -134,13 +134,10 @@ class MicrostructureBar:
 # ── v3.0 models ───────────────────────────────────────────────────────────────
 
 class LOBStateMachineState(Enum):
-    UNINITIALISED    = "UNINITIALISED"
-    SNAPSHOT_PENDING = "SNAPSHOT_PENDING"
-    BUFFERING        = "BUFFERING"
-    SYNCED           = "SYNCED"
-    GAP_DETECTED     = "GAP_DETECTED"
-    REINITIALISING   = "REINITIALISING"
-    DISCONNECTED     = "DISCONNECTED"
+    UNINITIALISED = "UNINITIALISED"
+    SYNCED        = "SYNCED"
+    GAP_DETECTED  = "GAP_DETECTED"
+    DISCONNECTED  = "DISCONNECTED"
 
 
 @dataclass
@@ -152,9 +149,6 @@ class WallState:
     last_seen_ts:    int
     side:            str       # "bid" or "ask"
     sigma:           float     # how many σ above surrounding median
-    aggression_hits: int   = 0
-    total_aggressed: float = 0.0
-
     @property
     def reload_ratio(self) -> float:
         return self.qty_current / self.qty_initial if self.qty_initial > 0 else 0.0

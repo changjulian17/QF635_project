@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 from config import settings
@@ -135,7 +135,7 @@ def _write_event(event_type: str, payload: dict) -> None:
             )
             conn.execute(
                 "INSERT INTO system_events (event_type, occurred_at, payload_json) VALUES (?, ?, ?)",
-                (event_type, datetime.utcnow().isoformat(), json.dumps(payload, default=str)),
+                (event_type, datetime.now(timezone.utc).isoformat(), json.dumps(payload, default=str)),
             )
         conn.close()
         logger.info("[Reconcile] %s event written to system_events", event_type)
