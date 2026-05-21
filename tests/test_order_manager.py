@@ -532,3 +532,113 @@ async def test_s2_state_reset_after_oco_failed_and_closed():
     assert om._placing_oco                is False
     # position_closed_event must be set for Gate 6's monitor to exit cleanly
     assert closed_event.is_set()
+
+
+# ── 20. OCO watcher records WIN on natural TP fill ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_watch_oco_win_records_outcome_and_sets_event():
+    """ALL_DONE OCO with exit_price > entry_price (LONG) → WIN, position_closed_event set."""
+    om, _, _, _ = _make_manager()
+    closed_event = asyncio.Event()
+    entry_price = 95_000.0
+    exit_price  = 97_000.0
+
+    om._open_signal_id    = "sig-win-test"
+    om._open_entry_price  = entry_price
+    om._open_entry_time   = time.monotonic() - 30
+    om._open_position_side = "BUY"
+    om._open_position_qty  = 0.001
+    om._open_position_closed_event = closed_event
+
+    outcomes: list = []
+    async def capture_outcome(signal_id, outcome, pnl, pnl_pct, duration_min):
+        outcomes.append((signal_id, outcome, pnl))
+    om._update_outcome_cb = capture_outcome
+
+    om._client = AsyncMock()
+    om._client.get_oco_order = AsyncMock(return_value={
+        "listStatusType": "ALL_DONE",
+        "orders": [{"orderId": 42}],
+    })
+    om._client.get_order = AsyncMock(return_value={
+        "executedQty": "0.001",
+        "avgPrice": str(exit_price),
+    })
+
+    await om._watch_oco_outcome(
+        oco_list_id=123, signal_id="sig-win-test",
+        entry_side="BUY", entry_price=entry_price, fill_qty=0.001,
+        entry_time=time.monotonic() - 30,
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    )
+    await asyncio.sleep(0)  # let the create_task coroutine execute
+
+    assert closed_event.is_set()
+    assert len(outcomes) == 1
+    assert outcomes[0][0] == "sig-win-test"
+    assert outcomes[0][1] == "WIN"
+    assert outcomes[0][2] == pytest.approx((exit_price - entry_price) * 0.001)
+
+
+# ── 21. OCO watcher exits cleanly on external close ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_watch_oco_exits_cleanly_on_external_close():
+    """If position_closed_event is already set, watcher exits without polling or recording."""
+    om, _, _, _ = _make_manager()
+    closed_event = asyncio.Event()
+    closed_event.set()  # position already closed before watcher polls
+
+    outcomes: list = []
+    async def capture(*args):
+        outcomes.append(args)
+    om._update_outcome_cb = capture
+    om._client = AsyncMock()
+
+    await om._watch_oco_outcome(
+        oco_list_id=99, signal_id="sig-ext", entry_side="BUY",
+        entry_price=95_000.0, fill_qty=0.001,
+        entry_time=time.monotonic(),
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    )
+
+    assert not outcomes                          # no outcome recorded
+    om._client.get_oco_order.assert_not_called() # no REST call made
+
+
+# ── 22. OCO watcher continues polling while EXECUTING ────────────────────────
+
+@pytest.mark.asyncio
+async def test_watch_oco_continues_polling_while_executing():
+    """EXECUTING status loops; ALL_DONE on second call → outcome recorded."""
+    om, _, _, _ = _make_manager()
+    closed_event = asyncio.Event()
+
+    om._open_signal_id   = "sig-poll"
+    om._open_entry_time  = time.monotonic()
+    om._open_entry_price = 95_000.0
+
+    call_count = 0
+    async def oco_side(**_kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            return {"listStatusType": "EXECUTING"}
+        return {"listStatusType": "ALL_DONE", "orders": [{"orderId": 1}]}
+
+    om._client = AsyncMock()
+    om._client.get_oco_order = AsyncMock(side_effect=oco_side)
+    om._client.get_order = AsyncMock(return_value={
+        "executedQty": "0.001", "avgPrice": "96000.0"
+    })
+
+    await om._watch_oco_outcome(
+        oco_list_id=5, signal_id="sig-poll", entry_side="BUY",
+        entry_price=95_000.0, fill_qty=0.001,
+        entry_time=time.monotonic(),
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    )
+
+    assert call_count == 2
+    assert closed_event.is_set()

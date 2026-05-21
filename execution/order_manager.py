@@ -80,6 +80,7 @@ class OrderManager:
         book_fn: Callable[[], tuple[float, float]] | None = None,
         ks_fire_cb: Callable[[str], Awaitable[None]] | None = None,
         update_outcome_cb: Callable[[str, str, float, float, float], Awaitable[None]] | None = None,
+        budget_update_cb: Callable[[float], None] | None = None,
     ) -> None:
         """
         book_fn: optional callable returning (best_bid, best_ask) without a REST
@@ -88,6 +89,8 @@ class OrderManager:
         ks_fire_cb: called with a reason string when KS-3 slippage fires.
         update_outcome_cb: called with (signal_id, outcome, pnl, pnl_pct, duration_min)
         after each position closes — wire to SignalTelemetry.update_outcome.
+        budget_update_cb: called with realised pnl (float) on every close — wire to
+        increment DailyBudget.realised_pnl so KS-1 budget checks reflect actual trades.
         """
         self._signal_q          = signal_queue
         self.fill_queue         = fill_queue
@@ -96,6 +99,7 @@ class OrderManager:
         self._book_fn           = book_fn
         self._ks_fire_cb        = ks_fire_cb
         self._update_outcome_cb = update_outcome_cb
+        self._budget_update_cb  = budget_update_cb
         self._client: AsyncClient | None = None
 
         # Graceful-shutdown gate: set False before draining the queue.
@@ -112,6 +116,7 @@ class OrderManager:
         self._open_signal_id:             str | None          = None
         self._open_entry_price:           float               = 0.0
         self._open_entry_time:            float               = 0.0   # time.monotonic()
+        self._oco_watcher_task:           asyncio.Task | None = None  # polls OCO until natural fill
 
         # ── OCO placement race flags (S1 fix) ────────────────────────────────────
         # _placing_oco:            True while create_oco_order REST call is in-flight.
@@ -454,6 +459,19 @@ class OrderManager:
                     "[Exec] OCO placed — TP=%.2f SL=%.2f listId=%s",
                     tp_price, sl_price, self._open_oco_list_id,
                 )
+                if self._open_oco_list_id is not None:
+                    self._oco_watcher_task = asyncio.create_task(
+                        self._watch_oco_outcome(
+                            oco_list_id        = self._open_oco_list_id,
+                            signal_id          = req.signal_id,
+                            entry_side         = entry_side,
+                            entry_price        = fill_price,
+                            fill_qty           = fill_qty,
+                            entry_time         = self._open_entry_time,
+                            position_closed_event = req.position_closed_event,
+                        ),
+                        name=f"oco_watcher_{req.signal_id[:8]}",
+                    )
 
         except Exception as exc:
             # C1: naked position — emergency-close immediately.
@@ -471,6 +489,74 @@ class OrderManager:
                 if req.position_closed_event:
                     req.position_closed_event.set()
 
+    # ── OCO natural-fill watcher ──────────────────────────────────────────────
+
+    async def _watch_oco_outcome(
+        self,
+        oco_list_id: int,
+        signal_id: str,
+        entry_side: str,
+        entry_price: float,
+        fill_qty: float,
+        entry_time: float,
+        position_closed_event: asyncio.Event,
+        poll_interval_s: float = 2.0,
+    ) -> None:
+        """
+        Background task: polls OCO status every poll_interval_s until:
+          a) position_closed_event fires (Gate 6 / killswitch closed it) → exit quietly, or
+          b) OCO reaches ALL_DONE (natural TP or SL fill) → record outcome, set event.
+
+        Runs only in live mode (not spawned when DRY_RUN=True).
+        Cancelled automatically by _reset_open_position() on any other close path.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(position_closed_event.wait(), timeout=poll_interval_s)
+                return  # position closed via another path — exit cleanly
+            except asyncio.TimeoutError:
+                pass
+
+            if not self._client:
+                return
+
+            try:
+                resp = await self._client.get_oco_order(orderListId=oco_list_id)
+            except Exception as exc:
+                logger.warning("[Exec] OCO poll failed (id=%d): %s", oco_list_id, exc)
+                continue
+
+            if resp.get("listStatusType") != "ALL_DONE":
+                continue
+
+            # OCO filled — identify the executed leg and its exit price.
+            exit_price = 0.0
+            for order_ref in resp.get("orders", []):
+                try:
+                    detail = await self._client.get_order(
+                        symbol=settings.SYMBOL, orderId=order_ref["orderId"]
+                    )
+                    if float(detail.get("executedQty", 0)) > 0:
+                        exit_price = float(detail.get("avgPrice") or detail.get("price", 0))
+                        break
+                except Exception as exc:
+                    logger.warning("[Exec] OCO leg detail fetch failed: %s", exc)
+
+            if exit_price > 0 and not position_closed_event.is_set():
+                async with self._position_lock:
+                    # Guard: only reset if this watcher's signal still owns the position.
+                    et = self._open_entry_time if self._open_signal_id == signal_id else entry_time
+                    if self._open_signal_id == signal_id:
+                        self._reset_open_position()
+                self._record_outcome(signal_id, entry_side, entry_price, exit_price, fill_qty, et)
+                position_closed_event.set()
+                logger.info(
+                    "[Exec] OCO natural fill — %s exit=%.2f signal=%s",
+                    "WIN" if (exit_price > entry_price) == (entry_side == "BUY") else "LOSS",
+                    exit_price, signal_id[:8],
+                )
+            return
+
     # ── Outcome recording ─────────────────────────────────────────────────────
 
     def _record_outcome(
@@ -482,18 +568,23 @@ class OrderManager:
         qty: float,
         entry_time: float,
     ) -> None:
-        """Schedule telemetry.update_outcome() for a closed position. No-op when callback not wired."""
-        if self._update_outcome_cb is None or not signal_id:
-            return
-        if entry_price <= 0 or qty <= 0:
+        """Record trade outcome: update budget and schedule telemetry write. No-op when not wired."""
+        if not signal_id or entry_price <= 0 or qty <= 0:
             return
         pnl = (close_price - entry_price) * qty if entry_side == "BUY" else (entry_price - close_price) * qty
         pnl_pct = pnl / (entry_price * qty)
         outcome = "WIN" if pnl > 0.0 else "LOSS" if pnl < 0.0 else "FLAT"
         duration_min = (time.monotonic() - entry_time) / 60.0
-        asyncio.create_task(
-            self._update_outcome_cb(signal_id, outcome, pnl, pnl_pct, duration_min)
-        )
+        if self._budget_update_cb is not None:
+            self._budget_update_cb(pnl)
+        if self._update_outcome_cb is None:
+            return
+        try:
+            asyncio.create_task(
+                self._update_outcome_cb(signal_id, outcome, pnl, pnl_pct, duration_min)
+            )
+        except RuntimeError:
+            logger.error("[Exec] No running event loop — outcome not scheduled for %s", signal_id)
 
     # ── Emergency close ───────────────────────────────────────────────────────
 
@@ -627,6 +718,9 @@ class OrderManager:
 
     def _reset_open_position(self) -> None:
         """Must be called under _position_lock."""
+        if self._oco_watcher_task and not self._oco_watcher_task.done():
+            self._oco_watcher_task.cancel()
+        self._oco_watcher_task            = None
         self._open_position_side          = None
         self._open_position_qty           = 0.0
         self._open_oco_list_id            = None

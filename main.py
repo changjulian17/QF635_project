@@ -232,11 +232,8 @@ async def _api_server(
         await runner.cleanup()  # guarantee socket release on any exit path
 
 
-async def _process_fills(
-    fill_q: asyncio.Queue,
-    portfolio: PortfolioState,
-) -> None:
-    """Log IOC entry fills. Realised P&L is tracked in DailyBudget via budget.realised_pnl."""
+async def _process_fills(fill_q: asyncio.Queue) -> None:
+    """Consume and log IOC entry fills. Outcome/PnL recording happens via update_outcome_cb."""
     while True:
         fill: FillDetail = await fill_q.get()
         logger.info(
@@ -332,6 +329,7 @@ async def main() -> None:
         equity_fn=lambda: portfolio.equity,
         ks_fire_cb=_ks_fire_cb,
         update_outcome_cb=telemetry.update_outcome,
+        budget_update_cb=lambda pnl: setattr(budget, "realised_pnl", budget.realised_pnl + pnl),
     )
     strategy_executor = StrategyExecutor(
         micro_signal_queue=micro_signal_queue,
@@ -403,7 +401,7 @@ async def main() -> None:
             tg.create_task(midnight_reset_loop(risk_engine, cvd_calculator),                  name="midnight_reset")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
             tg.create_task(_drain_queue(re_order_queue),                                      name="re_order_drain")
-            tg.create_task(_process_fills(fill_queue, portfolio),                             name="fill_processor")
+            tg.create_task(_process_fills(fill_queue),                                        name="fill_processor")
             tg.create_task(
                 _portfolio_mtm_loop(killswitch, budget, order_manager, portfolio, telemetry),
                 name="portfolio_mtm_loop",
