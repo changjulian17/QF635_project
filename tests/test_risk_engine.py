@@ -258,6 +258,27 @@ def test_budget_exhausted_when_remaining_zero():
     assert b.remaining == pytest.approx(0.0)
 
 
+# ── sync_tier + tier_change_cb ────────────────────────────────────────────────
+
+def test_sync_tier_returns_halted_on_budget_breach():
+    budget = make_budget(realised_pnl=-100.0)   # -100 / 10_000 = 1.0% = TIER_HALTED_PCT
+    engine = make_engine(make_portfolio(), budget)
+    tier = engine.sync_tier()
+    assert tier == "HALTED"
+
+
+def test_tier_change_cb_fires_on_transition():
+    transitions: list[tuple[str, str]] = []
+    budget = make_budget(realised_pnl=-50.0)   # -50 / 10_000 = 0.50% → REDUCED
+    engine = RiskEngine(
+        asyncio.Queue(), asyncio.Queue(), make_portfolio(), budget,
+        tier_change_cb=lambda old, new: transitions.append((old, new)),
+    )
+    engine.sync_tier()
+    assert len(transitions) == 1
+    assert transitions[0] == ("FULL", "REDUCED")
+
+
 def test_budget_loss_pct():
     b = DailyBudget.from_equity(10_000.0)
     b.realised_pnl = -200.0

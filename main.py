@@ -22,6 +22,7 @@ from aiohttp import web
 from binance import AsyncClient
 
 from config import settings
+from core.alerting import AlertDispatcher
 from core.cvd import CVDCalculator
 from core.lob_engine import LocalOrderBook
 from core.lob_recorder import LOBRecorder
@@ -77,6 +78,7 @@ async def emergency_close_all(
     portfolio: PortfolioState,
     telemetry: SignalTelemetry,
     reason: str,
+    alert_dispatcher: AlertDispatcher | None = None,
 ) -> None:
     """Hard stop: close all open positions, write system event, reject new signals."""
     logger.critical("[KS] emergency_close_all — reason=%s", reason)
@@ -85,6 +87,8 @@ async def emergency_close_all(
         "KILLSWITCH_FIRED",
         {"reason": reason, "equity": portfolio.equity, "ts": datetime.now(timezone.utc).isoformat()},
     )
+    if alert_dispatcher is not None:
+        asyncio.create_task(alert_dispatcher.notify_killswitch(reason, portfolio.equity))
 
 
 # ── Portfolio mark-to-market loop (KS-1) ─────────────────────────────────────
@@ -95,17 +99,22 @@ async def _portfolio_mtm_loop(
     order_manager: OrderManager,
     portfolio: PortfolioState,
     telemetry: SignalTelemetry,
+    risk_engine: RiskEngine,
+    strategy_executor: StrategyExecutor,
+    alert_dispatcher: AlertDispatcher,
 ) -> None:
-    """Check KS-1 budget breach every second. Exits after triggering emergency_close_all."""
+    """Check KS-1 budget breach and sync risk tier every second."""
     while True:
         await asyncio.sleep(1.0)
         if killswitch.is_active:
             return
         if killswitch.check_budget(budget.realised_pnl, budget.unrealised_pnl):
             await emergency_close_all(
-                order_manager, portfolio, telemetry, "KILLSWITCH_BUDGET"
+                order_manager, portfolio, telemetry, "KILLSWITCH_BUDGET", alert_dispatcher
             )
             return
+        new_tier = risk_engine.sync_tier()
+        strategy_executor.set_risk_tier(new_tier)
 
 
 # ── Midnight reset ────────────────────────────────────────────────────────────
@@ -175,6 +184,7 @@ async def _api_server(
     order_manager: OrderManager,
     telemetry: SignalTelemetry,
     port: int,
+    alert_dispatcher: AlertDispatcher | None = None,
 ) -> None:
     """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
 
@@ -212,7 +222,7 @@ async def _api_server(
         if killswitch.is_active:
             return web.json_response({"fired": True, "already_active": True})
         task = asyncio.create_task(
-            emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_UI")
+            emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_UI", alert_dispatcher)
         )
         task.add_done_callback(
             lambda t: logger.error("[KS] emergency_close_all failed: %s", t.exception())
@@ -253,6 +263,7 @@ async def main() -> None:
 
     # 1. Initialise all components ────────────────────────────────────────────
     init_db()
+    alert_dispatcher = AlertDispatcher(settings.ALERT_WEBHOOK_URL)
 
     portfolio = PortfolioState(
         equity=STARTING_EQUITY,
@@ -297,10 +308,21 @@ async def main() -> None:
         if killswitch.is_active:
             return
         if killswitch.check_heartbeat(status, delta_ms):
-            await emergency_close_all(order_manager, portfolio, telemetry, "KILLSWITCH_HEARTBEAT")
+            await emergency_close_all(
+                order_manager, portfolio, telemetry, "KILLSWITCH_HEARTBEAT", alert_dispatcher
+            )
 
     async def _ks_fire_cb(reason: str) -> None:
-        await emergency_close_all(order_manager, portfolio, telemetry, reason)
+        await emergency_close_all(order_manager, portfolio, telemetry, reason, alert_dispatcher)
+
+    def _on_tier_change(old_tier: str, new_tier: str) -> None:
+        telemetry.write_system_event(
+            "TIER_TRANSITION",
+            {"from": old_tier, "to": new_tier, "loss_pct": budget.loss_pct},
+        )
+        asyncio.create_task(
+            alert_dispatcher.notify_tier_change(old_tier, new_tier, budget.loss_pct)
+        )
 
     # Components ──────────────────────────────────────────────────────────────
     ws_consumer = BinanceWebSocketConsumer(
@@ -353,6 +375,7 @@ async def main() -> None:
         budget=budget,
         killswitch=killswitch,
         pyramid=pyramid,
+        tier_change_cb=_on_tier_change,
     )
     db_writer = DBWriter(
         candle_queue=candle_db_queue,
@@ -407,7 +430,10 @@ async def main() -> None:
             tg.create_task(_drain_queue(re_order_queue),                                      name="re_order_drain")
             tg.create_task(_process_fills(fill_queue),                                        name="fill_processor")
             tg.create_task(
-                _portfolio_mtm_loop(killswitch, budget, order_manager, portfolio, telemetry),
+                _portfolio_mtm_loop(
+                    killswitch, budget, order_manager, portfolio, telemetry,
+                    risk_engine, strategy_executor, alert_dispatcher,
+                ),
                 name="portfolio_mtm_loop",
             )
             tg.create_task(
@@ -418,6 +444,7 @@ async def main() -> None:
                 _api_server(
                     killswitch, portfolio, shared_state,
                     order_manager, telemetry, settings.DASHBOARD_API_PORT,
+                    alert_dispatcher,
                 ),
                 name="api_server",
             )

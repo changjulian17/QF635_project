@@ -22,6 +22,7 @@ from config import settings
 from core.cvd import WelfordOnline
 from core.signal_telemetry import SignalRecord
 from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState
+from risk.engine import TIER_MIN_CONFIDENCE, TIER_SCALARS
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,8 @@ def gate_2_confidence(
 
 
 def gate_3_capital(budget, tier: str) -> tuple[bool, str]:
-    if tier == "HALTED":
-        return False, "risk tier HALTED"
+    if tier in ("HALTED", "PASSIVE"):
+        return False, f"risk tier {tier} — no new entries"
     if budget is not None and budget.remaining <= 0:
         return False, f"daily budget exhausted (remaining={budget.remaining:.2f})"
     return True, ""
@@ -245,6 +246,8 @@ class StrategyExecutor:
         self._gate6_tasks: set[asyncio.Task] = set()
         self._gate6_check_ms = gate6_check_interval_ms
 
+        self._last_approved_ms: int = 0
+
     def set_risk_tier(self, tier: str) -> None:
         """
         Sync the active risk tier from RiskEngine into Gate 3.
@@ -316,6 +319,12 @@ class StrategyExecutor:
         if not ok:
             self._reject(rec, "GATE_2_FAIL", reason)
             return
+        # Tier-elevated minimum confidence (REDUCED=0.65, MINIMAL=0.80)
+        min_conf = TIER_MIN_CONFIDENCE.get(self._risk_tier, settings.MIN_CONFIDENCE)
+        if confidence < min_conf:
+            self._reject(rec, "GATE_2_FAIL",
+                         f"confidence {confidence:.3f} < tier-{self._risk_tier} min {min_conf:.2f}")
+            return
 
         # Gate 3 — capital
         ok, reason = gate_3_capital(self._budget, self._risk_tier)
@@ -335,14 +344,24 @@ class StrategyExecutor:
             self._reject(rec, "GATE_5_FAIL", reason)
             return
 
+        # Rate-limit: enforce minimum interval between approvals
+        if settings.MIN_SIGNAL_INTERVAL_MS > 0:
+            now_ms = int(time.time() * 1000)
+            elapsed_ms = now_ms - self._last_approved_ms
+            if elapsed_ms < settings.MIN_SIGNAL_INTERVAL_MS:
+                self._reject(rec, "GATE_5_FAIL",
+                             f"rate limit: {elapsed_ms}ms < {settings.MIN_SIGNAL_INTERVAL_MS}ms")
+                return
+
         # All gates passed — assemble executable order request
         rec.gate_passed = "APPROVED"
         self._emit_telemetry(rec)
 
         # notional_hint = risk fraction of equity; execution layer applies:
         #   qty = (equity × notional_hint) / abs(entry_price − protection_wall_price)
+        tier_scalar   = TIER_SCALARS.get(self._risk_tier, 1.0)
         notional_hint = round(
-            confidence * settings.KELLY_FRACTION * settings.RISK_PER_TRADE_PCT, 6
+            confidence * settings.KELLY_FRACTION * settings.RISK_PER_TRADE_PCT * tier_scalar, 6
         )
         order_req = MicroOrderRequest(
             micro_signal   = signal,
@@ -355,6 +374,7 @@ class StrategyExecutor:
             notional_hint  = notional_hint,
         )
         await self._signal_q.put(order_req)
+        self._last_approved_ms = int(time.time() * 1000)
         logger.info(
             "[Executor] APPROVED %s %s confidence=%.3f order_type=%s notional_hint=%.4f%%",
             signal.direction, signal.signal_type, confidence, order_type,

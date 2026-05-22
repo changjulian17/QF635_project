@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # Dashboard
     DASHBOARD_API_PORT: int = 8080
 
+    # Alerting
+    ALERT_WEBHOOK_URL: str = ""         # optional; empty = disabled
+
+    # Speed bumps
+    MIN_SIGNAL_INTERVAL_MS: int = 0     # 0 = disabled; e.g. 500 enforces ≤2 approvals/sec
+
     @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":
         if not self.DRY_RUN and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):

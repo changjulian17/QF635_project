@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone, timedelta
 from enum import StrEnum
 
@@ -27,7 +28,7 @@ class _Tier(StrEnum):
 
 
 # 5-tier throttle table: tier → position size scalar
-_TIER_SCALARS: dict[str, float] = {
+TIER_SCALARS: dict[str, float] = {
     "FULL":    1.00,
     "REDUCED": 0.50,
     "MINIMAL": 0.25,
@@ -36,7 +37,7 @@ _TIER_SCALARS: dict[str, float] = {
 }
 
 # 5-tier minimum confidence gates
-_TIER_MIN_CONFIDENCE: dict[str, float] = {
+TIER_MIN_CONFIDENCE: dict[str, float] = {
     "FULL":    0.50,
     "REDUCED": 0.65,
     "MINIMAL": 0.80,
@@ -57,6 +58,7 @@ class RiskEngine:
         budget: DailyBudget | None = None,
         killswitch: GlobalKillswitch | None = None,
         pyramid: PyramidController | None = None,
+        tier_change_cb: Callable[[str, str], None] | None = None,
     ) -> None:
         self._signal_queue   = signal_queue
         self._order_queue    = order_queue
@@ -66,6 +68,7 @@ class RiskEngine:
         self._pyramid        = pyramid     or PyramidController()
         self._tier: _Tier    = _Tier.FULL
         self._cooldown_until: datetime | None = None
+        self._tier_change_cb = tier_change_cb
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -85,7 +88,7 @@ class RiskEngine:
             logger.warning("[Risk] REJECTED — %s", reason)
             return OrderRequest(signal=signal, quantity=0.0, approved=False, rejection_reason=reason)
 
-        min_conf = _TIER_MIN_CONFIDENCE[self._tier]
+        min_conf = TIER_MIN_CONFIDENCE[self._tier]
         if signal.confidence < min_conf:
             reason = f"Tier {self._tier} requires confidence >= {min_conf:.2f}, got {signal.confidence:.2f}"
             return OrderRequest(signal=signal, quantity=0.0, approved=False, rejection_reason=reason)
@@ -189,7 +192,7 @@ class RiskEngine:
             self._budget.dov * 0.004,
         )
         kelly_scale = settings.KELLY_FRACTION * signal.confidence
-        tier_scalar = _TIER_SCALARS[self._tier]
+        tier_scalar = TIER_SCALARS[self._tier]
         leg_scalar  = self._pyramid.leg_scalar()
         return round((risk_amount / sl_distance) * kelly_scale * tier_scalar * leg_scalar, 6)
 
@@ -221,6 +224,17 @@ class RiskEngine:
     def mark_unrealised(self, pnl: float) -> None:
         """Update the budget's unrealised exposure so tier transitions fire proactively."""
         self._budget.unrealised_pnl = pnl
+
+    # ── Tier sync (called by MTM loop, not on inbound signals) ───────────────────
+
+    def sync_tier(self) -> str:
+        """Evaluate circuit breakers without an inbound signal; fire tier_change_cb on transition."""
+        old_tier = str(self._tier)
+        self._check_circuit_breakers()
+        new_tier = str(self._tier)
+        if new_tier != old_tier and self._tier_change_cb:
+            self._tier_change_cb(old_tier, new_tier)
+        return new_tier
 
     # ── Session reset ─────────────────────────────────────────────────────────
 

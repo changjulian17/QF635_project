@@ -397,3 +397,114 @@ def test_telemetry_emitted_at_every_rejection():
         assert rec.gate_passed == "GATE_0_FAIL"
 
     asyncio.run(_run())
+
+
+# ── New gap-fill tests ────────────────────────────────────────────────────────
+
+def test_gate3_fails_when_passive():
+    ok, reason = gate_3_capital(None, "PASSIVE")
+    assert ok is False
+    assert "PASSIVE" in reason
+
+
+def test_gate2_tier_min_confidence_minimal():
+    """MINIMAL tier must require confidence >= 0.80; 0.65 passes Gate 2 base but should be rejected."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=10.0)
+
+        class _LowScoreFC:
+            def compute(self, cvd_calculator, shared_state, **kwargs):
+                # Produce a score of ~0.65: OBI(0.30) + vol_ratio capped(0.25) + spread(0.20) = 0.75
+                # Use minimal alignment to land between 0.58 and 0.80
+                return _fv(obi_zscore=0.3, vol_ratio=2.0, spread_bps=3.0, cvd_positive=0)
+                # score = OBI(0.30) + vol(0.25) + spread(0.20) + CVD(0) = 0.75 — above FULL min but below MINIMAL
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_LowScoreFC(),
+            shared_state=state,
+        )
+        ex.set_risk_tier("MINIMAL")
+        await ex._evaluate(_signal())
+
+        assert signal_q.empty(), "signal should not be approved below MINIMAL min confidence"
+        rec = telem_q.get_nowait()
+        assert rec.gate_passed == "GATE_2_FAIL"
+        assert "MINIMAL" in rec.rejection_reason
+
+    asyncio.run(_run())
+
+
+def test_notional_hint_halved_in_reduced_tier():
+    """notional_hint must be 50% of FULL-tier for identical signal in REDUCED tier."""
+    async def _run():
+        state = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=10.0)
+
+        async def _approve(tier: str) -> float:
+            micro_q  = asyncio.Queue()
+            signal_q = asyncio.Queue()
+            telem_q  = asyncio.Queue()
+            ex = StrategyExecutor(
+                micro_signal_queue=micro_q,
+                signal_queue=signal_q,
+                telemetry_queue=telem_q,
+                feature_computer=_MockFC(),
+                shared_state=state,
+            )
+            ex.set_risk_tier(tier)
+            await ex._evaluate(_signal())
+            if signal_q.empty():
+                return 0.0
+            req = signal_q.get_nowait()
+            return req.notional_hint
+
+        hint_full    = await _approve("FULL")
+        hint_reduced = await _approve("REDUCED")
+
+        assert hint_full > 0
+        assert abs(hint_reduced - hint_full * 0.5) < 1e-9, (
+            f"REDUCED hint {hint_reduced} should be 50% of FULL hint {hint_full}"
+        )
+
+    asyncio.run(_run())
+
+
+def test_rate_limit_rejects_rapid_second_signal(monkeypatch):
+    """A second signal within MIN_SIGNAL_INTERVAL_MS must be rejected as GATE_5_FAIL."""
+    from config import settings as _settings
+    monkeypatch.setattr(_settings, "MIN_SIGNAL_INTERVAL_MS", 500)
+
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=10.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+        )
+        # First signal — should be approved and set _last_approved_ms
+        await ex._evaluate(_signal())
+        assert not signal_q.empty(), "first signal should be approved"
+        signal_q.get_nowait()
+
+        # Second signal immediately — must be rate-limited
+        await ex._evaluate(_signal())
+        assert signal_q.empty(), "second rapid signal should be rate-limited"
+
+        recs = []
+        while not telem_q.empty():
+            recs.append(telem_q.get_nowait())
+        rejections = [r for r in recs if r.gate_passed == "GATE_5_FAIL" and "rate limit" in (r.rejection_reason or "")]
+        assert rejections, "rate-limit rejection telemetry must be emitted"
+
+    asyncio.run(_run())
