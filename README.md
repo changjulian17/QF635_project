@@ -61,7 +61,6 @@ CryptoSentinel/
 ├── config.py                  # Pydantic V2 settings from .env
 ├── models.py                  # Shared dataclasses and enums
 ├── requirements.txt
-├── .env.example
 │
 ├── core/                      # Real-time data processing
 │   ├── ws_consumer.py         # WebSocket consumer + HeartbeatMonitor
@@ -138,7 +137,6 @@ CryptoSentinel/
 │   ├── test_risk_engine.py
 │   └── test_integration.py
 │
-└── dashboard.py               # Streamlit dashboard (legacy — active during Phase 1)
 ```
 
 ---
@@ -328,23 +326,53 @@ BINANCE_API_KEY=your_testnet_key
 BINANCE_API_SECRET=your_testnet_secret
 ```
 
+### Starting the system
+
+```bash
+./start.sh
+```
+
+`start.sh` runs three pre-flight checks before launching:
+
+1. `.env` file present
+2. `.venv` activated
+3. Connectivity test (`scripts/test_connection.py`) passes
+
+If all checks pass, it opens three separate Terminal windows — one for each component:
+
+| Window | Command | Notes |
+|--------|---------|-------|
+| LOB Recorder | `python -m core.lob_recorder` | Real Binance public stream, no API key needed |
+| Trading Engine | `python main.py` | Requires testnet credentials in `.env` |
+| Dash Dashboard | `python dashboard/app.py` | UI at http://127.0.0.1:8050 |
+
+### Stopping the system
+
+```bash
+./stop.sh
+```
+
+Sends SIGTERM to each process, waits up to 5 seconds, then SIGKILL if still running. Closes the three Terminal windows afterwards.
+
+### Manual startup (alternative)
+
 ```bash
 # Verify connectivity and auth
 python scripts/test_connection.py
 
-# Start LOB Recorder (terminal 1 — collects real Binance tick data)
+# Terminal 1 — LOB Recorder
 python -m core.lob_recorder
 
-# Start trading engine (terminal 2)
+# Terminal 2 — Trading engine
 python main.py
 
-# Start Dash dashboard (terminal 3 — Phase 3)
+# Terminal 3 — Dash dashboard
 python dashboard/app.py           # → http://127.0.0.1:8050
+```
 
-# Start legacy Streamlit dashboard (Phase 1 only — deprecated)
-streamlit run dashboard.py        # → http://localhost:8501
+### Run tests
 
-# Run tests
+```bash
 python -m pytest tests/ -v
 ```
 
@@ -477,7 +505,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 | **4. Tune strategy config** | Optimise wall sigma (`LOB_WALL_SIGMA`), confidence threshold (`MIN_CONFIDENCE`), ATR multipliers via Optuna. Evaluate Sharpe, Sortino, MDD, PF across out-of-sample windows. | 🔜 Pending |
 | **5. Train XGBoost scorer** | `strategy/scorer.py` — `XGBoostScorer.train_from_registry()` trains on APPROVED `signal_records`; `ScorerFactory` auto-loads at startup, falls back to `RuleBasedScorer` if no pkl exists. AUC gate ≥ 0.62, ECE logged, staleness warning after 30 days. | ✅ Done |
 | **6. Freeze StrategySpec** | `strategy/spec.py` + `strategy/registry.py` + `strategy/builder.py` — `StrategyBuilder` produces BACKTEST-status specs; `StrategyRegistry` dual-stores to YAML + SQLite with 4-gate PAPER promotion (≥50 OOS trades, Sharpe ≥ 1.0, MDD ≤ 15%, PF ≥ 1.3) and 3-gate LIVE promotion. | ✅ Done |
-| **7. Promote to paper trading** | Set `DRY_RUN=False` in `.env`. Monitor Gate funnel and PnL via `dashboard.py`. | 🔜 Pending |
+| **7. Promote to paper trading** | Set `DRY_RUN=False` in `.env`. Monitor Gate funnel and PnL via the Dash dashboard (`dashboard/app.py`). | 🔜 Pending |
 
 ---
 
@@ -487,18 +515,16 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 |-------|-----------|---------|---------|
 | Runtime | Python | 3.11+ | Async, type hints |
 | Async | asyncio | stdlib | Event loop |
-| LOB Recorder WS | websockets | 12.0 | Real Binance public stream |
-| Exchange WS/REST | python-binance | 1.0.19 | Testnet execution |
-| Historical data | ccxt | 4.3.x | OHLCV fetch (no key) |
-| Data | pandas + numpy | 2.2 + 1.26 | DataFrames + arrays |
-| Indicators | pandas-ta | 0.3.14b | ATR, RSI |
-| Stats | scipy | 1.13.0 | linregress, statistics |
-| ML scorer | xgboost | 2.0.x | Confidence scoring (Phase 2) |
-| Backtest fast | vectorbt | 0.26.x | OHLCV Path B (Phase 2) |
-| Optimiser | optuna | 3.6.x | Bayesian param search (Phase 2) |
+| LOB Recorder WS | websockets | 10.4 | Real Binance public stream |
+| Exchange WS/REST | python-binance | 1.0.36 | Testnet execution |
+| Historical data | ccxt | 4.3+ | OHLCV fetch (no key) |
+| Data | pandas + numpy | 3.0.3 + 2.4.4 | DataFrames + arrays |
+| Stats | scipy | 1.14+ | linregress, statistics |
+| ML scorer | xgboost | 2.1+ | Confidence scoring (Phase 2) |
+| Backtest fast | vectorbt | 0.25+ | OHLCV Path B (Phase 2) |
+| Optimiser | optuna | 3.6+ | Bayesian param search (Phase 2) |
 | Config | pydantic-settings | 2.3.x | .env management |
-| Dashboard | Dash + dash-bootstrap | 2.17 + 1.6 | All UI pages (Phase 3 — primary) |
-| Dashboard (legacy) | Streamlit | 1.35.0 | Phase 1 only — deprecated |
+| Dashboard | Dash + dash-bootstrap | 2.17 + 1.6 | All UI pages (Phase 3) |
 | Charts | plotly | 5.22.x | All visualisations |
 | Persistence | SQLite | stdlib | All databases |
 | Logging | loguru | 0.7.x | Structured logs |

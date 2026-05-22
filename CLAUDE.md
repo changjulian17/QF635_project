@@ -8,7 +8,6 @@ Real-time granular LOB microstructure analysis and paper-trading system for BTCU
 
 ```
 main.py          — asyncio orchestrator (entry point)
-dashboard.py     — Streamlit UI (active during Phase 1)
 config.py        — pydantic settings loaded from .env
 models.py        — shared dataclasses and enums
 
@@ -53,11 +52,6 @@ dashboard/           — Dash multi-page dashboard (Phase 3)
     registry.py      — /registry: strategy lifecycle, decay monitoring, LIVE promotion
     config.py        — /config: settings reference, emergency stop, event log
 
-dashboard.py         — DEPRECATED Streamlit UI (retained for reference)
-
-pages/               — Streamlit multi-page app
-  health.py          — system health checker (auto-refreshes every 10 s)
-
 scripts/
   test_connection.py — verify Binance testnet connectivity and auth
   test_orders.py     — BUY + SELL round-trip execution test
@@ -90,10 +84,6 @@ Start the trading engine (terminal 2):
 Start the Dash dashboard (terminal 3 — Phase 3):
 
 	python dashboard/app.py
-
-Start the legacy Streamlit dashboard (deprecated):
-
-	streamlit run dashboard.py
 
 Run unit tests:
 

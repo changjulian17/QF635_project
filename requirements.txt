@@ -3,9 +3,9 @@ aiohttp>=3.9
 websockets==10.4
 pandas==3.0.3
 numpy==2.4.4
-scipy==1.11.3
+scipy>=1.14
 pydantic-settings==2.3.4
-streamlit==1.35.0
+streamlit>=1.38
 plotly==5.22.0
 pytest==8.2.2
 pytest-asyncio==0.23.7

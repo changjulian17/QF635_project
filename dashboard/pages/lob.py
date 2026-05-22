@@ -5,7 +5,7 @@ import dash
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import dcc, html, Input, Output, callback
+from dash import dcc, html, Input, Output, State, callback, no_update, Patch
 import dash_bootstrap_components as dbc
 from plotly.subplots import make_subplots
 
@@ -19,7 +19,9 @@ _DEPTH_WARNING = settings.LOB_DEPTH < 100
 _STALE_THRESHOLD_S = 30  # flag data as stale after 30s without a new snapshot
 
 layout = html.Div([
-    dcc.Interval(id="lob-interval", interval=5000),
+    dcc.Interval(id="lob-interval", interval=30_000),       # 30s — full rebuild
+    dcc.Interval(id="lob-lines-interval", interval=5_000),  # 5s — incremental line update
+    dcc.Store(id="lob-last-ts"),                            # tracks last snapshot ts
 
     # ── Depth warning banner ───────────────────────────────────────────────
     dbc.Alert(
@@ -40,44 +42,48 @@ layout = html.Div([
             dbc.Label("Heatmap window (min)"),
             dcc.Slider(id="lob-hm-window", min=1, max=60, step=1, value=15,
                        marks={1: "1m", 15: "15m", 30: "30m", 60: "60m"}),
-        ], width=4),
+        ], width=3),
         dbc.Col([
             dbc.Label("Price range (±$)"),
             dcc.Slider(id="lob-price-range", min=100, max=2000, step=100, value=500,
                        marks={100: "100", 500: "500", 1000: "1000", 2000: "2000"}),
-        ], width=4),
+        ], width=3),
         dbc.Col([
             dbc.Label("Contrast (pctile)"),
             dcc.Slider(id="lob-contrast", min=80, max=99, step=1, value=95,
                        marks={80: "80", 90: "90", 95: "95", 99: "99"}),
-        ], width=4),
+        ], width=3),
+        dbc.Col([
+            dbc.Label(" "),
+            dbc.Button("Refresh Now", id="lob-refresh-btn", color="secondary",
+                       size="sm", className="w-100"),
+        ], width=3),
     ], className="mb-3"),
 
     # ── Chart ──────────────────────────────────────────────────────────────
-    dcc.Loading(
-        dcc.Graph(id="lob-chart", style={"height": "860px"}),
-        type="circle",
-    ),
+    dcc.Graph(id="lob-chart", style={"height": "860px"}),
 ])
 
 
 
 @callback(
     Output("lob-chart", "figure"),
+    Output("lob-last-ts", "data"),
     Input("lob-interval", "n_intervals"),
+    Input("lob-refresh-btn", "n_clicks"),
     Input("lob-hm-window", "value"),
     Input("lob-price-range", "value"),
     Input("lob-contrast", "value"),
 )
-def update_lob_chart(n, hm_minutes, half_range, contrast_pctile):
+def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile):
     rows_needed = hm_minutes * 60
     snapshots = fetch_lob_snapshots(limit=max(rows_needed, 3600))
 
     if isinstance(snapshots, DBOffline):
-        return _empty_fig("LOB DB offline — start engine first")
+        return _empty_fig("LOB DB offline — start engine first"), None
 
     if not snapshots:
-        return _empty_fig("Waiting for LOB snapshot data…")
+        return _empty_fig("Waiting for LOB snapshot data…"), None
 
     df = pd.DataFrame(snapshots)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
@@ -87,7 +93,7 @@ def update_lob_chart(n, hm_minutes, half_range, contrast_pctile):
     is_stale = age_s > _STALE_THRESHOLD_S
 
     hm_df = df.tail(rows_needed).copy()
-    obi_df = df.tail(3600).copy()
+    obi_df = df.tail(rows_needed).copy()
 
     fig = make_subplots(
         rows=4, cols=1, shared_xaxes=True,
@@ -204,6 +210,7 @@ def update_lob_chart(n, hm_minutes, half_range, contrast_pctile):
 
     fig.update_layout(
         height=860, template="plotly_dark",
+        uirevision="lob-chart",
         yaxis_title="Price (USDT)",
         legend=dict(orientation="h", y=-0.06, font=dict(size=10)),
         margin=dict(t=40, b=20),
@@ -222,4 +229,43 @@ def update_lob_chart(n, hm_minutes, half_range, contrast_pctile):
             bgcolor="rgba(0,0,0,0.5)",
         )
 
-    return fig
+    last_ts = df["ts"].iloc[-1].isoformat() if not df.empty else None
+    return fig, last_ts
+
+
+@callback(
+    Output("lob-chart", "figure", allow_duplicate=True),
+    Input("lob-lines-interval", "n_intervals"),
+    State("lob-last-ts", "data"),
+    State("lob-hm-window", "value"),
+    prevent_initial_call=True,
+)
+def update_lob_lines(n, last_ts, hm_minutes):
+    """Incremental update: replaces only OBI/CVD/Spread trace data every 5s."""
+    if last_ts is None:
+        return no_update
+
+    rows_needed = (hm_minutes or 15) * 60
+    snapshots = fetch_lob_snapshots(limit=rows_needed)
+
+    if isinstance(snapshots, DBOffline) or not snapshots:
+        return no_update
+
+    df = pd.DataFrame(snapshots)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    obi_df = df.tail(rows_needed)
+
+    if obi_df.empty:
+        return no_update
+
+    obi_ts = obi_df["ts"].dt.strftime("%H:%M:%S").tolist()
+    cvd_running = obi_df["cvd_delta"].fillna(0.0).cumsum().tolist()
+
+    patched = Patch()
+    patched["data"][3]["x"] = obi_ts
+    patched["data"][3]["y"] = obi_df["obi"].tolist()
+    patched["data"][4]["x"] = obi_ts
+    patched["data"][4]["y"] = cvd_running
+    patched["data"][5]["x"] = obi_ts
+    patched["data"][5]["y"] = obi_df["spread"].tolist()
+    return patched

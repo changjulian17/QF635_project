@@ -7,7 +7,7 @@ from config import settings
 from dashboard._db import fetch_signal_funnel, DBOffline
 from dashboard._logic import validate_ks_confirm as _validate_ks, fire_killswitch as _fire_ks
 
-dash.register_page(__name__, path="/live", name="Live")
+dash.register_page(__name__, path="/", name="Live", redirect_from=["/live"])
 
 _API_BASE = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
 
@@ -151,7 +151,7 @@ def update_live_page(n, engine_state):
                 ])
                 for r in sorted(funnel_result, key=lambda x: x["gate_passed"])
             ]),
-        ], striped=True, bordered=True, hover=True, dark=True, size="sm")
+        ], striped=True, bordered=True, hover=True, size="sm")
     else:
         funnel_table = html.P("No signal data in last 24h.", className="text-muted")
 
@@ -174,7 +174,7 @@ def update_live_page(n, engine_state):
                 ])
                 for p in positions
             ]),
-        ], striped=True, bordered=True, hover=True, dark=True, size="sm")
+        ], striped=True, bordered=True, hover=True, size="sm")
     else:
         pos_table = html.P("No open positions.", className="text-muted")
 

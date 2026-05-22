@@ -28,7 +28,7 @@ app = dash.Dash(
 _API_BASE = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
 
 _NAV_ITEMS = [
-    dbc.NavItem(dbc.NavLink("Live", href="/live", active="exact")),
+    dbc.NavItem(dbc.NavLink("Live", href="/", active="exact")),
     dbc.NavItem(dbc.NavLink("LOB", href="/lob", active="exact")),
     dbc.NavItem(dbc.NavLink("Walls", href="/walls", active="exact")),
     dbc.NavItem(dbc.NavLink("Backtest", href="/backtest", active="exact")),
@@ -45,7 +45,7 @@ _engine_badge = dbc.Badge(
 
 navbar = dbc.Navbar(
     dbc.Container([
-        dbc.NavbarBrand("CryptoSentinel", href="/live"),
+        dbc.NavbarBrand("CryptoSentinel", href="/"),
         dbc.Nav(_NAV_ITEMS, navbar=True, className="me-auto"),
         html.Div([
             html.Small("Engine:", className="text-muted me-1"),

@@ -29,7 +29,7 @@ async def lob_snapshot_writer(
         try:
             if lob_engine.lob_status != "SYNCED":
                 continue
-            snapshot: LOBSnapshot | None = await lob_engine.get_snapshot()
+            snapshot: LOBSnapshot | None = await lob_engine.get_snapshot(depth=settings.LOB_DEPTH)
             if snapshot is None:
                 continue
             # Use LOB_OBI_DEPTH levels — consistent with engine OBI computation

@@ -56,7 +56,7 @@ def _build_settings_table():
             html.Thead(html.Tr([html.Th("Setting"), html.Th("Value"), html.Th("Description")])),
             html.Tbody(rows),
         ],
-        striped=True, bordered=True, hover=True, dark=True, size="sm",
+        striped=True, bordered=True, hover=True, size="sm",
     )
 
 
@@ -194,7 +194,7 @@ def update_config_page(n, engine_state):
                 ])
                 for e in events
             ]),
-        ], striped=True, bordered=True, hover=True, dark=True, size="sm")
+        ], striped=True, bordered=True, hover=True, size="sm")
     else:
         event_table = html.P("No system events recorded yet.", className="text-muted")
 

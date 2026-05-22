@@ -97,7 +97,7 @@ def update_backtest(n):
                     ])),
                     html.Tbody(table_rows),
                 ],
-                striped=True, bordered=True, hover=True, dark=True, size="sm",
+                striped=True, bordered=True, hover=True, size="sm",
             ),
         ])
 

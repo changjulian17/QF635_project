@@ -97,7 +97,7 @@ def update_registry(n):
                 ])
                 for s in strategies
             ]),
-        ], striped=True, bordered=True, hover=True, dark=True, size="sm")
+        ], striped=True, bordered=True, hover=True, size="sm")
     else:
         lifecycle_table = html.P("No strategies registered yet.", className="text-muted")
 
@@ -159,7 +159,7 @@ def update_registry(n):
                 html.Th("Gate"), html.Th("Count (7d)"), html.Th("Count (30d)"), html.Th("Drift"),
             ])),
             html.Tbody(drift_table_rows),
-        ], striped=True, bordered=True, hover=True, dark=True, size="sm")
+        ], striped=True, bordered=True, hover=True, size="sm")
     else:
         funnel_drift = html.P("No signal data available yet.", className="text-muted")
 
