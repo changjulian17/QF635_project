@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 MAIN_DB = "cryptosentinel.db"
 REGISTRY_DB = settings.REGISTRY_DB
 BACKTEST_DB = settings.BACKTEST_RESULTS_DB
+LOB_TICK_DB = settings.LOB_TICK_DB
 
 
 class DBOffline(Exception):
@@ -50,6 +51,31 @@ def backtest_db() -> Generator[sqlite3.Connection, None, None]:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def lob_tick_db() -> Generator[sqlite3.Connection, None, None]:
+    conn = _connect(LOB_TICK_DB)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def fetch_agg_trades(since_ts_ms: int, limit: int = 20000) -> Union[list[dict], DBOffline]:
+    if not os.path.exists(LOB_TICK_DB):
+        return []
+    with lob_tick_db() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT ts_event, price, qty, is_buyer_maker FROM agg_trades "
+                "WHERE ts_event >= ? ORDER BY ts_event ASC LIMIT ?",
+                (since_ts_ms, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] lob_tick offline: %s", e)
+            return DBOffline(str(e))
+    return [dict(r) for r in rows]
 
 
 def fetch_portfolio_history(limit: int = 300) -> Union[list[dict], DBOffline]:

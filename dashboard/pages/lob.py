@@ -10,18 +10,26 @@ import dash_bootstrap_components as dbc
 from plotly.subplots import make_subplots
 
 from config import settings
-from dashboard._db import fetch_lob_snapshots, DBOffline
+from dashboard._db import fetch_lob_snapshots, fetch_agg_trades, DBOffline
 from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/lob", name="LOB")
 
 _DEPTH_WARNING = settings.LOB_DEPTH < 100
 _STALE_THRESHOLD_S = 30  # flag data as stale after 30s without a new snapshot
+_SGT = timezone(timedelta(hours=8))
 
 layout = html.Div([
     dcc.Interval(id="lob-interval", interval=30_000),       # 30s — full rebuild
     dcc.Interval(id="lob-lines-interval", interval=5_000),  # 5s — incremental line update
+    dcc.Interval(id="lob-clock-interval", interval=1_000),  # 1s — SGT clock
     dcc.Store(id="lob-last-ts"),                            # tracks last snapshot ts
+
+    # ── SGT clock ─────────────────────────────────────────────────────────
+    html.Div(id="lob-clock", style={
+        "textAlign": "right", "fontFamily": "monospace",
+        "fontSize": "1.1rem", "color": "#adb5bd", "marginBottom": "6px",
+    }),
 
     # ── Depth warning banner ───────────────────────────────────────────────
     dbc.Alert(
@@ -54,9 +62,15 @@ layout = html.Div([
                        marks={80: "80", 90: "90", 95: "95", 99: "99"}),
         ], width=3),
         dbc.Col([
-            dbc.Label(" "),
+            dbc.Label("Trade size (pctile)"),
+            dcc.Slider(id="lob-trade-pctile", min=70, max=99, step=1, value=80,
+                       marks={70: "70", 80: "80", 90: "90", 99: "99"}),
+        ], width=3),
+    ], className="mb-3"),
+    dbc.Row([
+        dbc.Col([
             dbc.Button("Refresh Now", id="lob-refresh-btn", color="secondary",
-                       size="sm", className="w-100"),
+                       size="sm"),
         ], width=3),
     ], className="mb-3"),
 
@@ -74,8 +88,9 @@ layout = html.Div([
     Input("lob-hm-window", "value"),
     Input("lob-price-range", "value"),
     Input("lob-contrast", "value"),
+    Input("lob-trade-pctile", "value"),
 )
-def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile):
+def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade_pctile):
     rows_needed = hm_minutes * 60
     snapshots = fetch_lob_snapshots(limit=max(rows_needed, 3600))
 
@@ -140,7 +155,7 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile):
                 pass
             valid_cols.append(col_ok)
 
-        ts_labels = hm_df["ts"].dt.strftime("%H:%M:%S").tolist()
+        ts_labels = hm_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
         mid_prices = hm_df["mid_price"].tolist()
 
         # H3: drop columns where both bid and ask JSON failed — prevents x-axis misalignment
@@ -155,7 +170,7 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile):
         max_vol = np.percentile(all_nonzero, contrast_pctile) if len(all_nonzero) else 1.0
 
         mid_ri = int((current_mid - price_lo) / bucket_size)
-        for ri in range(max(0, mid_ri - 1), min(n_prices, mid_ri + 2)):
+        for ri in range(max(0, mid_ri - 5), min(n_prices, mid_ri + 6)):
             bid_matrix[ri, :] = 0.0
             ask_matrix[ri, :] = 0.0
 
@@ -179,7 +194,7 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile):
 
     # ── Rows 2-4: OBI / CVD / Spread — guarded against empty data (H2) ────
     if not obi_df.empty:
-        obi_ts = obi_df["ts"].dt.strftime("%H:%M:%S").tolist()
+        obi_ts = obi_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
         # M4: fill NaN before cumsum so one bad row doesn't corrupt the rest
         cvd_running = obi_df["cvd_delta"].fillna(0.0).cumsum().tolist()
 
@@ -208,6 +223,48 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile):
         for row in (2, 3, 4):
             fig.add_trace(go.Scatter(x=[], y=[], showlegend=False), row=row, col=1)
 
+    # ── Row 1 overlay: market order bubbles (indices 6 & 7) ────────────────
+    if not hm_df.empty and ts_labels:
+        since_ts_ms = int(hm_df["ts"].iloc[0].timestamp() * 1000)
+        trades = fetch_agg_trades(since_ts_ms)
+        if trades and not isinstance(trades, DBOffline):
+            tdf = pd.DataFrame(trades)
+            threshold = tdf["qty"].quantile((trade_pctile or 80) / 100)
+            tdf = tdf[tdf["qty"] >= threshold].copy()
+            if not tdf.empty:
+                snap_ms = (hm_df["ts"].astype("int64") // 1_000_000).values
+                snapped_x = [
+                    ts_labels[int(np.argmin(np.abs(snap_ms - t)))]
+                    for t in tdf["ts_event"]
+                ]
+                sizes = np.clip(np.log1p(tdf["qty"].values) * 6, 5, 24)
+                for side, label, color in [
+                    (0, "Buy MO", "rgba(0,220,100,0.8)"),
+                    (1, "Sell MO", "rgba(220,60,60,0.8)"),
+                ]:
+                    mask = (tdf["is_buyer_maker"] == side).values
+                    fig.add_trace(go.Scatter(
+                        x=[snapped_x[i] for i, ok in enumerate(mask) if ok],
+                        y=tdf.loc[mask, "price"].tolist(),
+                        mode="markers",
+                        marker=dict(
+                            size=sizes[mask].tolist(), color=color,
+                            line=dict(width=0.5, color="white"),
+                        ),
+                        name=label,
+                        hovertemplate="qty: %{text}<extra></extra>",
+                        text=tdf.loc[mask, "qty"].round(4).astype(str).tolist(),
+                    ), row=1, col=1)
+        else:
+            # always add placeholder traces so index 6/7 are stable for Patch
+            for label in ("Buy MO", "Sell MO"):
+                fig.add_trace(go.Scatter(x=[], y=[], mode="markers",
+                                         name=label, showlegend=False), row=1, col=1)
+    else:
+        for label in ("Buy MO", "Sell MO"):
+            fig.add_trace(go.Scatter(x=[], y=[], mode="markers",
+                                     name=label, showlegend=False), row=1, col=1)
+
     fig.update_layout(
         height=860, template="plotly_dark",
         uirevision="lob-chart",
@@ -218,7 +275,7 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile):
     fig.update_xaxes(showticklabels=False, row=1, col=1)
     fig.update_xaxes(showticklabels=False, row=2, col=1)
     fig.update_xaxes(showticklabels=False, row=3, col=1)
-    fig.update_xaxes(title_text="Time (UTC)", row=4, col=1)
+    fig.update_xaxes(title_text="Time (SGT)", row=4, col=1)
 
     # H1: staleness annotation overlaid on chart
     if is_stale:
@@ -258,7 +315,7 @@ def update_lob_lines(n, last_ts, hm_minutes):
     if obi_df.empty:
         return no_update
 
-    obi_ts = obi_df["ts"].dt.strftime("%H:%M:%S").tolist()
+    obi_ts = obi_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
     cvd_running = obi_df["cvd_delta"].fillna(0.0).cumsum().tolist()
 
     patched = Patch()
@@ -269,3 +326,12 @@ def update_lob_lines(n, last_ts, hm_minutes):
     patched["data"][5]["x"] = obi_ts
     patched["data"][5]["y"] = obi_df["spread"].tolist()
     return patched
+
+
+@callback(
+    Output("lob-clock", "children"),
+    Input("lob-clock-interval", "n_intervals"),
+)
+def update_clock(_):
+    now_sgt = datetime.now(_SGT)
+    return f"SGT  {now_sgt.strftime('%Y-%m-%d  %H:%M:%S')}"
