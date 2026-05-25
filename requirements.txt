@@ -3,9 +3,21 @@ aiohttp>=3.9
 websockets==10.4
 pandas==3.0.3
 numpy==2.4.4
-scipy==1.11.3
+scipy>=1.14
 pydantic-settings==2.3.4
-streamlit==1.35.0
+streamlit>=1.38
 plotly==5.22.0
 pytest==8.2.2
 pytest-asyncio==0.23.7
+pytest-aiohttp>=1.0
+# Phase 2 — backtesting engine
+ccxt>=4.3
+vectorbt>=0.25
+optuna>=3.6
+xgboost>=2.1
+scikit-learn>=1.5
+pyyaml>=6.0
+joblib>=1.4
+# Phase 3 — Dash dashboard
+dash>=2.17
+dash-bootstrap-components>=1.6

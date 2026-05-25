@@ -1,0 +1,210 @@
+"""Tests for strategy/microstructure.py — pure detection functions."""
+import time
+
+import pytest
+
+from strategy.microstructure import (
+    detect_absorption,
+    detect_sweep_with_protection,
+    identify_walls,
+)
+from models import WallState
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _levels(base_qty: float, n: int = 20, spike_idx: int | None = None, spike_qty: float = 50.0):
+    """Return (price, qty) list with optional outlier."""
+    qtys = [base_qty + (i % 3) * 0.1 for i in range(n)]  # slight variance
+    if spike_idx is not None:
+        qtys[spike_idx] = spike_qty
+    return [(float(30000 - i * 10), qtys[i]) for i in range(n)]
+
+
+def _wall(
+    side: str = "bid",
+    qty_initial: float = 50.0,
+    qty_current: float = 50.0,
+    age_ms: int = 600,
+) -> WallState:
+    now = int(time.time() * 1000)
+    return WallState(
+        price         = 30000.0,
+        qty_initial   = qty_initial,
+        qty_current   = qty_current,
+        first_seen_ts = now - age_ms,
+        last_seen_ts  = now,
+        side          = side,
+        sigma         = 3.0,
+    )
+
+
+# ── identify_walls ────────────────────────────────────────────────────────────
+
+def test_wall_identified_above_sigma():
+    levels = _levels(1.0, n=20, spike_idx=5, spike_qty=50.0)
+    walls = identify_walls(levels, "bid", sigma_threshold=2.5, window=5)
+    prices = {w["price"] for w in walls}
+    assert levels[5][0] in prices
+
+
+def test_wall_below_sigma_not_identified():
+    # No outlier — uniform quantities should produce no walls
+    levels = _levels(1.0, n=20)
+    walls = identify_walls(levels, "bid", sigma_threshold=2.5, window=5)
+    assert walls == []
+
+
+def test_wall_too_few_levels_returns_empty():
+    levels = [(float(i), 1.0) for i in range(5)]   # fewer than 2*window+1
+    assert identify_walls(levels, "bid") == []
+
+
+def test_wall_sigma_field_populated():
+    levels = _levels(1.0, n=20, spike_idx=10, spike_qty=50.0)
+    walls = identify_walls(levels, "ask", sigma_threshold=2.5, window=5)
+    assert all(w["sigma"] >= 2.5 for w in walls)
+
+
+def test_wall_side_field_correct():
+    levels = _levels(1.0, n=20, spike_idx=10, spike_qty=50.0)
+    for side in ("bid", "ask"):
+        walls = identify_walls(levels, side)
+        assert all(w["side"] == side for w in walls)
+
+
+# ── detect_absorption ─────────────────────────────────────────────────────────
+# Directional convention: bid wall absorbs sellers (cvd_delta_1t < 0);
+#                         ask wall absorbs buyers  (cvd_delta_1t > 0).
+
+def test_absorption_bid_wall_with_sell_aggression():
+    # Bid wall, sell aggression (CVD negative) → should arm
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
+
+
+def test_absorption_ask_wall_with_buy_aggression():
+    # Ask wall, buy aggression (CVD positive) → should arm
+    ws = _wall(side="ask", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
+
+
+def test_absorption_false_wrong_direction_bid():
+    # Bid wall but buy aggression (positive CVD) → wrong direction → False
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
+
+
+def test_absorption_false_wrong_direction_ask():
+    # Ask wall but sell aggression (negative CVD) → wrong direction → False
+    ws = _wall(side="ask", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
+
+
+def test_absorption_false_when_not_persistent():
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=100)  # < 500 ms
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
+
+
+def test_absorption_false_when_price_breaks():
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.001, reload_ratio=0.80) is False
+
+
+def test_absorption_false_when_no_aggression():
+    ws = _wall(side="bid", age_ms=600)
+    assert detect_absorption(ws, cvd_delta_1t=0.0, price_move_pct=0.0001, reload_ratio=0.80) is False
+
+
+def test_absorption_false_when_reload_low():
+    ws = _wall(side="bid", qty_initial=50.0, qty_current=25.0, age_ms=600)  # reload=0.50 < 0.70
+    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.50) is False
+
+
+# ── detect_sweep_with_protection ─────────────────────────────────────────────
+
+def _fresh_ask_wall() -> WallState:
+    now = int(time.time() * 1000)
+    return WallState(
+        price=30100.0, qty_initial=30.0, qty_current=30.0,
+        first_seen_ts=now - 500, last_seen_ts=now,
+        side="ask", sigma=3.0,
+    )
+
+
+def test_sweep_with_protection_fires():
+    consumed = _wall(side="ask", qty_initial=50.0, qty_current=5.0, age_ms=600)
+    fresh    = [_fresh_ask_wall()]
+    # Replace with bid protection wall for long sweep
+    now = int(time.time() * 1000)
+    bid_wall = WallState(
+        price=29900.0, qty_initial=30.0, qty_current=30.0,
+        first_seen_ts=now - 500, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    fired, info = detect_sweep_with_protection(
+        wall_consumed      = consumed,
+        price_move_pct     = 0.0005,   # > 0.03%
+        cvd_spike_std      = 2.0,      # > 1.5σ
+        fresh_walls_behind = [bid_wall],
+    )
+    assert fired is True
+    assert info["direction"] == "LONG"
+    assert info["consumed_wall"] is consumed
+
+
+def test_sweep_without_protection_does_not_fire():
+    consumed = _wall(side="ask", qty_initial=50.0, qty_current=5.0, age_ms=600)
+    fired, info = detect_sweep_with_protection(
+        wall_consumed      = consumed,
+        price_move_pct     = 0.0005,
+        cvd_spike_std      = 2.0,
+        fresh_walls_behind = [],       # no protection wall
+    )
+    assert fired is False
+    assert info == {}
+
+
+def test_sweep_requires_all_four_conditions():
+    now = int(time.time() * 1000)
+    protection = WallState(
+        price=29900.0, qty_initial=30.0, qty_current=30.0,
+        first_seen_ts=now - 500, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+
+    # Not consumed (reload_ratio = 0.90)
+    not_consumed = _wall(side="ask", qty_initial=50.0, qty_current=45.0, age_ms=600)
+    fired, _ = detect_sweep_with_protection(not_consumed, 0.0005, 2.0, [protection])
+    assert fired is False
+
+    # Price did not move enough
+    consumed = _wall(side="ask", qty_initial=50.0, qty_current=5.0, age_ms=600)
+    fired, _ = detect_sweep_with_protection(consumed, 0.00001, 2.0, [protection])
+    assert fired is False
+
+    # CVD spike too small
+    fired, _ = detect_sweep_with_protection(consumed, 0.0005, 0.5, [protection])
+    assert fired is False
+
+    # All conditions met
+    fired, _ = detect_sweep_with_protection(consumed, 0.0005, 2.0, [protection])
+    assert fired is True
+
+
+def test_sweep_direction_short_from_bid_wall():
+    now = int(time.time() * 1000)
+    consumed_bid = _wall(side="bid", qty_initial=50.0, qty_current=5.0, age_ms=600)
+    ask_protection = WallState(
+        price=30100.0, qty_initial=30.0, qty_current=30.0,
+        first_seen_ts=now - 500, last_seen_ts=now,
+        side="ask", sigma=3.0,
+    )
+    fired, info = detect_sweep_with_protection(
+        wall_consumed=consumed_bid,
+        price_move_pct=-0.0005,
+        cvd_spike_std=2.0,
+        fresh_walls_behind=[ask_protection],
+    )
+    assert fired is True
+    assert info["direction"] == "SHORT"

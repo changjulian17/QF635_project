@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from config import settings
-from models import Candle, MicrostructureBar, PatternSignal, PortfolioState
+from models import Candle, LOBSnapshot, MicrostructureBar, PatternSignal, PortfolioState
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,17 @@ def init_db() -> None:
                 bid_levels TEXT, ask_levels TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lob_snapshots (
+                ts              TEXT PRIMARY KEY,
+                mid_price       REAL,
+                spread          REAL,
+                obi             REAL,
+                cvd_delta       REAL,
+                bid_levels_json TEXT,
+                ask_levels_json TEXT
+            )
+        """)
         conn.commit()
     logger.info("[DB] Database initialized.")
 
@@ -84,27 +95,42 @@ class DBWriter:
     async def _candle_loop(self) -> None:
         while True:
             candle: Candle = await self._candle_queue.get()
-            await asyncio.to_thread(self._write_candle, candle)
+            try:
+                await asyncio.to_thread(self._write_candle, candle)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _signal_loop(self) -> None:
         while True:
             signal: PatternSignal = await self._signal_queue.get()
-            await asyncio.to_thread(self._write_signal, signal)
+            try:
+                await asyncio.to_thread(self._write_signal, signal)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _ms_bar_loop(self) -> None:
         while True:
             bar: MicrostructureBar = await self._ms_bar_queue.get()
-            await asyncio.to_thread(self._write_ms_bar, bar)
+            try:
+                await asyncio.to_thread(self._write_ms_bar, bar)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _portfolio_loop(self) -> None:
         while True:
             await asyncio.sleep(self.PORTFOLIO_INTERVAL)
-            await asyncio.to_thread(self._write_portfolio, self._portfolio)
+            try:
+                await asyncio.to_thread(self._write_portfolio, self._portfolio)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _cleanup_loop(self) -> None:
         while True:
             await asyncio.sleep(self.CLEANUP_INTERVAL)
-            await asyncio.to_thread(self._purge_old_records)
+            try:
+                await asyncio.to_thread(self._purge_old_records)
+            except Exception as e:
+                logger.warning("[DB] Write error (%s) — continuing", e)
 
     def _purge_old_records(self) -> None:
         cutoff = f"-{self.RETENTION_DAYS} days"
@@ -148,6 +174,48 @@ class DBWriter:
                 "INSERT OR REPLACE INTO portfolio VALUES (?,?,?,?,?)",
                 (datetime.now(timezone.utc).isoformat(), pf.equity,
                  pf.daily_pnl, pf.drawdown_pct, pf.circuit_breaker.name),
+            )
+            conn.commit()
+
+    async def write_lob_snapshot(
+        self,
+        snapshot: LOBSnapshot,
+        obi: float,
+        spread: float,
+        mid_price: float,
+        cvd_delta: float,
+    ) -> None:
+        await asyncio.to_thread(
+            self._write_lob_snapshot_sync, snapshot, obi, spread, mid_price, cvd_delta
+        )
+
+    @staticmethod
+    def _write_lob_snapshot_sync(
+        snapshot: LOBSnapshot,
+        obi: float,
+        spread: float,
+        mid_price: float,
+        cvd_delta: float,
+    ) -> None:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO lob_snapshots
+                   (ts, mid_price, spread, obi, cvd_delta, bid_levels_json, ask_levels_json)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    snapshot.timestamp.isoformat(),
+                    mid_price, spread, obi, cvd_delta,
+                    json.dumps([[l.price, l.qty] for l in snapshot.bids]),
+                    json.dumps([[l.price, l.qty] for l in snapshot.asks]),
+                ),
+            )
+            conn.execute(
+                """DELETE FROM lob_snapshots
+                   WHERE rowid NOT IN (
+                       SELECT rowid FROM lob_snapshots
+                       ORDER BY ts DESC LIMIT ?
+                   )""",
+                (settings.LOB_HISTORY,),
             )
             conn.commit()
 

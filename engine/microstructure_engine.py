@@ -3,7 +3,6 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
 import numpy as np
 
 from config import settings
@@ -11,8 +10,6 @@ from .lob_engine import LocalOrderBook
 from models import AggTrade, LOBLevel, LOBSnapshot, MicrostructureBar
 
 logger = logging.getLogger(__name__)
-
-_SNAPSHOT_URL = f"{settings.REST_BASE}/api/v3/depth"
 
 
 class MicrostructureEngine:
@@ -53,9 +50,6 @@ class MicrostructureEngine:
         # Rolling volume history per price level (deque of qty values)
         self._level_hist: dict[float, deque] = defaultdict(lambda: deque(maxlen=50))
 
-        # Iceberg: trades observed at each price in recent windows
-        self._trade_hist: dict[float, deque] = defaultdict(lambda: deque(maxlen=20))
-
         # Liquidity flip: maximum qty ever seen at each price on each side
         self._peak_bid_qty: dict[float, float] = {}
         self._peak_ask_qty: dict[float, float] = {}
@@ -64,48 +58,42 @@ class MicrostructureEngine:
         self._breakouts: list[tuple[datetime, float, str]] = []
 
         self._prev_snap: LOBSnapshot | None = None
+        self._bar_count: int = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         asyncio.create_task(self._collect_trades())
-        await self._initialise()
+        try:
+            await self._initialise()
+        except Exception as exc:
+            logger.error("[MS] Initialisation failed: %s — running in drain mode.", exc)
+            await self._drain_loop()
+            return
         await self._main_loop()
 
+    async def _drain_loop(self) -> None:
+        """Discard depth events when the engine cannot initialise. Prevents queue backpressure."""
+        while True:
+            await self._depth_queue.get()
+
     async def _initialise(self) -> None:
-        """Fetch REST snapshot and synchronise with buffered depth events."""
-        self._lob.reset()
-        logger.info("[MS] Fetching order book snapshot…")
-
-        async with aiohttp.ClientSession() as session:
-            params = {"symbol": settings.SYMBOL, "limit": 1000}
-            async with session.get(_SNAPSHOT_URL, params=params) as resp:
-                data = await resp.json()
-
-        self._lob.set_snapshot(data)
-        snap_id = data["lastUpdateId"]
-
-        # Drain events buffered in the queue while we were fetching
-        drained = 0
-        while not self._depth_queue.empty():
-            event = self._depth_queue.get_nowait()
-            if int(event["u"]) > snap_id:
-                self._lob.apply_diff(event)
-                drained += 1
-
-        logger.info(f"[MS] Initialised. Applied {drained} buffered diff events.")
+        """Wait for first valid depth20 snapshot — LOB state machine handles sync."""
+        self._cvd = 0.0
+        await self._lob.reset()
+        logger.info("[MS] Waiting for first depth20 snapshot…")
+        while True:
+            event = await self._depth_queue.get()
+            if await self._lob.apply_snapshot(event):
+                logger.info("[MS] LOB synced. lastUpdateId=%d", event.get("lastUpdateId", 0))
+                return
 
     async def _main_loop(self) -> None:
         while True:
             event = await self._depth_queue.get()
+            await self._lob.apply_snapshot(event)
 
-            ok = self._lob.apply_diff(event)
-            if not ok:
-                logger.warning("[MS] Sequence gap — reinitialising LOB.")
-                await self._initialise()
-                continue
-
-            snap = self._lob.get_snapshot(settings.LOB_DEPTH)
+            snap = await self._lob.get_snapshot(settings.LOB_DEPTH)
             if snap is None:
                 continue
 
@@ -120,11 +108,10 @@ class MicrostructureEngine:
 
     async def _collect_trades(self) -> None:
         while True:
-            trade: AggTrade = await self._trade_queue.get()
-            self._pending_trades.append(trade)
-            # Record for iceberg detection keyed by rounded price (1 tick = $1 on BTC)
-            rounded = round(trade.price, 0)
-            self._trade_hist[rounded].append((trade.timestamp, trade.qty, trade.is_buyer_maker))
+            item = await self._trade_queue.get()
+            if not isinstance(item, AggTrade):
+                continue  # bookTicker dicts share this queue; spread is derived from LOB
+            self._pending_trades.append(item)
 
     # ── Bar computation ───────────────────────────────────────────────────
 
@@ -153,6 +140,10 @@ class MicrostructureEngine:
         for lvl in snap.asks:
             self._level_hist[lvl.price].append(lvl.qty)
             self._peak_ask_qty[lvl.price] = max(self._peak_ask_qty.get(lvl.price, 0.0), lvl.qty)
+
+        self._bar_count += 1
+        if self._bar_count % settings.PRICE_PRUNE_INTERVAL == 0:
+            self._prune_price_dicts(mid_price)
 
         rb, ra = self._detect_reload(snap)
         ib, ia = self._detect_iceberg(snap, trades)
@@ -225,8 +216,9 @@ class MicrostructureEngine:
         Resistance algorithm (L2 approximation):
           1. A level exceeds the minimum size floor (ICEBERG_MIN_QTY).
           2. An aggressive trade hits it within ICEBERG_PRICE_TOL.
-          3. After the trade the level has replenished to ≥ ICEBERG_MIN_REPLENISH
-             of its pre-trade qty — indicating hidden reserve behind the visible tip.
+          3. After the trade the level holds MORE qty than the natural post-fill
+             remainder (prev_qty − hit_vol), confirming a hidden reserve refilled it,
+             AND still meets the ICEBERG_MIN_REPLENISH size floor.
 
         Thresholds are intentionally strict to reduce false positives on a
         fast-moving book where normal partial fills are common.
@@ -250,8 +242,9 @@ class MicrostructureEngine:
             )
             if hit_vol <= 0:
                 continue
-            # Level replenished to ≥ threshold — hidden reserve consumed and refilled
-            if lvl.qty >= prev_qty * settings.ICEBERG_MIN_REPLENISH:
+            # Hidden reserve: level has MORE qty than natural post-fill remainder AND is still large
+            recovered = lvl.qty - max(prev_qty - hit_vol, 0.0)
+            if recovered > 0 and lvl.qty >= prev_qty * settings.ICEBERG_MIN_REPLENISH:
                 iceberg_bid = True
                 break
 
@@ -266,7 +259,8 @@ class MicrostructureEngine:
             )
             if hit_vol <= 0:
                 continue
-            if lvl.qty >= prev_qty * settings.ICEBERG_MIN_REPLENISH:
+            recovered = lvl.qty - max(prev_qty - hit_vol, 0.0)
+            if recovered > 0 and lvl.qty >= prev_qty * settings.ICEBERG_MIN_REPLENISH:
                 iceberg_ask = True
                 break
 
@@ -282,10 +276,12 @@ class MicrostructureEngine:
         buy_vol = sum(t.qty for t in trades if not t.is_buyer_maker)
         sell_vol = sum(t.qty for t in trades if t.is_buyer_maker)
 
-        top_ask_vol = sum(l.qty for l in snap.asks[: settings.SWEEP_LEVELS]) or 1.0
-        top_bid_vol = sum(l.qty for l in snap.bids[: settings.SWEEP_LEVELS]) or 1.0
+        ref_snap = self._prev_snap if self._prev_snap is not None else snap
+        top_ask_vol = sum(l.qty for l in ref_snap.asks[: settings.SWEEP_LEVELS]) or 1.0
+        top_bid_vol = sum(l.qty for l in ref_snap.bids[: settings.SWEEP_LEVELS]) or 1.0
 
-        return buy_vol > top_ask_vol * 0.8, sell_vol > top_bid_vol * 0.8
+        return (buy_vol > top_ask_vol * settings.SWEEP_THRESHOLD,
+                sell_vol > top_bid_vol * settings.SWEEP_THRESHOLD)
 
     def _detect_book_flip(
         self, snap: LOBSnapshot, trades: list[AggTrade]
@@ -297,7 +293,7 @@ class MicrostructureEngine:
         if self._prev_snap is None:
             return False, False
 
-        all_qtys = [l.qty for l in snap.bids + snap.asks]
+        all_qtys = [l.qty for l in self._prev_snap.bids + self._prev_snap.asks]
         if not all_qtys:
             return False, False
         mean_qty = float(np.mean(all_qtys))
@@ -310,27 +306,27 @@ class MicrostructureEngine:
 
         # Large bid vanished → check if cancellation (not consumed) + sell aggression
         for lvl in self._prev_snap.bids:
-            if (lvl.qty - mean_qty) / std_qty < 3.0:
+            if (lvl.qty - mean_qty) / std_qty < settings.BOOK_FLIP_SIGMA:
                 continue
             if lvl.price in curr_bid_prices:
                 continue
             consumed = sum(t.qty for t in trades if t.is_buyer_maker and abs(t.price - lvl.price) < 1.0)
-            if consumed < lvl.qty * 0.3:
+            if consumed < lvl.qty * settings.BOOK_FLIP_MIN_CONSUMED:
                 sell_agg = sum(t.qty for t in trades if t.is_buyer_maker)
-                if sell_agg > mean_qty * 0.5:
+                if sell_agg > mean_qty * settings.BOOK_FLIP_AGG_RATIO:
                     flip_bid = True
                     break
 
         # Large ask vanished → cancellation + buy aggression
         for lvl in self._prev_snap.asks:
-            if (lvl.qty - mean_qty) / std_qty < 3.0:
+            if (lvl.qty - mean_qty) / std_qty < settings.BOOK_FLIP_SIGMA:
                 continue
             if lvl.price in curr_ask_prices:
                 continue
             consumed = sum(t.qty for t in trades if not t.is_buyer_maker and abs(t.price - lvl.price) < 1.0)
-            if consumed < lvl.qty * 0.3:
+            if consumed < lvl.qty * settings.BOOK_FLIP_MIN_CONSUMED:
                 buy_agg = sum(t.qty for t in trades if not t.is_buyer_maker)
-                if buy_agg > mean_qty * 0.5:
+                if buy_agg > mean_qty * settings.BOOK_FLIP_AGG_RATIO:
                     flip_ask = True
                     break
 
@@ -344,23 +340,19 @@ class MicrostructureEngine:
         if self._prev_snap is None:
             return False, False
 
-        curr_ask_prices = {l.price for l in snap.asks}
-        curr_bid_prices = {l.price for l in snap.bids}
+        asks_by_price = {l.price: l.qty for l in snap.asks}
+        bids_by_price = {l.price: l.qty for l in snap.bids}
 
         liq_to_res = any(
-            price in curr_ask_prices and
-            any(l.qty >= self._peak_bid_qty.get(price, 0) * 0.5
-                for l in snap.asks if l.price == price)
+            asks_by_price.get(price, 0.0) >= peak * 0.5
             for price, peak in self._peak_bid_qty.items()
-            if peak > 0 and price in curr_ask_prices
+            if peak > 0 and price in asks_by_price
         )
 
         liq_to_sup = any(
-            price in curr_bid_prices and
-            any(l.qty >= self._peak_ask_qty.get(price, 0) * 0.5
-                for l in snap.bids if l.price == price)
+            bids_by_price.get(price, 0.0) >= peak * 0.5
             for price, peak in self._peak_ask_qty.items()
-            if peak > 0 and price in curr_bid_prices
+            if peak > 0 and price in bids_by_price
         )
 
         return liq_to_res, liq_to_sup
@@ -397,12 +389,21 @@ class MicrostructureEngine:
             )
             price_move = mid_price - prev_mid
 
-            if buy_vol > sell_vol * 2.0 and price_move > 0:
+            if buy_vol >= settings.BREAK_MIN_VOL and buy_vol > sell_vol * 2.0 and price_move > 0:
                 self._breakouts.append((now, mid_price, "up"))
-            elif sell_vol > buy_vol * 2.0 and price_move < 0:
+            elif sell_vol >= settings.BREAK_MIN_VOL and sell_vol > buy_vol * 2.0 and price_move < 0:
                 self._breakouts.append((now, mid_price, "down"))
 
         bp_long = any(d == "up" and obi > settings.OBI_BREAK_THRESH for _, _, d in self._breakouts)
         bp_short = any(d == "down" and obi < -settings.OBI_BREAK_THRESH for _, _, d in self._breakouts)
 
         return bp_long, bp_short
+
+    def _prune_price_dicts(self, mid_price: float) -> None:
+        """Evict price keys outside ±PRICE_PRUNE_BAND of current mid to prevent unbounded growth."""
+        band = settings.PRICE_PRUNE_BAND
+        lo = mid_price * (1.0 - band)
+        hi = mid_price * (1.0 + band)
+        for d in (self._level_hist, self._peak_bid_qty, self._peak_ask_qty):
+            for price in [p for p in d if not (lo <= p <= hi)]:
+                del d[price]
