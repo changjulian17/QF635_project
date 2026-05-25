@@ -61,7 +61,10 @@ htmlcov/
 local/
 tmp/
 temp/
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/*.md
 .gitignore
 
 # XGBoost / ML model artefacts
