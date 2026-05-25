@@ -315,6 +315,8 @@ Every signal evaluation — whether it passes all gates or is rejected at Gate 0
 
 ## Quick Start
 
+Requires **Python 3.13+**.
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -513,7 +515,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 
 | Layer | Technology | Version | Purpose |
 |-------|-----------|---------|---------|
-| Runtime | Python | 3.11+ | Async, type hints |
+| Runtime | Python | 3.13+ | Async, type hints |
 | Async | asyncio | stdlib | Event loop |
 | LOB Recorder WS | websockets | 10.4 | Real Binance public stream |
 | Exchange WS/REST | python-binance | 1.0.36 | Testnet execution |

@@ -119,9 +119,10 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
 
     # ── Row 1: heatmap ─────────────────────────────────────────────────────
     if not hm_df.empty:
-        current_mid = float(hm_df["mid_price"].iloc[-1])
-        price_lo = current_mid - half_range
-        price_hi = current_mid + half_range
+        current_mid   = float(hm_df["mid_price"].iloc[-1])
+        window_center = float((hm_df["mid_price"].min() + hm_df["mid_price"].max()) / 2)
+        price_lo = window_center - half_range
+        price_hi = window_center + half_range
         bucket_size = settings.LOB_HEATMAP_BUCKET
         price_buckets = np.arange(price_lo, price_hi + bucket_size, bucket_size)
         n_times, n_prices = len(hm_df), len(price_buckets)
@@ -165,6 +166,7 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
             ask_matrix = ask_matrix[:, vm]
             ts_labels  = [t for t, ok in zip(ts_labels, valid_cols) if ok]
             mid_prices = [p for p, ok in zip(mid_prices, valid_cols) if ok]
+        hm_ts_snap = hm_df["ts"][np.array(valid_cols, dtype=bool)] if not all(valid_cols) else hm_df["ts"]
 
         all_nonzero = np.concatenate([bid_matrix[bid_matrix > 0], ask_matrix[ask_matrix > 0]])
         max_vol = np.percentile(all_nonzero, contrast_pctile) if len(all_nonzero) else 1.0
@@ -225,41 +227,51 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
 
     # ── Row 1 overlay: market order bubbles (indices 6 & 7) ────────────────
     if not hm_df.empty and ts_labels:
-        since_ts_ms = int(hm_df["ts"].iloc[0].timestamp() * 1000)
-        trades = fetch_agg_trades(since_ts_ms)
+        snap_ms   = np.array([int(t.timestamp() * 1000) for t in hm_ts_snap], dtype=np.int64)
+        win_start = int(snap_ms[0])
+        win_end   = int(snap_ms[-1])
+
+        trades = fetch_agg_trades(win_start)
+        buy_x,  buy_y,  buy_sz,  buy_txt  = [], [], [], []
+        sell_x, sell_y, sell_sz, sell_txt = [], [], [], []
+
         if trades and not isinstance(trades, DBOffline):
             tdf = pd.DataFrame(trades)
-            threshold = tdf["qty"].quantile((trade_pctile or 80) / 100)
-            tdf = tdf[tdf["qty"] >= threshold].copy()
+            tdf = tdf[(tdf["ts_event"] >= win_start) & (tdf["ts_event"] <= win_end)].copy()
             if not tdf.empty:
-                snap_ms = (hm_df["ts"].astype("int64") // 1_000_000).values
+                threshold = tdf["qty"].quantile((trade_pctile or 80) / 100)
+                tdf = tdf[tdf["qty"] >= threshold].copy()
+            if not tdf.empty:
                 snapped_x = [
                     ts_labels[int(np.argmin(np.abs(snap_ms - t)))]
-                    for t in tdf["ts_event"]
+                    for t in tdf["ts_event"].values
                 ]
                 sizes = np.clip(np.log1p(tdf["qty"].values) * 6, 5, 24)
-                for side, label, color in [
-                    (0, "Buy MO", "rgba(0,220,100,0.8)"),
-                    (1, "Sell MO", "rgba(220,60,60,0.8)"),
-                ]:
-                    mask = (tdf["is_buyer_maker"] == side).values
-                    fig.add_trace(go.Scatter(
-                        x=[snapped_x[i] for i, ok in enumerate(mask) if ok],
-                        y=tdf.loc[mask, "price"].tolist(),
-                        mode="markers",
-                        marker=dict(
-                            size=sizes[mask].tolist(), color=color,
-                            line=dict(width=0.5, color="white"),
-                        ),
-                        name=label,
-                        hovertemplate="qty: %{text}<extra></extra>",
-                        text=tdf.loc[mask, "qty"].round(4).astype(str).tolist(),
-                    ), row=1, col=1)
-        else:
-            # always add placeholder traces so index 6/7 are stable for Patch
-            for label in ("Buy MO", "Sell MO"):
-                fig.add_trace(go.Scatter(x=[], y=[], mode="markers",
-                                         name=label, showlegend=False), row=1, col=1)
+                buy_mask  = tdf["is_buyer_maker"].values == 0
+                sell_mask = ~buy_mask
+                buy_x   = [snapped_x[i] for i, ok in enumerate(buy_mask)  if ok]
+                buy_y   = tdf["price"].values[buy_mask].tolist()
+                buy_sz  = sizes[buy_mask].tolist()
+                buy_txt = tdf["qty"].values[buy_mask].round(4).astype(str).tolist()
+                sell_x   = [snapped_x[i] for i, ok in enumerate(sell_mask) if ok]
+                sell_y   = tdf["price"].values[sell_mask].tolist()
+                sell_sz  = sizes[sell_mask].tolist()
+                sell_txt = tdf["qty"].values[sell_mask].round(4).astype(str).tolist()
+
+        fig.add_trace(go.Scatter(
+            x=buy_x, y=buy_y, mode="markers",
+            marker=dict(size=buy_sz or 8, color="rgba(0,220,100,0.8)",
+                        line=dict(width=0.5, color="white")),
+            name="Buy MO", text=buy_txt,
+            hovertemplate="qty: %{text}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=sell_x, y=sell_y, mode="markers",
+            marker=dict(size=sell_sz or 8, color="rgba(220,60,60,0.8)",
+                        line=dict(width=0.5, color="white")),
+            name="Sell MO", text=sell_txt,
+            hovertemplate="qty: %{text}<extra></extra>",
+        ), row=1, col=1)
     else:
         for label in ("Buy MO", "Sell MO"):
             fig.add_trace(go.Scatter(x=[], y=[], mode="markers",
