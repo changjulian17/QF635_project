@@ -101,7 +101,7 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
         return _empty_fig("Waiting for LOB snapshot data…"), None
 
     df = pd.DataFrame(snapshots)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df["ts"] = pd.to_datetime(df["ts"], format="ISO8601", utc=True)
 
     # H1: staleness check
     age_s = (datetime.now(timezone.utc) - df["ts"].iloc[-1].to_pydatetime()).total_seconds()
@@ -321,7 +321,7 @@ def update_lob_lines(n, last_ts, hm_minutes):
         return no_update
 
     df = pd.DataFrame(snapshots)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df["ts"] = pd.to_datetime(df["ts"], format="ISO8601", utc=True)
     obi_df = df.tail(rows_needed)
 
     if obi_df.empty:
