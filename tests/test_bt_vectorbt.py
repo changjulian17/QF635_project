@@ -145,3 +145,44 @@ def test_run_vectorbt_returns_metrics(synthetic_df):
 
     assert metrics.strategy_name == "Support / Resistance Breakout"
     assert metrics.total_return_pct == metrics.total_return_pct   # not NaN
+
+
+def test_valid_mask_filters_inverted_sl_tp(synthetic_df):
+    """
+    M1: entries where TP is on the wrong side of entry_approx (inverted stops)
+    must be removed by valid_mask before reaching VectorBT, not crash the run.
+    """
+    from unittest.mock import patch
+    from backtesting.signals import SignalArrays
+    import numpy as np
+
+    n = len(synthetic_df)
+    # Craft signal arrays where every entry has LONG-style TP but SL *above* entry
+    # (inverted — SL should be below for a LONG), so the valid_mask should neutralise them.
+    entries  = np.zeros(n, dtype=bool)
+    sl_stop  = np.full(n, np.nan)
+    tp_stop  = np.full(n, np.nan)
+    atr_arr  = np.full(n, 100.0)
+    close    = synthetic_df["close"].values
+
+    for i in range(50, n, 100):
+        entries[i] = True
+        tp_stop[i] = close[i] + 500.0   # TP above entry → LONG
+        sl_stop[i] = close[i] + 800.0   # SL also above entry → INVERTED (invalid)
+
+    bad_arrays = SignalArrays(entries=entries, sl_stop=sl_stop, tp_stop=tp_stop, atr=atr_arr)
+
+    params = {
+        "swing_window": 5, "pattern_lookback": 50, "min_r2": 0.75,
+        "breakout_vol_mult": 1.2, "touch_tolerance_atr": 0.5,
+        "atr_multiplier_sl": 1.5, "atr_multiplier_tp": 3.0, "atr_period": 14,
+    }
+
+    with patch("backtesting.vectorbt_runner.generate_signals", return_value=bad_arrays):
+        # Must not raise — valid_mask should zero out all the inverted entries
+        metrics = _run_vectorbt("Support / Resistance Breakout", synthetic_df, params)
+
+    # All inverted entries suppressed → VBT sees no valid entries → empty metrics
+    assert metrics.total_trades == 0, (
+        f"Expected 0 trades (all entries filtered), got {metrics.total_trades}"
+    )

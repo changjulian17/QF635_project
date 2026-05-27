@@ -149,9 +149,13 @@ class TickReplayEngine:
                 else:
                     self._process_trade(event)
 
-        # EOD close — mark any open position at last observed trade price
-        if self._open_position is not None and self._last_trade_price > 0:
-            self._close_position(self._last_trade_price, end_ms, "EOD")
+        # EOD close — use last trade price, falling back to mid if no trades occurred in window
+        if self._open_position is not None:
+            close_price = self._last_trade_price if self._last_trade_price > 0 else self._prev_mid
+            if close_price > 0:
+                self._close_position(close_price, end_ms, "EOD")
+            else:
+                logger.warning("[TickReplay] EOD: no price available to close position — skipping close")
 
         self._equity_curve.append((end_ms, self._equity))
 
@@ -186,8 +190,12 @@ class TickReplayEngine:
                 else:
                     self._process_trade(event)
 
-        if self._open_position is not None and self._last_trade_price > 0:
-            self._close_position(self._last_trade_price, end_ms, "EOD")
+        if self._open_position is not None:
+            close_price = self._last_trade_price if self._last_trade_price > 0 else self._prev_mid
+            if close_price > 0:
+                self._close_position(close_price, end_ms, "EOD")
+            else:
+                logger.warning("[TickReplay] EOD: no price available to close position — skipping close")
 
         self._equity_curve.append((end_ms, self._equity))
 

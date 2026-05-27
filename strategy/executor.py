@@ -23,6 +23,7 @@ from core.cvd import WelfordOnline
 from core.signal_telemetry import SignalRecord
 from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState
 from risk.engine import TIER_MIN_CONFIDENCE, TIER_SCALARS
+from strategy.spec import EntryRules
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,10 @@ def gate_3_capital(budget, tier: str) -> tuple[bool, str]:
 def gate_4_order_selection(
     spread_bps: float,
     spread_p95: float,
+    spread_hard_cap_bps: float = 8.0,
 ) -> tuple[bool, str, str]:
+    if spread_bps > spread_hard_cap_bps:
+        return False, f"spread {spread_bps:.1f}bps > hard cap {spread_hard_cap_bps:.1f}bps", ""
     if spread_bps > spread_p95 * 2:
         return False, f"spread {spread_bps:.1f}bps > 2×p95 {spread_p95:.1f}bps", ""
     order_type = "IOC_LIMIT"
@@ -105,17 +109,21 @@ class RuleBasedScorer:
     Weights: OBI alignment 0.30, vol surge 0.25, spread 0.20, CVD 0.25.
     """
 
+    def __init__(self, rules: EntryRules | None = None) -> None:
+        self._rules = rules or EntryRules()
+
     def score(self, fv: FeatureVector, signal: MicroSignal) -> float:
         score = 0.0
+        thresh = self._rules.obi_threshold
         # OBI directional alignment
-        if signal.direction == "LONG" and fv.obi_zscore > 0.20:
+        if signal.direction == "LONG" and fv.obi_zscore > thresh:
             score += 0.30
-        elif signal.direction == "SHORT" and fv.obi_zscore < -0.20:
+        elif signal.direction == "SHORT" and fv.obi_zscore < -thresh:
             score += 0.30
         # Volume surge
         score += min(fv.vol_ratio / 4.0, 0.25)
         # Spread within normal range
-        if fv.spread_bps < 8.0:
+        if fv.spread_bps < self._rules.spread_max_bps:
             score += 0.20
         # CVD alignment
         if signal.direction == "LONG" and fv.cvd_positive:
@@ -214,6 +222,7 @@ class StrategyExecutor:
         lob_engine=None,
         order_manager=None,
         gate6_check_interval_ms: int = 200,
+        strategy_id: str = "v3.0",
     ) -> None:
         self._micro_q       = micro_signal_queue
         self._signal_q      = signal_queue
@@ -221,6 +230,8 @@ class StrategyExecutor:
         self._fc            = feature_computer
         self._state         = shared_state
         self._budget        = budget
+        self._strategy_id   = strategy_id
+        self._entry_rules   = EntryRules()
         if rule_scorer is not None:
             self._scorer = rule_scorer
         else:
@@ -264,6 +275,20 @@ class StrategyExecutor:
             logger.info("[Executor] Risk tier updated: %s → %s", self._risk_tier, tier)
             self._risk_tier = tier
 
+    def set_entry_rules(self, rules: EntryRules) -> None:
+        """Apply optimised entry thresholds from the active registered spec.
+
+        Call once at startup after resolving the active strategy from the registry.
+        Also updates RuleBasedScorer thresholds when that fallback scorer is active.
+        """
+        self._entry_rules = rules
+        if isinstance(self._scorer, RuleBasedScorer):
+            self._scorer = RuleBasedScorer(rules)
+        logger.info(
+            "[Executor] Entry rules applied: spread_max_bps=%.1f obi_threshold=%.2f",
+            rules.spread_max_bps, rules.obi_threshold,
+        )
+
     @property
     def _spread_p95(self) -> float:
         """Session-aware 95th-percentile spread via log-normal approximation."""
@@ -281,6 +306,7 @@ class StrategyExecutor:
         rec = SignalRecord(
             micro_signal = signal.signal_type,
             direction    = signal.direction,
+            strategy_id  = self._strategy_id,
         )
 
         # Gate 0 — data fidelity
@@ -349,7 +375,7 @@ class StrategyExecutor:
             now_ms = int(time.time() * 1000)
             elapsed_ms = now_ms - self._last_approved_ms
             if elapsed_ms < settings.MIN_SIGNAL_INTERVAL_MS:
-                self._reject(rec, "GATE_5_FAIL",
+                self._reject(rec, "RATE_LIMIT",
                              f"rate limit: {elapsed_ms}ms < {settings.MIN_SIGNAL_INTERVAL_MS}ms")
                 return
 

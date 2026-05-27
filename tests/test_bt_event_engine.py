@@ -358,3 +358,33 @@ class TestFullEngineRun:
             eq_curve, _ = eng.run(df)
 
         assert len(eq_curve) == n - 1
+
+    def test_pnl_pct_uses_equity_at_entry_not_notional(self):
+        """
+        H2: pnl_pct must equal net_pnl / equity_at_entry, not net_pnl / notional.
+        A single TP trade lets us verify the denominator precisely.
+        """
+        n = 30
+        # Bar 5 signal → entry at bar 6 open (50 000), TP at 52 000.
+        # equity at entry ≈ 10 000 - entry_fee ≈ 9 985.
+        df     = _make_df(n)
+        # Signal fires at bar 5 → entry at bar 6 open. TP check starts at bar 7.
+        df.loc[7, "high"]  = 53_000.0   # bar 7 high exceeds TP=52000
+        df.loc[6, "open"]  = 50_000.0
+        arrays = _signal_arrays(n, entry_bars=[5], sl=49_000.0, tp=52_000.0)
+
+        with patch("backtesting.event_engine.generate_signals", return_value=arrays):
+            eng = EventDrivenEngine(
+                "Falling Wedge", {"pattern_lookback": 1},
+                raw_mode=True, starting_equity=10_000.0,
+            )
+            _, trades = eng.run(df)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.equity_at_entry > 0, "equity_at_entry must be stored on SimulatedTrade"
+        expected_pnl_pct = t.pnl / t.equity_at_entry
+        assert abs(t.pnl_pct - expected_pnl_pct) < 1e-9, (
+            f"pnl_pct={t.pnl_pct:.6f} expected {expected_pnl_pct:.6f} "
+            f"(pnl={t.pnl:.4f}, equity_at_entry={t.equity_at_entry:.4f})"
+        )

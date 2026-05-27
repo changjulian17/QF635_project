@@ -315,6 +315,17 @@ def _run_vectorbt(
     sl_s = (entry_approx - sl_abs).abs() / entry_approx   # NaN where sl_abs is NaN
     tp_s = (tp_abs - entry_approx).abs() / entry_approx   # NaN where tp_abs is NaN
 
+    # Silently filter entries where TP is on the wrong side of entry (degenerate Optuna params).
+    # Using .abs() above masks inversions, so we zero them out here to prevent corrupted portfolios.
+    # This cannot happen with current signal generators (ATR > 0 guarantees valid stops) but
+    # guards against future additions or extreme Optuna param combinations (e.g. atr_sl = 0).
+    valid_mask = (tp_abs > entry_approx) | (tp_abs < entry_approx)  # always True where TP is defined
+    valid_mask = valid_mask & (  # TP must be on opposite side from SL
+        ((tp_abs > entry_approx) & (sl_abs < entry_approx)) |   # LONG
+        ((tp_abs < entry_approx) & (sl_abs > entry_approx))     # SHORT
+    )
+    entries_s = entries_s & valid_mask.fillna(False)
+
     # Pass high/low so VBT checks stops intrabar (not only against close).
     high_s = pd.Series(df["high"].values, index=idx) if "high" in df.columns else None
     low_s  = pd.Series(df["low"].values,  index=idx) if "low"  in df.columns else None
@@ -450,7 +461,7 @@ def _extract_metrics(pf, strategy_name: str) -> BacktestMetrics:
 
 def _infer_vbt_freq(df: pd.DataFrame) -> str:
     """Infer VectorBT frequency string from the DataFrame's timestamp column."""
-    if len(df) < 2:
+    if len(df) < 2 or "timestamp" not in df.columns:
         return "1min"
     diff_ms = int(df["timestamp"].iloc[1]) - int(df["timestamp"].iloc[0])
     mapping = {

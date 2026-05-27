@@ -15,6 +15,8 @@ import logging
 import math
 from typing import TYPE_CHECKING, Optional
 
+import pandas as pd
+
 from strategy.spec import EntryRules, StatisticalValidity, StrategySpec
 
 if TYPE_CHECKING:
@@ -144,8 +146,8 @@ class StrategyBuilder:
             raise ValueError("n_folds must be >= 2 to produce meaningful OOS splits.")
         fold_ms = (end_ms - start_ms) // n_folds
 
-        all_pnl_usd: list[float] = []
-        equity_checkpoints: list[float] = [10_000.0]  # track running equity for drawdown
+        all_pnl_usd:  list[float]     = []
+        eq_curves:    list[pd.Series] = []  # timestamped equity series for daily Sharpe
 
         for i in range(n_folds):
             fold_start = start_ms + i * fold_ms
@@ -155,8 +157,8 @@ class StrategyBuilder:
             for t in trades:
                 all_pnl_usd.append(t.pnl_usd)
 
-            if len(eq_curve) > 0:
-                equity_checkpoints.extend(eq_curve.tolist())
+            if len(eq_curve) > 1:
+                eq_curves.append(eq_curve)
 
             logger.info(
                 "[WalkForward] Fold %d/%d: %d trades, fold equity Δ=%.2f",
@@ -178,28 +180,29 @@ class StrategyBuilder:
         gross_loss  = abs(sum(losses)) if losses else 0.0
         pf          = gross_win / gross_loss if gross_loss > 1e-9 else float("inf")
 
-        # Max drawdown from the equity checkpoint series
-        peak        = equity_checkpoints[0]
-        max_dd_pct  = 0.0
-        for eq in equity_checkpoints:
-            peak = max(peak, eq)
-            dd   = (peak - eq) / peak * 100.0 if peak > 0 else 0.0
-            max_dd_pct = max(max_dd_pct, dd)
-
-        # Trade-level Sharpe: mean/std of pnl_usd, annualised by trade frequency.
-        # Assumes crypto runs 24/7 and uses the actual fold span for frequency.
-        mean_pnl = sum(all_pnl_usd) / n_total
-        if n_total > 1:
-            variance = sum((p - mean_pnl) ** 2 for p in all_pnl_usd) / (n_total - 1)
-            std_pnl  = math.sqrt(variance)
+        # Max drawdown from the concatenated equity curve
+        if eq_curves:
+            full_equity = pd.concat(eq_curves).sort_index()
+            rolling_peak  = full_equity.cummax()
+            drawdown      = (full_equity - rolling_peak) / rolling_peak
+            max_dd_pct    = float(abs(drawdown.min())) * 100.0
         else:
-            std_pnl = 0.0
+            max_dd_pct = 0.0
 
-        if std_pnl > 1e-9:
-            total_days  = (end_ms - start_ms) / 86_400_000
-            trades_per_day = n_total / max(total_days, 1)
-            ann_factor  = math.sqrt(trades_per_day * 365)
-            sharpe      = (mean_pnl / std_pnl) * ann_factor
+        # Sharpe from daily equity returns — consistent with metrics.py so that the
+        # value stored in StrategySpec.validity.sharpe_oos matches the dashboard display.
+        TRADING_DAYS_PER_YEAR = 365  # crypto markets run 24/7
+        RISK_FREE_RATE_ANNUAL = 0.05
+        rfr_daily = RISK_FREE_RATE_ANNUAL / TRADING_DAYS_PER_YEAR
+        if eq_curves:
+            daily_eq = full_equity.resample("1D").last().dropna()
+            daily_returns = daily_eq.pct_change().dropna()
+            if len(daily_returns) > 1 and daily_returns.std() > 1e-10:
+                excess    = daily_returns - rfr_daily
+                ann_factor = math.sqrt(TRADING_DAYS_PER_YEAR)
+                sharpe     = float(excess.mean() / excess.std() * ann_factor)
+            else:
+                sharpe = 0.0
         else:
             sharpe = 0.0
 

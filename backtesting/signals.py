@@ -304,9 +304,10 @@ def _gen_wedge(df: pd.DataFrame, params: dict, bullish: bool) -> SignalArrays:
         if r_h ** 2 < min_r2 or r_l ** 2 < min_r2:
             continue
 
-        # Extrapolate lower trendline to the last bar in the window (index lookback-1)
-        lower_now = slope_l * (lookback - 1) + icpt_l
-        current   = closes[i - 1]   # last completed bar in window
+        # Extrapolate lower trendline to the current bar (index lookback, one beyond window end)
+        # closes[i] and atr_arr[i] both reference the current bar — all three are consistent.
+        lower_now = slope_l * lookback + icpt_l
+        current   = closes[i]
         atr       = atr_arr[i]
 
         if bullish:
@@ -404,9 +405,10 @@ def _gen_triangle_symmetrical(df: pd.DataFrame, params: dict) -> SignalArrays:
         if not (slope_h < 0 and slope_l > 0):
             continue
 
-        upper_now = slope_h * (lookback - 1) + icpt_h
-        lower_now = slope_l * (lookback - 1) + icpt_l
-        current   = closes[i - 1]
+        # Extrapolate both trendlines to the current bar (consistent with closes[i] and atr_arr[i])
+        upper_now = slope_h * lookback + icpt_h
+        lower_now = slope_l * lookback + icpt_l
+        current   = closes[i]
         atr       = atr_arr[i]
 
         # Prior trend direction from 20-bar simple slope

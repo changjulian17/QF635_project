@@ -475,7 +475,7 @@ def test_notional_hint_halved_in_reduced_tier():
 
 
 def test_rate_limit_rejects_rapid_second_signal(monkeypatch):
-    """A second signal within MIN_SIGNAL_INTERVAL_MS must be rejected as GATE_5_FAIL."""
+    """A second signal within MIN_SIGNAL_INTERVAL_MS must be rejected as RATE_LIMIT."""
     from config import settings as _settings
     monkeypatch.setattr(_settings, "MIN_SIGNAL_INTERVAL_MS", 500)
 
@@ -504,7 +504,7 @@ def test_rate_limit_rejects_rapid_second_signal(monkeypatch):
         recs = []
         while not telem_q.empty():
             recs.append(telem_q.get_nowait())
-        rejections = [r for r in recs if r.gate_passed == "GATE_5_FAIL" and "rate limit" in (r.rejection_reason or "")]
+        rejections = [r for r in recs if r.gate_passed == "RATE_LIMIT" and "rate limit" in (r.rejection_reason or "")]
         assert rejections, "rate-limit rejection telemetry must be emitted"
 
     asyncio.run(_run())

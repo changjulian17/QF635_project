@@ -115,6 +115,7 @@ class SimulatedTrade:
     pnl_pct:         float           = 0.0
     duration_minutes:float           = 0.0
     fees_paid:       float           = 0.0
+    equity_at_entry: float           = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,9 +250,10 @@ class EventDrivenEngine:
                     open_trade.exit_reason    = exit_info["reason"]
                     open_trade.fees_paid     += exit_fees
                     open_trade.pnl            = net_pnl
-                    open_trade.pnl_pct        = net_pnl / (
-                        open_trade.entry_price * open_trade.quantity
-                    ) if open_trade.quantity > 0 else 0.0
+                    open_trade.pnl_pct        = (
+                        net_pnl / open_trade.equity_at_entry
+                        if open_trade.equity_at_entry > 0 else 0.0
+                    )
                     open_trade.duration_minutes = (
                         (open_trade.exit_time - open_trade.entry_time)
                         .total_seconds() / 60
@@ -308,15 +310,16 @@ class EventDrivenEngine:
                             side = "LONG" if tp > entry_price else "SHORT"
 
                             open_trade = SimulatedTrade(
-                                strategy    = self.strategy,
-                                side        = side,
-                                entry_bar   = i,
-                                entry_time  = dt.to_pydatetime(),
-                                entry_price = entry_price,
-                                quantity    = quantity,
-                                stop_loss   = sl,
-                                take_profit = tp,
-                                fees_paid   = entry_fees,
+                                strategy        = self.strategy,
+                                side            = side,
+                                entry_bar       = i,
+                                entry_time      = dt.to_pydatetime(),
+                                entry_price     = entry_price,
+                                quantity        = quantity,
+                                stop_loss       = sl,
+                                take_profit     = tp,
+                                fees_paid       = entry_fees,
+                                equity_at_entry = equity,
                             )
 
                             logger.debug(
@@ -482,6 +485,8 @@ class EventDrivenEngine:
         if worst_case > remaining_budget:
             risk_amount = remaining_budget
 
+        # 0.25 = Kelly fraction applied only in full-mode (raw_mode uses 1× sizing for
+        # signal-quality benchmarking). Full-mode is 4× smaller to match live risk limits.
         quantity = round((risk_amount / sl_distance) * tier_scalar * 0.25, 6)
         return quantity > 0, quantity
 

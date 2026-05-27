@@ -231,7 +231,8 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
         win_start = int(snap_ms[0])
         win_end   = int(snap_ms[-1])
 
-        trades = fetch_agg_trades(win_start)
+        trade_limit = min(rows_needed * 20, 200_000)  # ~20 trades/s peak; cap to avoid OOM
+        trades = fetch_agg_trades(win_start, limit=trade_limit)
         buy_x,  buy_y,  buy_sz,  buy_txt  = [], [], [], []
         sell_x, sell_y, sell_sz, sell_txt = [], [], [], []
 
@@ -330,6 +331,12 @@ def update_lob_lines(n, last_ts, hm_minutes):
     obi_ts = obi_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
     cvd_running = obi_df["cvd_delta"].fillna(0.0).cumsum().tolist()
 
+    # Trace order assumed from update_lob_chart (must stay in sync if traces are added/removed):
+    #   0 = Bids heatmap   1 = Asks heatmap   2 = Mid price line
+    #   3 = OBI            4 = CVD            5 = Spread
+    #   6 = Buy MO         7 = Sell MO
+    # Guard: this callback only runs when last_ts is set, which means hm_df was non-empty
+    # in the last full rebuild, so traces 0–2 exist and indices 3–5 are correct.
     patched = Patch()
     patched["data"][3]["x"] = obi_ts
     patched["data"][3]["y"] = obi_df["obi"].tolist()
