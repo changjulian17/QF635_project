@@ -19,9 +19,9 @@ from unittest.mock import patch
 
 import pytest
 
-from backtesting.tick_replay import ReplayTrade, TickReplayEngine
+from backtesting.tick_replay import ReplayEvent, ReplayTrade, TickReplayEngine
 from core.cvd import CVDCalculator
-from models import FeatureVector
+from models import FeatureVector, WallState
 from strategy.features import FeatureComputer, FeatureParams
 from strategy.microstructure import identify_walls
 
@@ -772,3 +772,42 @@ def test_eod_close_oos_uses_prev_mid_when_no_trades(tmp_path):
     assert engine._open_position is None, "OOS position should have been closed at EOD"
     assert len(trades) == 1
     assert trades[0].exit_reason == "EOD"
+
+
+def test_replay_signal_does_not_require_cvd_spike(tmp_db):
+    """Tick replay must mirror live: sweep+protection can fire with cold/zero CVD spike."""
+    engine = TickReplayEngine(params={}, db_path=tmp_db, starting_equity=10_000.0)
+    engine._reset(BASE_TS)
+    ts_ms = BASE_TS + 1_000
+    engine._prev_mid = 30_005.0
+    engine._wall_states = {
+        30_010.0: WallState(
+            price=30_010.0,
+            qty_initial=50.0,
+            qty_current=5.0,
+            first_seen_ts=ts_ms - 1_000,
+            last_seen_ts=ts_ms,
+            side="ask",
+            sigma=3.0,
+        ),
+        29_980.0: WallState(
+            price=29_980.0,
+            qty_initial=30.0,
+            qty_current=30.0,
+            first_seen_ts=ts_ms - 500,
+            last_seen_ts=ts_ms,
+            side="bid",
+            sigma=3.0,
+        ),
+    }
+    engine._absorption_flags = {30_010.0: True}
+
+    engine._process_trade(ReplayEvent(
+        ts_ms=ts_ms,
+        kind="trade",
+        data={"price": 30_021.0, "qty": 1.0, "is_buyer_maker": 0},
+    ))
+
+    assert engine._open_position is not None
+    assert engine._open_position["signal"].cvd_std == pytest.approx(0.0)
+    assert engine._open_position["direction"] == "LONG"

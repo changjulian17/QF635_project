@@ -68,7 +68,9 @@ def gate_2_confidence(
     return True, "", score
 
 
-def gate_3_capital(budget, tier: str) -> tuple[bool, str]:
+def gate_3_capital(budget, tier: str, active_exposure: bool = False) -> tuple[bool, str]:
+    if active_exposure:
+        return False, "active microstructure exposure"
     if tier in ("HALTED", "PASSIVE"):
         return False, f"risk tier {tier} — no new entries"
     if budget is not None and budget.remaining <= 0:
@@ -106,7 +108,8 @@ def gate_5_execution_sync(
 class RuleBasedScorer:
     """
     Placeholder scorer until XGBoost is trained on tick data.
-    Weights: OBI alignment 0.30, vol surge 0.25, spread 0.20, CVD 0.25.
+    Weights: OBI alignment 0.45, vol surge 0.35, spread 0.20.
+    CVD is retained for telemetry/ML features, but is not a rule-based gate.
     """
 
     def __init__(self, rules: EntryRules | None = None) -> None:
@@ -117,19 +120,14 @@ class RuleBasedScorer:
         thresh = self._rules.obi_threshold
         # OBI directional alignment
         if signal.direction == "LONG" and fv.obi_zscore > thresh:
-            score += 0.30
+            score += 0.45
         elif signal.direction == "SHORT" and fv.obi_zscore < -thresh:
-            score += 0.30
+            score += 0.45
         # Volume surge
-        score += min(fv.vol_ratio / 4.0, 0.25)
+        score += min((fv.vol_ratio / 4.0) * 0.35, 0.35)
         # Spread within normal range
         if fv.spread_bps < self._rules.spread_max_bps:
             score += 0.20
-        # CVD alignment
-        if signal.direction == "LONG" and fv.cvd_positive:
-            score += 0.25
-        elif signal.direction == "SHORT" and not fv.cvd_positive:
-            score += 0.25
         return round(min(score, 1.0), 3)
 
 
@@ -148,9 +146,11 @@ class PersistenceMonitor:
         lob_engine,
         order_manager,
         position_closed_event: asyncio.Event,
+        shared_state: SharedState | None = None,
         check_interval_ms: int = 200,
     ) -> None:
         interval = check_interval_ms / 1000.0
+        started_ms = int(time.time() * 1000)
         while True:
             # Race the poll interval against position-closed. If the position exits
             # normally (TP/SL), stop quietly without firing the wall-removed alert.
@@ -163,6 +163,39 @@ class PersistenceMonitor:
                 return
             except asyncio.TimeoutError:
                 pass
+
+            now_ms = int(time.time() * 1000)
+            if now_ms - started_ms >= settings.MICRO_MAX_HOLD_MS:
+                logger.warning("[Gate6] Max hold exceeded — triggering safety exit")
+                if hasattr(order_manager, "handle_safety_exit"):
+                    await order_manager.handle_safety_exit("MAX_HOLD")
+                return
+
+            if shared_state is not None and (
+                shared_state.heartbeat_status == "CRITICAL"
+                or shared_state.last_delta_ms > settings.HEARTBEAT_CRITICAL_MS
+            ):
+                logger.warning("[Gate6] Heartbeat/latency critical — triggering safety exit")
+                if hasattr(order_manager, "handle_safety_exit"):
+                    await order_manager.handle_safety_exit("LATENCY_CRITICAL")
+                return
+
+            if hasattr(lob_engine, "get_snapshot"):
+                snap = await lob_engine.get_snapshot(depth=1)
+                if snap and snap.bids and snap.asks:
+                    best_bid = snap.bids[0].price
+                    best_ask = snap.asks[0].price
+                    mid = (best_bid + best_ask) / 2.0
+                    spread_bps = ((best_ask - best_bid) / mid * 10_000) if mid > 0 else 0.0
+                    if spread_bps > settings.MICRO_EXIT_SPREAD_HARD_CAP_BPS:
+                        logger.warning(
+                            "[Gate6] Spread %.1fbps > %.1fbps — triggering safety exit",
+                            spread_bps,
+                            settings.MICRO_EXIT_SPREAD_HARD_CAP_BPS,
+                        )
+                        if hasattr(order_manager, "handle_safety_exit"):
+                            await order_manager.handle_safety_exit("SPREAD_HARD_CAP")
+                        return
 
             walls = await lob_engine.get_current_walls()
             if not _wall_present(protection_wall_price, walls):
@@ -353,7 +386,12 @@ class StrategyExecutor:
             return
 
         # Gate 3 — capital
-        ok, reason = gate_3_capital(self._budget, self._risk_tier)
+        active_exposure = (
+            bool(self._order_manager.has_active_exposure())
+            if self._order_manager and hasattr(self._order_manager, "has_active_exposure")
+            else False
+        )
+        ok, reason = gate_3_capital(self._budget, self._risk_tier, active_exposure)
         if not ok:
             self._reject(rec, "GATE_3_FAIL", reason)
             return
@@ -458,6 +496,7 @@ class StrategyExecutor:
                     lob_engine=self._lob_engine,
                     order_manager=self._order_manager,
                     position_closed_event=position_closed_event,
+                    shared_state=self._state,
                     check_interval_ms=self._gate6_check_ms,
                 ),
                 name=f"gate6_persistence_{signal_id[:8]}",

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
+from config import settings
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry Rules
@@ -40,6 +42,11 @@ class EntryRules:
     sweep_qty_mult:   float = 2.0    # microstructure: sweep qty multiplier
     atr_mult_sl:      float = 1.5    # risk: ATR multiplier for stop-loss
     atr_mult_tp:      float = 3.0    # risk: ATR multiplier for take-profit
+    micro_price_move_floor_bps: float = settings.MICRO_PRICE_MOVE_FLOOR_BPS
+    micro_price_move_percentile: float = settings.MICRO_PRICE_MOVE_PERCENTILE
+    protection_max_distance_bps: float = settings.PROTECTION_MAX_DISTANCE_BPS
+    micro_max_hold_ms: int = settings.MICRO_MAX_HOLD_MS
+    micro_exit_spread_hard_cap_bps: float = settings.MICRO_EXIT_SPREAD_HARD_CAP_BPS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +128,11 @@ class StrategySpec:
             "sweep_qty_mult":        self.entry_rules.sweep_qty_mult,
             "atr_mult_sl":           self.entry_rules.atr_mult_sl,
             "atr_mult_tp":           self.entry_rules.atr_mult_tp,
+            "micro_price_move_floor_bps": self.entry_rules.micro_price_move_floor_bps,
+            "micro_price_move_percentile": self.entry_rules.micro_price_move_percentile,
+            "protection_max_distance_bps": self.entry_rules.protection_max_distance_bps,
+            "micro_max_hold_ms": self.entry_rules.micro_max_hold_ms,
+            "micro_exit_spread_hard_cap_bps": self.entry_rules.micro_exit_spread_hard_cap_bps,
             # Statistical validity
             "oos_trade_count":       self.validity.oos_trade_count,
             "sharpe_oos":            self.validity.sharpe_oos,
@@ -148,6 +160,19 @@ class StrategySpec:
                 sweep_qty_mult   = d.get("sweep_qty_mult",   2.0),
                 atr_mult_sl      = d.get("atr_mult_sl",      1.5),
                 atr_mult_tp      = d.get("atr_mult_tp",      3.0),
+                micro_price_move_floor_bps = d.get(
+                    "micro_price_move_floor_bps", settings.MICRO_PRICE_MOVE_FLOOR_BPS
+                ),
+                micro_price_move_percentile = d.get(
+                    "micro_price_move_percentile", settings.MICRO_PRICE_MOVE_PERCENTILE
+                ),
+                protection_max_distance_bps = d.get(
+                    "protection_max_distance_bps", settings.PROTECTION_MAX_DISTANCE_BPS
+                ),
+                micro_max_hold_ms = d.get("micro_max_hold_ms", settings.MICRO_MAX_HOLD_MS),
+                micro_exit_spread_hard_cap_bps = d.get(
+                    "micro_exit_spread_hard_cap_bps", settings.MICRO_EXIT_SPREAD_HARD_CAP_BPS
+                ),
             ),
             validity = StatisticalValidity(
                 oos_trade_count  = d.get("oos_trade_count",  0),

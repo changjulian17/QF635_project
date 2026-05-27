@@ -14,6 +14,7 @@ from __future__ import annotations
 import heapq
 import json
 import sqlite3
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator, Literal, Optional
@@ -38,6 +39,7 @@ from strategy.microstructure import (
     detect_absorption,
     detect_sweep_with_protection,
     identify_walls,
+    rolling_abs_move_threshold,
 )
 
 _CONSUMED_RATIO = 0.15      # pre-filter: skip walls still intact (mirrors live code)
@@ -122,6 +124,7 @@ class TickReplayEngine:
         self._last_day:          int   = -1
         self._prev_mid:          float = 0.0
         self._last_trade_price:  float = 0.0
+        self._abs_mid_history: deque[float] = deque(maxlen=settings.MICRO_PRICE_MOVE_WINDOW)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -217,6 +220,7 @@ class TickReplayEngine:
         self._last_day         = -1
         self._prev_mid         = 0.0
         self._last_trade_price = 0.0
+        self._abs_mid_history.clear()
         self.feature_history   = []
         # Reset FeatureComputer so OOS windows don't inherit IS distribution state.
         # CVD is not reset here — the midnight handler in _process_trade resets it at
@@ -237,7 +241,7 @@ class TickReplayEngine:
         self._prev_mid         = 0.0
         self._last_trade_price = 0.0
         self.feature_history   = []
-        # _fc intentionally NOT reset — IS warm-up state is preserved
+        # _fc and _abs_mid_history intentionally NOT reset — IS warm-up state is preserved
 
     # ── Event streaming ───────────────────────────────────────────────────────
 
@@ -371,6 +375,8 @@ class TickReplayEngine:
             asks           = [LOBLevel(price=p, qty=q) for p, q in ask_levels],
             last_update_id = 0,
         )
+        if self._prev_mid > 0:
+            self._abs_mid_history.append(abs((mid - self._prev_mid) / self._prev_mid))
         self._fc.update_orderbook(snap, wall_dicts)
         self._prev_mid = mid
 
@@ -417,6 +423,7 @@ class TickReplayEngine:
             (price - self._prev_mid) / self._prev_mid
             if self._prev_mid > 0 else 0.0
         )
+        price_move_threshold = rolling_abs_move_threshold(tuple(self._abs_mid_history))
         cvd_delta_1t = self._cvd.get_cvd_delta(1)
         cvd_std      = self._cvd.get_cvd_tick_std()
         cvd_spike_std = (
@@ -439,7 +446,13 @@ class TickReplayEngine:
                 if w.side == opposite
             ]
             fired, info = detect_sweep_with_protection(
-                ws, price_move_pct, cvd_spike_std, fresh_behind, now_ms=ts_ms
+                ws,
+                price_move_pct,
+                cvd_spike_std,
+                fresh_behind,
+                now_ms=ts_ms,
+                mid_price=self._prev_mid,
+                price_move_threshold=price_move_threshold,
             )
             if fired:
                 signal = MicroSignal(
