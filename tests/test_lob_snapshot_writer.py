@@ -189,6 +189,72 @@ async def test_lob_snapshot_writer_writes_when_synced():
 
 
 @pytest.mark.asyncio
+async def test_lob_snapshot_writer_broadcasts_when_hub_given():
+    """When a hub is supplied, each snapshot is broadcast with the expected payload keys."""
+    snapshot = _make_snapshot()
+    lob_engine = MagicMock()
+    lob_engine.lob_status = "SYNCED"
+    lob_engine.get_snapshot = AsyncMock(return_value=snapshot)
+    db_writer = MagicMock()
+    db_writer.write_lob_snapshot = AsyncMock()
+    cvd = MagicMock()
+    cvd.get_cvd_delta.return_value = 2.5
+    hub = MagicMock()
+    hub.broadcast = AsyncMock()
+
+    call_count = 0
+
+    async def fake_sleep(t):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise asyncio.CancelledError()
+
+    with patch("engine.lob_snapshot_writer.asyncio.sleep", fake_sleep):
+        try:
+            await lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0, hub=hub)
+        except asyncio.CancelledError:
+            pass
+
+    hub.broadcast.assert_awaited_once()
+    payload = hub.broadcast.await_args[0][0]
+    assert set(payload) == {
+        "ts", "mid_price", "spread", "obi", "cvd_delta", "bid_levels", "ask_levels"
+    }
+    assert payload["cvd_delta"] == 2.5
+    assert payload["bid_levels"][0] == [snapshot.bids[0].price, snapshot.bids[0].qty]
+
+
+@pytest.mark.asyncio
+async def test_lob_snapshot_writer_no_broadcast_without_hub():
+    """Without a hub the writer behaves exactly as before (no broadcast attempted)."""
+    snapshot = _make_snapshot()
+    lob_engine = MagicMock()
+    lob_engine.lob_status = "SYNCED"
+    lob_engine.get_snapshot = AsyncMock(return_value=snapshot)
+    db_writer = MagicMock()
+    db_writer.write_lob_snapshot = AsyncMock()
+    cvd = MagicMock()
+    cvd.get_cvd_delta.return_value = 1.0
+
+    call_count = 0
+
+    async def fake_sleep(t):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise asyncio.CancelledError()
+
+    with patch("engine.lob_snapshot_writer.asyncio.sleep", fake_sleep):
+        try:
+            await lob_snapshot_writer(lob_engine, cvd, db_writer, interval=0)
+        except asyncio.CancelledError:
+            pass
+
+    db_writer.write_lob_snapshot.assert_called_once()  # still writes to DB
+
+
+@pytest.mark.asyncio
 async def test_lob_snapshot_writer_tolerates_exception():
     """A transient exception should be logged and the loop should continue, not crash."""
     lob_engine = MagicMock()

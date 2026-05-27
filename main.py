@@ -32,6 +32,7 @@ from core.startup_reconciler import reconcile_on_startup
 from core.ws_consumer import BinanceWebSocketConsumer
 from engine.db_writer import DBWriter, init_db
 from engine.lob_snapshot_writer import lob_snapshot_writer as _lob_snapshot_writer
+from engine.realtime_hub import RealtimeHub
 from execution.order_manager import OrderManager
 from models import FillDetail, PortfolioState, SharedState
 from risk.budget import DailyBudget
@@ -185,6 +186,7 @@ async def _api_server(
     telemetry: SignalTelemetry,
     port: int,
     alert_dispatcher: AlertDispatcher | None = None,
+    hub: RealtimeHub | None = None,
 ) -> None:
     """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
 
@@ -230,10 +232,24 @@ async def _api_server(
         )
         return web.json_response({"fired": True})
 
+    async def _handle_ws_lob(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        if hub is not None:
+            hub.register(ws)
+        try:
+            async for _msg in ws:  # keep connection open; client never sends
+                pass
+        finally:
+            if hub is not None:
+                hub.unregister(ws)
+        return ws
+
     app = web.Application()
     app.router.add_get("/api/health", _handle_health)
     app.router.add_get("/api/portfolio", _handle_portfolio)
     app.router.add_post("/api/killswitch", _handle_killswitch)
+    app.router.add_get("/ws/lob", _handle_ws_lob)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -411,6 +427,9 @@ async def main() -> None:
     # 5. LOB warm-up guard ────────────────────────────────────────────────────
     await asyncio.sleep(0.5)
 
+    # Real-time broadcast hub — streams LOB snapshots to dashboard WS clients
+    realtime_hub = RealtimeHub()
+
     # 6. Start TaskGroup with all coroutines ──────────────────────────────────
     try:
         async with asyncio.TaskGroup() as tg:
@@ -437,14 +456,14 @@ async def main() -> None:
                 name="portfolio_mtm_loop",
             )
             tg.create_task(
-                _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer),
+                _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer, hub=realtime_hub),
                 name="lob_snapshot_writer",
             )
             tg.create_task(
                 _api_server(
                     killswitch, portfolio, shared_state,
                     order_manager, telemetry, settings.DASHBOARD_API_PORT,
-                    alert_dispatcher,
+                    alert_dispatcher, realtime_hub,
                 ),
                 name="api_server",
             )
