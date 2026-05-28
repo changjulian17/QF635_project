@@ -251,3 +251,70 @@ def test_dynamic_threshold_floor_and_warmed_percentile():
         min_samples=3,
     )
     assert threshold == pytest.approx(0.0004)
+
+
+# --- FeatureComputer injection ---
+
+def test_update_orderbook_called_when_feature_computer_injected():
+    import asyncio
+    from unittest.mock import MagicMock, AsyncMock, patch
+
+    fc = MagicMock()
+    detector = _make_detector(feature_computer=fc)
+
+    snapshot = {
+        "bids": [["30010.0", "1.0"], ["30005.0", "0.5"]],
+        "asks": [["30015.0", "0.8"], ["30020.0", "0.3"]],
+    }
+
+    asyncio.run(detector._process_snapshot(snapshot))
+    fc.update_orderbook.assert_called_once()
+    args = fc.update_orderbook.call_args
+    snap, wall_dicts = args[0]
+    assert snap.bids[0].price == pytest.approx(30010.0)
+    assert snap.asks[0].price == pytest.approx(30015.0)
+
+
+def test_absorption_batch_deduplicates_same_wall():
+    """Same wall price armed on two consecutive ticks produces a single batch entry."""
+    import asyncio
+    detector = _make_detector()
+
+    snapshot = {
+        "bids": [["30000.0", "1.0"], ["29990.0", "0.5"]],
+        "asks": [["30010.0", "0.8"]],
+    }
+
+    now = int(time.time() * 1000)
+    wall = WallState(
+        price=30000.0, qty_initial=50.0, qty_current=50.0,
+        first_seen_ts=now - 600, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    detector._wall_states[30000.0] = wall
+    detector._absorption_armed[30000.0] = True
+
+    # Arm the same wall twice by direct batch mutation (simulates two consecutive ticks)
+    detector._absorption_batch[wall.price] = wall
+    detector._absorption_batch[wall.price] = wall  # second tick — same key
+
+    assert len(detector._absorption_batch) == 1
+
+
+def _make_detector(feature_computer=None):
+    import asyncio
+    from strategy.microstructure import MicrostructureDetector
+    from unittest.mock import MagicMock
+
+    cvd = MagicMock()
+    cvd.get_cvd_delta.return_value = 0.0
+    cvd.get_cvd_tick_std.return_value = 0.0
+    cvd.is_warmed_up = False
+
+    return MicrostructureDetector(
+        depth_queue=asyncio.Queue(),
+        trade_queue=asyncio.Queue(),
+        signal_queue=asyncio.Queue(),
+        cvd_calculator=cvd,
+        feature_computer=feature_computer,
+    )

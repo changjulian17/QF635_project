@@ -58,12 +58,36 @@ close_terminal_window() {
 echo "=== CryptoSentinel shutdown ==="
 
 stop_process "LOB Recorder"   "core.lob_recorder"
-stop_process "Trading Engine" "python.*main\.py"
+ENGINE_PID_FILE="/tmp/cs_engine.pid"
+if [[ -f "$ENGINE_PID_FILE" ]]; then
+    engine_pid=$(cat "$ENGINE_PID_FILE")
+    if kill -0 "$engine_pid" 2>/dev/null; then
+        echo "  Stopping Trading Engine (PID: $engine_pid) ..."
+        kill -TERM "$engine_pid" 2>/dev/null || true
+        elapsed=0
+        while kill -0 "$engine_pid" 2>/dev/null; do
+            if (( elapsed >= GRACEFUL_TIMEOUT )); then
+                log_warn "Trading Engine — still alive after ${GRACEFUL_TIMEOUT}s, sending SIGKILL"
+                kill -KILL "$engine_pid" 2>/dev/null || true
+                break
+            fi
+            sleep 1
+            (( elapsed++ )) || true
+        done
+        log_ok "Trading Engine stopped"
+    else
+        log_warn "Trading Engine — not running (stale PID file)"
+    fi
+    rm -f "$ENGINE_PID_FILE"
+else
+    stop_process "Trading Engine" "python.*main\.py"
+fi
 stop_process "Dash Dashboard" "dashboard/app\.py"
 
 echo "Closing Terminal windows..."
 close_terminal_window "LOB Recorder"
 close_terminal_window "Trading Engine"
+close_terminal_window "Trading Engine (TESTNET)"
 close_terminal_window "Dash Dashboard"
 
 log_ok "Shutdown complete."

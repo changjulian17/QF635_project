@@ -90,3 +90,59 @@ def test_sr_no_breakout_in_range():
     vol_ratio = 2.0
     sig = d._check_sr_breakout(closes, highs, lows, atr, vol_ratio)
     assert sig is None
+
+
+# --- FeatureComputer injection ---
+
+def test_update_candle_called_when_feature_computer_injected():
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock
+    from models import Candle
+
+    fc = MagicMock()
+    d = PatternDetector(asyncio.Queue(), asyncio.Queue(), feature_computer=fc)
+
+    candle = Candle(
+        open_time=datetime.now(timezone.utc),
+        open=100.0, high=101.0, low=99.0, close=100.5,
+        volume=10.0, is_closed=True,
+    )
+
+    async def _run():
+        await d._candle_queue.put(candle)
+        # Drive one iteration: patch run() to exit after first candle
+        candle2 = Candle(
+            open_time=datetime.now(timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=100.5,
+            volume=10.0, is_closed=True,
+        )
+        await d._candle_queue.put(candle2)
+        # Manually replicate the first two run() iterations
+        c = await d._candle_queue.get()
+        if d._feature_computer is not None:
+            d._feature_computer.update_candle(c)
+        d._candles.append(c)
+
+    asyncio.run(_run())
+    fc.update_candle.assert_called_once_with(candle)
+
+
+def test_no_crash_when_feature_computer_is_none():
+    from datetime import datetime, timezone
+    from models import Candle
+
+    d = PatternDetector(asyncio.Queue(), asyncio.Queue())
+
+    async def _run():
+        candle = Candle(
+            open_time=datetime.now(timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=100.5,
+            volume=10.0, is_closed=True,
+        )
+        c = candle
+        if d._feature_computer is not None:
+            d._feature_computer.update_candle(c)
+        d._candles.append(c)
+
+    asyncio.run(_run())
+    assert len(d._candles) == 1

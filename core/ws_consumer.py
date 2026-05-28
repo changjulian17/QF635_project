@@ -104,6 +104,8 @@ class BinanceWebSocketConsumer:
         self._reconnect_delay = 1.0
         self._max_delay       = 60.0
         self.heartbeat        = HeartbeatMonitor()
+        self._frame_counts: dict[str, int] = {}
+        self._frame_log_ts: float = 0.0
 
         # Local order book for diff-depth reconstruction
         self._bid_book:       dict[float, float] = {}
@@ -173,13 +175,13 @@ class BinanceWebSocketConsumer:
             self._reconnect_delay = min(self._reconnect_delay * 2, self._max_delay)
 
     async def _receive_loop(self, ws) -> None:
-        conn_start = asyncio.get_event_loop().time()
+        conn_start = time.monotonic()
 
         while True:
             if not self._running:
                 break
 
-            if asyncio.get_event_loop().time() - conn_start > _MAX_CONNECTION_SECONDS:
+            if time.monotonic() - conn_start > _MAX_CONNECTION_SECONDS:
                 logger.info("[WS] Approaching 24 h limit — reconnecting proactively.")
                 await ws.close()
                 break
@@ -211,6 +213,16 @@ class BinanceWebSocketConsumer:
                     )
 
                 await self._dispatch(stream, msg)
+
+                label = stream.split("@", 1)[-1] if "@" in stream else stream
+                self._frame_counts[label] = self._frame_counts.get(label, 0) + 1
+                now = time.monotonic()
+                if now - self._frame_log_ts >= 10.0:
+                    total  = sum(self._frame_counts.values())
+                    detail = "  ".join(f"{k}:{v}" for k, v in sorted(self._frame_counts.items()))
+                    logger.info("[WS] %d frames/10s  (%s)", total, detail)
+                    self._frame_counts.clear()
+                    self._frame_log_ts = now
 
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning("[WS] Malformed message: %s", exc)

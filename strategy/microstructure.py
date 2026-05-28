@@ -12,10 +12,11 @@ import logging
 import statistics
 import time
 from collections import deque
+from datetime import datetime, timezone
 from typing import Optional
 
 from config import settings
-from models import AggTrade, MicroSignal, WallState
+from models import AggTrade, LOBLevel, LOBSnapshot, MicroSignal, WallState
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,7 @@ class MicrostructureDetector:
         cvd_calculator,
         sigma_threshold: float = 2.5,
         window: int = 5,
+        feature_computer=None,
     ) -> None:
         self._depth_queue  = depth_queue
         self._trade_queue  = trade_queue
@@ -242,11 +244,14 @@ class MicrostructureDetector:
         self._cvd          = cvd_calculator
         self._sigma        = sigma_threshold
         self._window       = window
+        self._feature_computer = feature_computer
 
         self._wall_states: dict[float, WallState] = {}
         self._absorption_armed: dict[float, bool] = {}  # keyed by wall price
         self._prev_mid: float = 0.0
         self._abs_mid_history: deque[float] = deque(maxlen=settings.MICRO_PRICE_MOVE_WINDOW)
+        self._absorption_batch: dict[float, WallState] = {}
+        self._absorption_last_log_ms: int = 0
 
     async def run(self) -> None:
         asyncio.create_task(self._collect_trades())
@@ -315,6 +320,19 @@ class MicrostructureDetector:
                 ws.qty_current  = book.get(price, 0.0)
                 ws.last_seen_ts = now_ms
 
+        if self._feature_computer is not None:
+            snap = LOBSnapshot(
+                timestamp      = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc),
+                bids           = [LOBLevel(price=p, qty=q) for p, q in bid_levels],
+                asks           = [LOBLevel(price=p, qty=q) for p, q in ask_levels],
+                last_update_id = 0,
+            )
+            wall_dicts = [
+                {"price": ws.price, "absorption_ratio": ws.reload_ratio}
+                for ws in self._wall_states.values()
+            ]
+            self._feature_computer.update_orderbook(snap, wall_dicts)
+
         # Absorption check — 3-tick delta reduces single-trade noise while staying
         # responsive enough to detect multi-trade aggression against a wall.
         price_move_pct   = (mid - self._prev_mid) / self._prev_mid if self._prev_mid > 0 else 0.0
@@ -323,10 +341,23 @@ class MicrostructureDetector:
         for ws in self._wall_states.values():
             if detect_absorption(ws, cvd_delta_3t, price_move_pct, ws.reload_ratio):
                 self._absorption_armed[ws.price] = True
-                logger.info(
-                    "[MS] Absorption armed price=%.2f side=%s reload=%.0f%%",
-                    ws.price, ws.side, ws.reload_ratio * 100,
-                )
+                self._absorption_batch[ws.price] = ws
+
+        if self._absorption_batch and now_ms - self._absorption_last_log_ms >= 1_000:
+            batch      = list(self._absorption_batch.values())
+            bid_walls  = [w for w in batch if w.side == "bid"]
+            ask_walls  = [w for w in batch if w.side == "ask"]
+            max_reload = max(batch, key=lambda w: w.reload_ratio)
+            prices     = [w.price for w in batch]
+            logger.info(
+                "[MS] Absorption: %d walls armed (%d bid / %d ask) | "
+                "max reload=%.0f%% @%.2f | range %.2f–%.2f",
+                len(batch), len(bid_walls), len(ask_walls),
+                max_reload.reload_ratio * 100, max_reload.price,
+                min(prices), max(prices),
+            )
+            self._absorption_batch = {}
+            self._absorption_last_log_ms = now_ms
 
         # Sweep + Protection check — 1-tick delta captures the momentary spike
         cvd_delta_1t  = self._cvd.get_cvd_delta(1)

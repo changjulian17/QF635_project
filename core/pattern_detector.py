@@ -2,12 +2,16 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.stats import linregress
 
 from config import settings
 from models import Candle, Direction, PatternSignal, PatternType
+
+if TYPE_CHECKING:
+    from strategy.features import FeatureComputer
 
 logger = logging.getLogger(__name__)
 
@@ -18,16 +22,20 @@ class PatternDetector:
         candle_queue: asyncio.Queue,
         signal_queue: asyncio.Queue,
         signal_db_queue: asyncio.Queue | None = None,
+        feature_computer: "FeatureComputer | None" = None,
     ) -> None:
         self._candle_queue = candle_queue
         self._signal_queue = signal_queue
         self._signal_db_queue = signal_db_queue
+        self._feature_computer = feature_computer
         self._candles: deque[Candle] = deque(maxlen=settings.PATTERN_LOOKBACK)
 
     async def run(self) -> None:
         logger.info("[Detector] Pattern detector started.")
         while True:
             candle: Candle = await self._candle_queue.get()
+            if self._feature_computer is not None:
+                self._feature_computer.update_candle(candle)
             self._candles.append(candle)
 
             if len(self._candles) < 20:

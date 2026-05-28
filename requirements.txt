@@ -19,9 +19,6 @@ scikit-learn>=1.5
 pyyaml>=6.0
 joblib>=1.4
 # Phase 3 — Dash dashboard
-# Upper bounds pin the Dash 2.x major the dashboard was built on — dash-extensions
-# 2.x force-upgrades to Dash 4 (breaking changes), so the WebSocket component is
-# pulled from the dash-extensions 1.x line instead.
-dash>=2.17,<3
-dash-bootstrap-components>=1.6,<2
+dash>=4.1,<5
+dash-bootstrap-components>=2.0,<3
 dash-extensions>=1.0,<2  # WebSocket component for real-time LOB streaming

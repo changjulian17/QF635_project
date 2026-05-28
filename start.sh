@@ -28,11 +28,21 @@ if [[ ! -f "$SCRIPT_DIR/.venv/bin/activate" ]]; then
     exit 1
 fi
 source "$SCRIPT_DIR/.venv/bin/activate"
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
 log_ok ".venv activated"
+
+# --- Pre-flight: already running? ---
+if [[ -f /tmp/cs_engine.pid ]]; then
+    _pid=$(cat /tmp/cs_engine.pid)
+    if kill -0 "$_pid" 2>/dev/null; then
+        log_err "Trading Engine is already running (PID $_pid). Run ./stop.sh first."
+        exit 1
+    fi
+fi
 
 # --- Pre-flight: connectivity test ---
 echo "Running connectivity test (scripts/test_connection.py)..."
-if ! python "$SCRIPT_DIR/scripts/test_connection.py"; then
+if ! "$PYTHON" "$SCRIPT_DIR/scripts/test_connection.py"; then
     log_err "Connectivity test failed. Check your .env credentials and network."
     exit 1
 fi
@@ -54,9 +64,9 @@ open_window() {
 }
 
 echo "Launching components..."
-open_window "LOB Recorder"    "python -m core.lob_recorder"
-open_window "Trading Engine"  "python main.py"
-open_window "Dash Dashboard"  "python dashboard/app.py"
+open_window "LOB Recorder"    "'$PYTHON' -m core.lob_recorder"
+open_window "Trading Engine"  "'$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Dash Dashboard"  "'$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""

@@ -60,6 +60,7 @@ _file_handler = RotatingFileHandler(
 _file_handler.setLevel(_LOG_LEVEL)
 _file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 logging.getLogger().addHandler(_file_handler)
+logging.getLogger("websockets").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -369,11 +370,13 @@ async def main() -> None:
         trade_queue=trade_queue,
         signal_queue=micro_signal_queue,
         cvd_calculator=cvd_calculator,
+        feature_computer=feature_computer,
     )
     pattern_detector = PatternDetector(
         candle_queue=candle_queue,
         signal_queue=signal_queue,
         signal_db_queue=signal_db_queue,
+        feature_computer=feature_computer,
     )
     telemetry = SignalTelemetry(telemetry_queue=telemetry_queue)
 
