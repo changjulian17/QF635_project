@@ -7,6 +7,8 @@ from strategy.microstructure import (
     detect_absorption,
     detect_sweep_with_protection,
     identify_walls,
+    price_move_floor_pct,
+    rolling_abs_move_threshold,
 )
 from models import WallState
 
@@ -134,19 +136,19 @@ def _fresh_ask_wall() -> WallState:
 
 def test_sweep_with_protection_fires():
     consumed = _wall(side="ask", qty_initial=50.0, qty_current=5.0, age_ms=600)
-    fresh    = [_fresh_ask_wall()]
     # Replace with bid protection wall for long sweep
     now = int(time.time() * 1000)
     bid_wall = WallState(
-        price=29900.0, qty_initial=30.0, qty_current=30.0,
+        price=29995.0, qty_initial=30.0, qty_current=30.0,
         first_seen_ts=now - 500, last_seen_ts=now,
         side="bid", sigma=3.0,
     )
     fired, info = detect_sweep_with_protection(
         wall_consumed      = consumed,
         price_move_pct     = 0.0005,   # > 0.03%
-        cvd_spike_std      = 2.0,      # > 1.5σ
+        cvd_spike_std      = 0.1,      # telemetry only; no entry gate
         fresh_walls_behind = [bid_wall],
+        mid_price          = 30005.0,
     )
     assert fired is True
     assert info["direction"] == "LONG"
@@ -168,27 +170,27 @@ def test_sweep_without_protection_does_not_fire():
 def test_sweep_requires_all_four_conditions():
     now = int(time.time() * 1000)
     protection = WallState(
-        price=29900.0, qty_initial=30.0, qty_current=30.0,
+        price=29995.0, qty_initial=30.0, qty_current=30.0,
         first_seen_ts=now - 500, last_seen_ts=now,
         side="bid", sigma=3.0,
     )
 
     # Not consumed (reload_ratio = 0.90)
     not_consumed = _wall(side="ask", qty_initial=50.0, qty_current=45.0, age_ms=600)
-    fired, _ = detect_sweep_with_protection(not_consumed, 0.0005, 2.0, [protection])
+    fired, _ = detect_sweep_with_protection(not_consumed, 0.0005, 2.0, [protection], mid_price=30005.0)
     assert fired is False
 
     # Price did not move enough
     consumed = _wall(side="ask", qty_initial=50.0, qty_current=5.0, age_ms=600)
-    fired, _ = detect_sweep_with_protection(consumed, 0.00001, 2.0, [protection])
+    fired, _ = detect_sweep_with_protection(consumed, 0.00001, 2.0, [protection], mid_price=30005.0)
     assert fired is False
 
-    # CVD spike too small
-    fired, _ = detect_sweep_with_protection(consumed, 0.0005, 0.5, [protection])
-    assert fired is False
+    # CVD spike is telemetry only and must not block entry.
+    fired, _ = detect_sweep_with_protection(consumed, 0.0005, 0.0, [protection], mid_price=30005.0)
+    assert fired is True
 
     # All conditions met
-    fired, _ = detect_sweep_with_protection(consumed, 0.0005, 2.0, [protection])
+    fired, _ = detect_sweep_with_protection(consumed, 0.0005, 2.0, [protection], mid_price=30005.0)
     assert fired is True
 
 
@@ -196,7 +198,7 @@ def test_sweep_direction_short_from_bid_wall():
     now = int(time.time() * 1000)
     consumed_bid = _wall(side="bid", qty_initial=50.0, qty_current=5.0, age_ms=600)
     ask_protection = WallState(
-        price=30100.0, qty_initial=30.0, qty_current=30.0,
+        price=30005.0, qty_initial=30.0, qty_current=30.0,
         first_seen_ts=now - 500, last_seen_ts=now,
         side="ask", sigma=3.0,
     )
@@ -205,6 +207,47 @@ def test_sweep_direction_short_from_bid_wall():
         price_move_pct=-0.0005,
         cvd_spike_std=2.0,
         fresh_walls_behind=[ask_protection],
+        mid_price=29995.0,
     )
     assert fired is True
     assert info["direction"] == "SHORT"
+
+
+def test_sweep_rejects_wrong_signed_price_move():
+    now = int(time.time() * 1000)
+    consumed_ask = _wall(side="ask", qty_initial=50.0, qty_current=5.0, age_ms=600)
+    bid_protection = WallState(
+        price=29995.0, qty_initial=30.0, qty_current=30.0,
+        first_seen_ts=now - 500, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    fired, _ = detect_sweep_with_protection(
+        consumed_ask, -0.0005, 5.0, [bid_protection], mid_price=30005.0
+    )
+    assert fired is False
+
+
+def test_sweep_rejects_far_protection_wall():
+    now = int(time.time() * 1000)
+    consumed_ask = _wall(side="ask", qty_initial=50.0, qty_current=5.0, age_ms=600)
+    far_bid = WallState(
+        price=29900.0, qty_initial=30.0, qty_current=30.0,
+        first_seen_ts=now - 500, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    fired, _ = detect_sweep_with_protection(
+        consumed_ask, 0.0005, 5.0, [far_bid], mid_price=30005.0
+    )
+    assert fired is False
+
+
+def test_dynamic_threshold_floor_and_warmed_percentile():
+    floor = price_move_floor_pct()
+    assert rolling_abs_move_threshold([0.01], floor_pct=floor, min_samples=3) == pytest.approx(floor)
+    threshold = rolling_abs_move_threshold(
+        [0.0001, 0.0002, 0.0004, 0.0010],
+        floor_pct=floor,
+        percentile=0.75,
+        min_samples=3,
+    )
+    assert threshold == pytest.approx(0.0004)

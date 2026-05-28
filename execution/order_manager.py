@@ -124,6 +124,8 @@ class OrderManager:
         #                           _place_oco reads it on completion and cancels.
         self._placing_oco:            bool = False
         self._cancel_oco_on_placement: bool = False
+        self._entry_in_flight:          bool = False
+        self._emergency_close_in_progress: bool = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -185,26 +187,55 @@ class OrderManager:
                     "[Exec] Killswitch active — discarding signal %s", req.signal_id[:8]
                 )
                 continue
+            if self.has_active_exposure():
+                logger.warning(
+                    "[Exec] Active exposure — discarding signal %s", req.signal_id[:8]
+                )
+                continue
             await self._submit(req)
 
     # ── Core submission ───────────────────────────────────────────────────────
 
+    def _has_active_exposure_locked(self) -> bool:
+        return (
+            self._entry_in_flight
+            or self._emergency_close_in_progress
+            or self._placing_oco
+            or self._open_position_side is not None
+            or self._open_position_qty > 0.0
+        )
+
+    def has_active_exposure(self) -> bool:
+        """Return True when a microstructure entry/position/close is active."""
+        return self._has_active_exposure_locked()
+
     async def _submit(self, req: MicroOrderRequest) -> None:
-        book = await self._resolve_book()
-        if book is None:
-            logger.warning(
-                "[Exec] Could not resolve order book — skipping %s", req.signal_id[:8]
-            )
-            return
-        best_bid, best_ask = book
+        async with self._position_lock:
+            if self._has_active_exposure_locked():
+                logger.warning(
+                    "[Exec] Active exposure at submit — skipping %s", req.signal_id[:8]
+                )
+                return
+            self._entry_in_flight = True
+        try:
+            book = await self._resolve_book()
+            if book is None:
+                logger.warning(
+                    "[Exec] Could not resolve order book — skipping %s", req.signal_id[:8]
+                )
+                return
+            best_bid, best_ask = book
 
-        resp = await self._submit_aggressive_limit(req, req.side, best_bid, best_ask)
-        if resp is None:
-            return
+            resp = await self._submit_aggressive_limit(req, req.side, best_bid, best_ask)
+            if resp is None:
+                return
 
-        fill_price = _weighted_avg_fill(resp)
-        fill_qty   = float(resp.get("executedQty", 0))
-        await self._place_oco(req, fill_price, fill_qty, req.side)
+            fill_price = _weighted_avg_fill(resp)
+            fill_qty   = float(resp.get("executedQty", 0))
+            await self._place_oco(req, fill_price, fill_qty, req.side)
+        finally:
+            async with self._position_lock:
+                self._entry_in_flight = False
 
     async def _resolve_book(self) -> tuple[float, float] | None:
         """
@@ -354,6 +385,7 @@ class OrderManager:
                     "[Exec] fill_queue full — FillDetail dropped for %s", req.signal_id[:8]
                 )
             req.fill_event.set()
+            self._entry_in_flight            = False
             self._open_position_side         = side
             self._open_position_qty          = fill_qty
             self._open_position_closed_event = req.position_closed_event
@@ -653,7 +685,9 @@ class OrderManager:
 
     # ── Gate 6 callback ───────────────────────────────────────────────────────
 
-    async def handle_protection_wall_removed(self, position_side: str) -> None:
+    async def handle_protection_wall_removed(
+        self, position_side: str, reason: str = "WALL_REMOVED"
+    ) -> None:
         """
         Called by PersistenceMonitor (Gate 6) when the protection wall is no
         longer in the book.
@@ -668,7 +702,7 @@ class OrderManager:
           position_closed_event is set ONLY on a confirmed exit fill.
         """
         logger.warning(
-            "[Exec] Gate6 alert — protection wall removed (side=%s)", position_side
+            "[Exec] Gate6 alert — %s (side=%s)", reason, position_side
         )
 
         async with self._position_lock:
@@ -712,7 +746,9 @@ class OrderManager:
         # S2 — fire position_closed_event only on confirmed fill.
         closed, close_p = False, 0.0
         if side and qty > 0:
-            closed, close_p = await self._emergency_close(qty, side, reason="WALL_REMOVED")
+            async with self._position_lock:
+                self._emergency_close_in_progress = True
+            closed, close_p = await self._emergency_close(qty, side, reason=reason)
 
         async with self._position_lock:
             sig_id = self._open_signal_id
@@ -730,6 +766,13 @@ class OrderManager:
                 "position_closed_event NOT set; manual intervention required"
             )
 
+    async def handle_safety_exit(self, reason: str) -> None:
+        """Cancel the active OCO and aggressively close for a safety condition."""
+        async with self._position_lock:
+            side = self._open_position_side
+        position_side = "LONG" if side == "BUY" else "SHORT" if side == "SELL" else "UNKNOWN"
+        await self.handle_protection_wall_removed(position_side, reason=f"SAFETY_{reason}")
+
     def _reset_open_position(self) -> None:
         """Must be called under _position_lock."""
         if self._oco_watcher_task and not self._oco_watcher_task.done():
@@ -744,6 +787,8 @@ class OrderManager:
         self._open_entry_time             = 0.0
         self._placing_oco                 = False
         self._cancel_oco_on_placement     = False
+        self._entry_in_flight             = False
+        self._emergency_close_in_progress = False
 
     # ── Killswitch hard stop ──────────────────────────────────────────────────
 
@@ -797,6 +842,8 @@ class OrderManager:
             except Exception as exc:
                 logger.error("[Exec] force_close_all: OCO cancel failed: %s", exc)
 
+        async with self._position_lock:
+            self._emergency_close_in_progress = True
         closed, close_p = await self._emergency_close(qty, side, reason)
 
         async with self._position_lock:

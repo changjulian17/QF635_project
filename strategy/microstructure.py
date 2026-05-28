@@ -11,17 +11,82 @@ import asyncio
 import logging
 import statistics
 import time
+from collections import deque
 from typing import Optional
 
+from config import settings
 from models import AggTrade, MicroSignal, WallState
 
 logger = logging.getLogger(__name__)
 
 _CONSUMED_RATIO   = 0.15     # wall qty below this fraction of initial → consumed
-_PRICE_MOVE_THRESH = 0.0003  # 0.03% price move required for sweep
-_CVD_SPIKE_STD    = 1.5      # CVD must spike > 1.5σ
 _FRESH_WALL_MS    = 3_000    # protection wall must appear within 3 s
 _STALE_WALL_MS    = 30_000   # prune wall states not seen for 30 s
+
+
+def price_move_floor_pct(floor_bps: float | None = None) -> float:
+    """Convert a bps threshold to decimal return units."""
+    bps = settings.MICRO_PRICE_MOVE_FLOOR_BPS if floor_bps is None else floor_bps
+    return bps / 10_000.0
+
+
+def rolling_abs_move_threshold(
+    abs_returns: list[float] | tuple[float, ...],
+    floor_pct: float | None = None,
+    percentile: float | None = None,
+    min_samples: int | None = None,
+) -> float:
+    """Causal hybrid threshold: rolling absolute-return percentile with a hard floor."""
+    floor = price_move_floor_pct() if floor_pct is None else floor_pct
+    pct = settings.MICRO_PRICE_MOVE_PERCENTILE if percentile is None else percentile
+    minimum = settings.MICRO_PRICE_MOVE_MIN_SAMPLES if min_samples is None else min_samples
+    if len(abs_returns) < minimum:
+        return floor
+    ordered = sorted(abs_returns)
+    idx = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * pct)))
+    return max(floor, ordered[idx])
+
+
+def valid_protection_walls(
+    wall_consumed: WallState,
+    price_move_pct: float,
+    fresh_walls_behind: list[WallState],
+    mid_price: float,
+    now_ms: int,
+    max_distance_bps: float | None = None,
+) -> tuple[str | None, list[WallState]]:
+    """
+    Return the implied direction and fresh protection walls that are truly behind
+    the breakout. CVD is intentionally absent from this decision.
+    """
+    if wall_consumed.side == "ask":
+        direction = "LONG"
+        if price_move_pct <= 0.0:
+            return None, []
+        required_side = "bid"
+        def is_behind(w: WallState) -> bool:
+            return w.price < mid_price and w.price < wall_consumed.price
+    elif wall_consumed.side == "bid":
+        direction = "SHORT"
+        if price_move_pct >= 0.0:
+            return None, []
+        required_side = "ask"
+        def is_behind(w: WallState) -> bool:
+            return w.price > mid_price and w.price > wall_consumed.price
+    else:
+        return None, []
+
+    max_bps = settings.PROTECTION_MAX_DISTANCE_BPS if max_distance_bps is None else max_distance_bps
+    valid = [
+        w for w in fresh_walls_behind
+        if w.side == required_side
+        and (now_ms - w.first_seen_ts) <= _FRESH_WALL_MS
+        and mid_price > 0.0
+        and abs(w.price - mid_price) / mid_price * 10_000 <= max_bps
+        and is_behind(w)
+    ]
+    valid.sort(key=lambda w: abs(w.price - mid_price))
+    return direction, valid
 
 
 # ── Pure detection functions ──────────────────────────────────────────────────
@@ -79,7 +144,7 @@ def detect_absorption(
       2. Directional aggression against the wall:
            bid wall → sellers aggressing (cvd_delta_1t < 0)
            ask wall → buyers aggressing  (cvd_delta_1t > 0)
-      3. Price barely moved (|price_move_pct| < 0.03%)
+      3. Price barely moved (|price_move_pct| < configured floor)
       4. Wall has reloaded to >= 70% of initial qty
     """
     if wall.side == "bid":
@@ -90,7 +155,7 @@ def detect_absorption(
     return (
         wall.is_persistent
         and directional_aggression
-        and abs(price_move_pct) < _PRICE_MOVE_THRESH
+        and abs(price_move_pct) < price_move_floor_pct()
         and reload_ratio >= 0.70
     )
 
@@ -101,13 +166,15 @@ def detect_sweep_with_protection(
     cvd_spike_std: float,
     fresh_walls_behind: list[WallState],
     now_ms: Optional[int] = None,
+    mid_price: Optional[float] = None,
+    price_move_threshold: Optional[float] = None,
+    max_protection_distance_bps: Optional[float] = None,
 ) -> tuple[bool, dict]:
     """
-    Return (True, signal_info) when all four sweep+protection conditions are met:
+    Return (True, signal_info) when all sweep+protection conditions are met:
       1. Wall consumed — qty_current < 15% of qty_initial
-      2. Price moved > 0.03% in the sweep direction
-      3. CVD spike > 1.5σ
-      4. Fresh Wall appeared on the far side within 3 s
+      2. Price moved beyond the threshold in the sweep direction
+      3. Fresh Wall appeared on the far side within 3 s
 
     now_ms : override the current timestamp (ms epoch). When None, uses
              time.time(). Pass the replay event timestamp for backtesting so
@@ -115,26 +182,35 @@ def detect_sweep_with_protection(
 
     Returns (False, {}) if any condition fails.
     """
-    consumed    = wall_consumed.reload_ratio < _CONSUMED_RATIO
-    price_moved = abs(price_move_pct) > _PRICE_MOVE_THRESH
-    cvd_spike   = cvd_spike_std > _CVD_SPIKE_STD
-
     _now = now_ms if now_ms is not None else int(time.time() * 1000)
-    fresh_list = [
-        w for w in fresh_walls_behind
-        if (_now - w.first_seen_ts) <= _FRESH_WALL_MS
-    ]
-    has_protection = len(fresh_list) > 0
+    consumed = wall_consumed.reload_ratio < _CONSUMED_RATIO
+    threshold = price_move_floor_pct() if price_move_threshold is None else price_move_threshold
+    effective_mid = mid_price if mid_price is not None else wall_consumed.price
+    direction, fresh_list = valid_protection_walls(
+        wall_consumed,
+        price_move_pct,
+        fresh_walls_behind,
+        effective_mid,
+        _now,
+        max_distance_bps=max_protection_distance_bps,
+    )
+    price_moved = (
+        price_move_pct >= threshold
+        if direction == "LONG"
+        else price_move_pct <= -threshold
+        if direction == "SHORT"
+        else False
+    )
 
-    if consumed and price_moved and cvd_spike and has_protection:
-        newest = min(fresh_list, key=lambda w: _now - w.first_seen_ts)
-        direction = "LONG" if wall_consumed.side == "ask" else "SHORT"
+    if consumed and price_moved and fresh_list and direction:
+        protection = fresh_list[0]
         return True, {
             "direction": direction,
             "consumed_wall": wall_consumed,
-            "protection_wall": newest,
+            "protection_wall": protection,
             "price_move_pct": price_move_pct,
             "cvd_spike_std": cvd_spike_std,
+            "price_move_threshold": threshold,
         }
 
     return False, {}
@@ -172,6 +248,7 @@ class MicrostructureDetector:
         self._wall_states: dict[float, WallState] = {}
         self._absorption_armed: dict[float, bool] = {}  # keyed by wall price
         self._prev_mid: float = 0.0
+        self._abs_mid_history: deque[float] = deque(maxlen=settings.MICRO_PRICE_MOVE_WINDOW)
 
     async def run(self) -> None:
         asyncio.create_task(self._collect_trades())
@@ -243,6 +320,7 @@ class MicrostructureDetector:
         # Absorption check — 3-tick delta reduces single-trade noise while staying
         # responsive enough to detect multi-trade aggression against a wall.
         price_move_pct   = (mid - self._prev_mid) / self._prev_mid if self._prev_mid > 0 else 0.0
+        price_move_threshold = rolling_abs_move_threshold(tuple(self._abs_mid_history))
         cvd_delta_3t     = self._cvd.get_cvd_delta(3)
         for ws in self._wall_states.values():
             if detect_absorption(ws, cvd_delta_3t, price_move_pct, ws.reload_ratio):
@@ -263,7 +341,13 @@ class MicrostructureDetector:
                 if w.side == opposite and (now_ms - w.first_seen_ts) <= _FRESH_WALL_MS
             ]
             fired, info = detect_sweep_with_protection(
-                ws, price_move_pct, cvd_spike_std, fresh_behind
+                ws,
+                price_move_pct,
+                cvd_spike_std,
+                fresh_behind,
+                now_ms=now_ms,
+                mid_price=mid,
+                price_move_threshold=price_move_threshold,
             )
             if fired:
                 signal = MicroSignal(
@@ -290,5 +374,6 @@ class MicrostructureDetector:
         for p in stale:
             del self._wall_states[p]
             self._absorption_armed.pop(p, None)
+        if self._prev_mid > 0:
+            self._abs_mid_history.append(abs(price_move_pct))
         self._prev_mid = mid
-

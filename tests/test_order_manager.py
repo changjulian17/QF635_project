@@ -642,3 +642,96 @@ async def test_watch_oco_continues_polling_while_executing():
 
     assert call_count == 2
     assert closed_event.is_set()
+
+
+# ── 23. Active exposure guard ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_active_exposure_blocks_second_submit():
+    """A second signal cannot overwrite an already tracked open position."""
+    om, _, fill_q, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
+    om._open_position_side = "BUY"
+    om._open_position_qty = 0.001
+
+    with patch.object(settings, "DRY_RUN", True):
+        await om._submit(_make_req("LONG"))
+
+    assert fill_q.empty()
+    assert om._open_position_side == "BUY"
+    assert om._open_position_qty == pytest.approx(0.001)
+
+
+@pytest.mark.asyncio
+async def test_entry_in_flight_clears_after_unfilled_entry():
+    """Rejected/unfilled entries must release the in-flight exposure guard."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
+    om._client = AsyncMock()
+    om._client.create_order = AsyncMock(
+        return_value={"orderId": "999", "status": "EXPIRED", "executedQty": "0"}
+    )
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om._submit(_make_req("LONG"))
+
+    assert not om.has_active_exposure()
+
+
+@pytest.mark.asyncio
+async def test_natural_oco_close_clears_active_exposure():
+    om, _, _, _ = _make_manager()
+    closed_event = asyncio.Event()
+    om._open_signal_id = "sig-clear"
+    om._open_entry_price = 95_000.0
+    om._open_entry_time = time.monotonic()
+    om._open_position_side = "BUY"
+    om._open_position_qty = 0.001
+    om._open_position_closed_event = closed_event
+
+    om._client = AsyncMock()
+    om._client.get_oco_order = AsyncMock(return_value={
+        "listStatusType": "ALL_DONE",
+        "orders": [{"orderId": 42}],
+    })
+    om._client.get_order = AsyncMock(return_value={
+        "executedQty": "0.001",
+        "avgPrice": "96_000.0".replace("_", ""),
+    })
+
+    await om._watch_oco_outcome(
+        oco_list_id=123, signal_id="sig-clear",
+        entry_side="BUY", entry_price=95_000.0, fill_qty=0.001,
+        entry_time=time.monotonic(),
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    )
+
+    assert closed_event.is_set()
+    assert not om.has_active_exposure()
+
+
+@pytest.mark.asyncio
+async def test_safety_exit_cancels_oco_and_emergency_closes():
+    om, _, _, _ = _make_manager()
+    closed_event = asyncio.Event()
+    om._open_position_side = "BUY"
+    om._open_position_qty = 0.001
+    om._open_position_closed_event = closed_event
+    om._open_oco_list_id = 77
+    om._open_signal_id = "sig-safety"
+    om._open_entry_price = 95_000.0
+    om._open_entry_time = time.monotonic()
+    om._client = AsyncMock()
+    om._client.delete_oco_order = AsyncMock()
+
+    emergency_reasons = []
+    async def confirmed_close(qty, entry_side, reason):
+        emergency_reasons.append(reason)
+        return True, 94_900.0
+    om._emergency_close = confirmed_close
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om.handle_safety_exit("MAX_HOLD")
+
+    om._client.delete_oco_order.assert_called_once()
+    assert emergency_reasons == ["SAFETY_MAX_HOLD"]
+    assert closed_event.is_set()
+    assert not om.has_active_exposure()

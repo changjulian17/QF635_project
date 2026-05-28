@@ -42,6 +42,7 @@ from risk.pyramid import PyramidController
 from strategy.executor import StrategyExecutor
 from strategy.features import FeatureComputer
 from strategy.microstructure import MicrostructureDetector
+from strategy.registry import StrategyRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -363,6 +364,19 @@ async def main() -> None:
     )
     telemetry = SignalTelemetry(telemetry_queue=telemetry_queue)
 
+    # Resolve active registered strategy so strategy_id and entry_rules can be
+    # passed into StrategyExecutor. Falls back to defaults when no spec is registered.
+    _registry     = StrategyRegistry(db_path=settings.REGISTRY_DB)
+    _active_spec  = _registry.get_active_strategy()
+    _strategy_id  = _active_spec.strategy_id if _active_spec else "v3.0"
+    if _active_spec:
+        logger.info(
+            "[Main] Active strategy: %s v%d (%s)", _active_spec.name,
+            _active_spec.version, _active_spec.status,
+        )
+    else:
+        logger.warning("[Main] No registered strategy found — using default strategy_id and EntryRules")
+
     # OrderManager constructed first so its reference can be injected into StrategyExecutor
     order_manager = OrderManager(
         signal_queue=om_queue,
@@ -383,7 +397,10 @@ async def main() -> None:
         cvd_calculator=cvd_calculator,
         lob_engine=lob_engine,
         order_manager=order_manager,
+        strategy_id=_strategy_id,
     )
+    if _active_spec:
+        strategy_executor.set_entry_rules(_active_spec.entry_rules)
     risk_engine = RiskEngine(
         signal_queue=signal_queue,
         order_queue=re_order_queue,

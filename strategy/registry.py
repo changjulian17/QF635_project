@@ -25,6 +25,7 @@ from typing import Optional
 
 import yaml
 
+from core.signal_telemetry import _ensure_signal_records_schema
 from strategy.spec import EntryRules, StatisticalValidity, StrategySpec
 
 _STATUS_RANK = {"RESEARCH": 0, "BACKTEST": 1, "PAPER": 2, "LIVE": 3}
@@ -77,6 +78,7 @@ class StrategyRegistry:
                     UNIQUE (name, version)
                 )
             """)
+            _ensure_signal_records_schema(conn)
 
     def _yaml_path(self, name: str, version: int) -> str:
         safe_name = name.replace(" ", "_").replace("/", "_")

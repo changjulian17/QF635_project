@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     BOOK_FLIP_MIN_CONSUMED: float = 0.30 # max fraction consumed before cancellation is inferred
     BOOK_FLIP_AGG_RATIO: float = 0.50    # min aggression vol (as fraction of mean_qty) to confirm flip
     BREAK_MIN_VOL: float = 1.0           # min absolute buy/sell volume to register a breakout
+    MICRO_PRICE_MOVE_FLOOR_BPS: float = 3.0
+    MICRO_PRICE_MOVE_WINDOW: int = 300
+    MICRO_PRICE_MOVE_PERCENTILE: float = 0.90
+    MICRO_PRICE_MOVE_MIN_SAMPLES: int = 50
+    PROTECTION_MAX_DISTANCE_BPS: float = 25.0
+    MICRO_MAX_HOLD_MS: int = 60_000
+    MICRO_EXIT_SPREAD_HARD_CAP_BPS: float = 12.0
 
     # Heartbeat monitor (§4)
     HEARTBEAT_WARN_MS: int = 200
@@ -111,6 +118,20 @@ class Settings(BaseSettings):
             f"KELLY_FRACTION ({self.KELLY_FRACTION}) must be in (0.0, 0.5]"
         assert self.ATR_MULTIPLIER_TP > self.ATR_MULTIPLIER_SL, \
             f"ATR_MULTIPLIER_TP ({self.ATR_MULTIPLIER_TP}) must be > ATR_MULTIPLIER_SL ({self.ATR_MULTIPLIER_SL})"
+        assert self.MICRO_PRICE_MOVE_FLOOR_BPS > 0.0, \
+            "MICRO_PRICE_MOVE_FLOOR_BPS must be > 0"
+        assert self.MICRO_PRICE_MOVE_WINDOW > 0, \
+            "MICRO_PRICE_MOVE_WINDOW must be > 0"
+        assert 0.0 < self.MICRO_PRICE_MOVE_PERCENTILE < 1.0, \
+            "MICRO_PRICE_MOVE_PERCENTILE must be in (0, 1)"
+        assert 0 < self.MICRO_PRICE_MOVE_MIN_SAMPLES <= self.MICRO_PRICE_MOVE_WINDOW, \
+            "MICRO_PRICE_MOVE_MIN_SAMPLES must be in [1, MICRO_PRICE_MOVE_WINDOW]"
+        assert self.PROTECTION_MAX_DISTANCE_BPS > 0.0, \
+            "PROTECTION_MAX_DISTANCE_BPS must be > 0"
+        assert self.MICRO_MAX_HOLD_MS > 0, \
+            "MICRO_MAX_HOLD_MS must be > 0"
+        assert self.MICRO_EXIT_SPREAD_HARD_CAP_BPS > 0.0, \
+            "MICRO_EXIT_SPREAD_HARD_CAP_BPS must be > 0"
         return self
 
 

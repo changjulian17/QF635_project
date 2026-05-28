@@ -61,10 +61,10 @@ def update_walls_chart(n, window_min, half_range, contrast_pctile):
         return _empty_fig("Waiting for data…")
 
     cdf = pd.DataFrame(candles)
-    cdf["open_time"] = pd.to_datetime(cdf["open_time"], utc=True)
+    cdf["open_time"] = pd.to_datetime(cdf["open_time"], format="ISO8601", utc=True)
 
     sdf = pd.DataFrame(snapshots)
-    sdf["ts"] = pd.to_datetime(sdf["ts"], utc=True)
+    sdf["ts"] = pd.to_datetime(sdf["ts"], format="ISO8601", utc=True)
 
     # VWAP must be computed before clipping so the rolling window has full history
     cdf["vwap"] = (

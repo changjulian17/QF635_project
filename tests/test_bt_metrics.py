@@ -151,3 +151,28 @@ def test_buy_and_hold_benchmark_metrics():
     assert m.total_return_pct > 0.0
     assert m.annualised_return_pct > 0.0
     assert m.max_drawdown_pct == 0.0      # no drawdown on rising curve
+
+
+def test_sortino_cap_proportional_to_sharpe():
+    """
+    M4: when there are no downside days, Sortino must be capped at
+    min(3 × |Sharpe|, 10.0), not a flat 10.0.
+    Uses a curve with variance (so Sharpe is computable) but no days
+    below the risk-free rate (so down_std = 0 and the cap is applied).
+    """
+    # Vary returns so std > 0 (needed for a nonzero Sharpe), but keep every
+    # return well above rfr_daily (~0.014%/day) so down_std stays zero.
+    returns = [0.005 if i % 3 != 0 else 0.010 for i in range(59)]
+    equity  = _make_equity(returns)
+    trades  = [_trade(500.0)] * 25
+
+    m = calculate_metrics(equity, trades)
+
+    assert m.sharpe_ratio > 0, (
+        f"Sharpe must be positive for a rising equity curve, got {m.sharpe_ratio}"
+    )
+    expected_cap = min(3.0 * abs(m.sharpe_ratio), 10.0)
+    assert abs(m.sortino_ratio - expected_cap) < 1e-6, (
+        f"Sortino={m.sortino_ratio:.4f} expected cap={expected_cap:.4f} "
+        f"(Sharpe={m.sharpe_ratio:.4f})"
+    )

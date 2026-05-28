@@ -23,6 +23,7 @@ from core.cvd import WelfordOnline
 from core.signal_telemetry import SignalRecord
 from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState
 from risk.engine import TIER_MIN_CONFIDENCE, TIER_SCALARS
+from strategy.spec import EntryRules
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,9 @@ def gate_2_confidence(
     return True, "", score
 
 
-def gate_3_capital(budget, tier: str) -> tuple[bool, str]:
+def gate_3_capital(budget, tier: str, active_exposure: bool = False) -> tuple[bool, str]:
+    if active_exposure:
+        return False, "active microstructure exposure"
     if tier in ("HALTED", "PASSIVE"):
         return False, f"risk tier {tier} — no new entries"
     if budget is not None and budget.remaining <= 0:
@@ -78,7 +81,10 @@ def gate_3_capital(budget, tier: str) -> tuple[bool, str]:
 def gate_4_order_selection(
     spread_bps: float,
     spread_p95: float,
+    spread_hard_cap_bps: float = 8.0,
 ) -> tuple[bool, str, str]:
+    if spread_bps > spread_hard_cap_bps:
+        return False, f"spread {spread_bps:.1f}bps > hard cap {spread_hard_cap_bps:.1f}bps", ""
     if spread_bps > spread_p95 * 2:
         return False, f"spread {spread_bps:.1f}bps > 2×p95 {spread_p95:.1f}bps", ""
     order_type = "IOC_LIMIT"
@@ -102,26 +108,26 @@ def gate_5_execution_sync(
 class RuleBasedScorer:
     """
     Placeholder scorer until XGBoost is trained on tick data.
-    Weights: OBI alignment 0.30, vol surge 0.25, spread 0.20, CVD 0.25.
+    Weights: OBI alignment 0.45, vol surge 0.35, spread 0.20.
+    CVD is retained for telemetry/ML features, but is not a rule-based gate.
     """
+
+    def __init__(self, rules: EntryRules | None = None) -> None:
+        self._rules = rules or EntryRules()
 
     def score(self, fv: FeatureVector, signal: MicroSignal) -> float:
         score = 0.0
+        thresh = self._rules.obi_threshold
         # OBI directional alignment
-        if signal.direction == "LONG" and fv.obi_zscore > 0.20:
-            score += 0.30
-        elif signal.direction == "SHORT" and fv.obi_zscore < -0.20:
-            score += 0.30
+        if signal.direction == "LONG" and fv.obi_zscore > thresh:
+            score += 0.45
+        elif signal.direction == "SHORT" and fv.obi_zscore < -thresh:
+            score += 0.45
         # Volume surge
-        score += min(fv.vol_ratio / 4.0, 0.25)
+        score += min((fv.vol_ratio / 4.0) * 0.35, 0.35)
         # Spread within normal range
-        if fv.spread_bps < 8.0:
+        if fv.spread_bps < self._rules.spread_max_bps:
             score += 0.20
-        # CVD alignment
-        if signal.direction == "LONG" and fv.cvd_positive:
-            score += 0.25
-        elif signal.direction == "SHORT" and not fv.cvd_positive:
-            score += 0.25
         return round(min(score, 1.0), 3)
 
 
@@ -140,9 +146,11 @@ class PersistenceMonitor:
         lob_engine,
         order_manager,
         position_closed_event: asyncio.Event,
+        shared_state: SharedState | None = None,
         check_interval_ms: int = 200,
     ) -> None:
         interval = check_interval_ms / 1000.0
+        started_ms = int(time.time() * 1000)
         while True:
             # Race the poll interval against position-closed. If the position exits
             # normally (TP/SL), stop quietly without firing the wall-removed alert.
@@ -155,6 +163,39 @@ class PersistenceMonitor:
                 return
             except asyncio.TimeoutError:
                 pass
+
+            now_ms = int(time.time() * 1000)
+            if now_ms - started_ms >= settings.MICRO_MAX_HOLD_MS:
+                logger.warning("[Gate6] Max hold exceeded — triggering safety exit")
+                if hasattr(order_manager, "handle_safety_exit"):
+                    await order_manager.handle_safety_exit("MAX_HOLD")
+                return
+
+            if shared_state is not None and (
+                shared_state.heartbeat_status == "CRITICAL"
+                or shared_state.last_delta_ms > settings.HEARTBEAT_CRITICAL_MS
+            ):
+                logger.warning("[Gate6] Heartbeat/latency critical — triggering safety exit")
+                if hasattr(order_manager, "handle_safety_exit"):
+                    await order_manager.handle_safety_exit("LATENCY_CRITICAL")
+                return
+
+            if hasattr(lob_engine, "get_snapshot"):
+                snap = await lob_engine.get_snapshot(depth=1)
+                if snap and snap.bids and snap.asks:
+                    best_bid = snap.bids[0].price
+                    best_ask = snap.asks[0].price
+                    mid = (best_bid + best_ask) / 2.0
+                    spread_bps = ((best_ask - best_bid) / mid * 10_000) if mid > 0 else 0.0
+                    if spread_bps > settings.MICRO_EXIT_SPREAD_HARD_CAP_BPS:
+                        logger.warning(
+                            "[Gate6] Spread %.1fbps > %.1fbps — triggering safety exit",
+                            spread_bps,
+                            settings.MICRO_EXIT_SPREAD_HARD_CAP_BPS,
+                        )
+                        if hasattr(order_manager, "handle_safety_exit"):
+                            await order_manager.handle_safety_exit("SPREAD_HARD_CAP")
+                        return
 
             walls = await lob_engine.get_current_walls()
             if not _wall_present(protection_wall_price, walls):
@@ -214,6 +255,7 @@ class StrategyExecutor:
         lob_engine=None,
         order_manager=None,
         gate6_check_interval_ms: int = 200,
+        strategy_id: str = "v3.0",
     ) -> None:
         self._micro_q       = micro_signal_queue
         self._signal_q      = signal_queue
@@ -221,6 +263,8 @@ class StrategyExecutor:
         self._fc            = feature_computer
         self._state         = shared_state
         self._budget        = budget
+        self._strategy_id   = strategy_id
+        self._entry_rules   = EntryRules()
         if rule_scorer is not None:
             self._scorer = rule_scorer
         else:
@@ -264,6 +308,20 @@ class StrategyExecutor:
             logger.info("[Executor] Risk tier updated: %s → %s", self._risk_tier, tier)
             self._risk_tier = tier
 
+    def set_entry_rules(self, rules: EntryRules) -> None:
+        """Apply optimised entry thresholds from the active registered spec.
+
+        Call once at startup after resolving the active strategy from the registry.
+        Also updates RuleBasedScorer thresholds when that fallback scorer is active.
+        """
+        self._entry_rules = rules
+        if isinstance(self._scorer, RuleBasedScorer):
+            self._scorer = RuleBasedScorer(rules)
+        logger.info(
+            "[Executor] Entry rules applied: spread_max_bps=%.1f obi_threshold=%.2f",
+            rules.spread_max_bps, rules.obi_threshold,
+        )
+
     @property
     def _spread_p95(self) -> float:
         """Session-aware 95th-percentile spread via log-normal approximation."""
@@ -281,6 +339,7 @@ class StrategyExecutor:
         rec = SignalRecord(
             micro_signal = signal.signal_type,
             direction    = signal.direction,
+            strategy_id  = self._strategy_id,
         )
 
         # Gate 0 — data fidelity
@@ -327,7 +386,12 @@ class StrategyExecutor:
             return
 
         # Gate 3 — capital
-        ok, reason = gate_3_capital(self._budget, self._risk_tier)
+        active_exposure = (
+            bool(self._order_manager.has_active_exposure())
+            if self._order_manager and hasattr(self._order_manager, "has_active_exposure")
+            else False
+        )
+        ok, reason = gate_3_capital(self._budget, self._risk_tier, active_exposure)
         if not ok:
             self._reject(rec, "GATE_3_FAIL", reason)
             return
@@ -349,7 +413,7 @@ class StrategyExecutor:
             now_ms = int(time.time() * 1000)
             elapsed_ms = now_ms - self._last_approved_ms
             if elapsed_ms < settings.MIN_SIGNAL_INTERVAL_MS:
-                self._reject(rec, "GATE_5_FAIL",
+                self._reject(rec, "RATE_LIMIT",
                              f"rate limit: {elapsed_ms}ms < {settings.MIN_SIGNAL_INTERVAL_MS}ms")
                 return
 
@@ -432,6 +496,7 @@ class StrategyExecutor:
                     lob_engine=self._lob_engine,
                     order_manager=self._order_manager,
                     position_closed_event=position_closed_event,
+                    shared_state=self._state,
                     check_interval_ms=self._gate6_check_ms,
                 ),
                 name=f"gate6_persistence_{signal_id[:8]}",

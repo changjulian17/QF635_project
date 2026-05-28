@@ -172,3 +172,38 @@ def test_atr_strictly_positive_after_warmup():
     assert np.all(arrays.atr[warmup:] > 0), (
         "ATR must be strictly positive after the warm-up period"
     )
+
+
+def test_wedge_and_triangle_sl_tp_consistent_with_sr_breakout():
+    """
+    H3/H4: after the paired fixes, wedge and triangle SL distances must be
+    computed from the same bar as the entry confirmation close.  We verify
+    this indirectly: for a given ATR value, SL distance (close - sl_stop)
+    must equal atr_sl × ATR to within floating-point tolerance — which holds
+    only if current = closes[i] rather than closes[i-1].
+    """
+    rng    = np.random.default_rng(42)
+    df     = _make_random_df(300, rng)
+    params = _default_params()
+
+    for strategy in ("Falling Wedge", "Rising Wedge", "Symmetrical Triangle"):
+        arrays = generate_signals(strategy, df, params)
+        entry_bars = np.where(arrays.entries)[0]
+        if len(entry_bars) == 0:
+            continue
+
+        closes = df["close"].values
+        atr_sl = float(params["atr_multiplier_sl"])
+
+        for i in entry_bars:
+            atr_i = arrays.atr[i]
+            close_i = closes[i]
+            sl_i    = arrays.sl_stop[i]
+            tp_i    = arrays.tp_stop[i]
+            # SL must be atr_sl × ATR away from closes[i], not closes[i-1]
+            sl_dist = abs(close_i - sl_i)
+            expected = atr_sl * atr_i
+            assert abs(sl_dist - expected) < 1e-4 * atr_i, (
+                f"{strategy} bar {i}: SL distance {sl_dist:.4f} ≠ "
+                f"atr_sl×ATR = {expected:.4f} — current may still use closes[i-1]"
+            )

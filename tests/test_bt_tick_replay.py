@@ -19,9 +19,9 @@ from unittest.mock import patch
 
 import pytest
 
-from backtesting.tick_replay import ReplayTrade, TickReplayEngine
+from backtesting.tick_replay import ReplayEvent, ReplayTrade, TickReplayEngine
 from core.cvd import CVDCalculator
-from models import FeatureVector
+from models import FeatureVector, WallState
 from strategy.features import FeatureComputer, FeatureParams
 from strategy.microstructure import identify_walls
 
@@ -671,3 +671,143 @@ def test_pre_requisite_data_available():
             if len(events) >= 10:
                 break
     assert len(events) > 0, "No events streamed from real lob_tick.db"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# H1 regression: EOD close in zero-trade windows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_depth_only_db(tmp_path: "pathlib.Path") -> str:
+    """DB with depth snapshots but NO agg_trades rows — simulates a no-trade window."""
+    db_path = str(tmp_path / "depth_only.db")
+    with sqlite3.connect(db_path) as conn:
+        _create_schema(conn)
+        for i in range(20):
+            ts    = BASE_TS + i * 1_000
+            bids  = json.dumps(_make_bids(BASE_PRICE))
+            asks  = json.dumps(_make_asks(BASE_PRICE))
+            conn.execute(
+                "INSERT INTO depth_snapshots (ts_event, bids_json, asks_json) VALUES (?,?,?)",
+                (ts, bids, asks),
+            )
+    return db_path
+
+
+def _make_fake_signal():
+    """Minimal MicroSignal stand-in for injecting an open position dict."""
+    from unittest.mock import MagicMock
+    return MagicMock()
+
+
+def test_eod_close_uses_prev_mid_when_no_trades(tmp_path):
+    """
+    H1: when a replay window contains depth events but no trades, an open
+    position must be closed using _prev_mid rather than being silently left open.
+
+    Strategy: patch _reset so that after it clears engine state, we inject an
+    open position and a known _prev_mid. The depth-only DB provides no trades,
+    so _last_trade_price stays 0, and the EOD code must fall back to _prev_mid.
+    """
+    db_path    = _make_depth_only_db(tmp_path)
+    engine     = TickReplayEngine(params={}, db_path=db_path, starting_equity=10_000.0)
+    fake_signal = _make_fake_signal()
+
+    original_reset = engine._reset
+
+    def reset_then_inject(start_ms: int) -> None:
+        original_reset(start_ms)
+        engine._open_position = {
+            "direction":      "LONG",
+            "entry_price":    BASE_PRICE,
+            "qty":            0.001,
+            "sl":             BASE_PRICE - 200,
+            "tp":             BASE_PRICE + 600,
+            "entry_ts_ms":    start_ms,
+            "signal":         fake_signal,
+            "entry_cost_usd": 0.0,
+        }
+        engine._prev_mid = BASE_PRICE
+
+    with patch.object(engine, "_reset", reset_then_inject):
+        end_ms = BASE_TS + 25_000
+        eq, trades = engine.replay_window(BASE_TS, end_ms)
+
+    assert engine._open_position is None, "Position should have been closed at EOD"
+    assert len(trades) == 1, f"Expected 1 EOD trade, got {len(trades)}"
+    assert trades[0].exit_reason == "EOD"
+
+
+def test_eod_close_oos_uses_prev_mid_when_no_trades(tmp_path):
+    """
+    H1 (OOS path): replay_window_oos must also close open positions using _prev_mid
+    when no trades occur in the window. Same injection technique via _reset_for_oos.
+    """
+    db_path    = _make_depth_only_db(tmp_path)
+    engine     = TickReplayEngine(params={}, db_path=db_path, starting_equity=10_000.0)
+    fake_signal = _make_fake_signal()
+
+    # Prime IS state normally (no position injected for IS pass)
+    engine.replay_window(BASE_TS, BASE_TS + 5_000)
+
+    original_oos_reset = engine._reset_for_oos
+
+    def oos_reset_then_inject(start_ms: int) -> None:
+        original_oos_reset(start_ms)
+        engine._open_position = {
+            "direction":      "SHORT",
+            "entry_price":    BASE_PRICE,
+            "qty":            0.001,
+            "sl":             BASE_PRICE + 200,
+            "tp":             BASE_PRICE - 600,
+            "entry_ts_ms":    start_ms,
+            "signal":         fake_signal,
+            "entry_cost_usd": 0.0,
+        }
+        engine._prev_mid = BASE_PRICE
+
+    with patch.object(engine, "_reset_for_oos", oos_reset_then_inject):
+        end_ms = BASE_TS + 25_000
+        eq, trades = engine.replay_window_oos(BASE_TS + 5_000, end_ms)
+
+    assert engine._open_position is None, "OOS position should have been closed at EOD"
+    assert len(trades) == 1
+    assert trades[0].exit_reason == "EOD"
+
+
+def test_replay_signal_does_not_require_cvd_spike(tmp_db):
+    """Tick replay must mirror live: sweep+protection can fire with cold/zero CVD spike."""
+    engine = TickReplayEngine(params={}, db_path=tmp_db, starting_equity=10_000.0)
+    engine._reset(BASE_TS)
+    ts_ms = BASE_TS + 1_000
+    engine._prev_mid = 30_005.0
+    engine._wall_states = {
+        30_010.0: WallState(
+            price=30_010.0,
+            qty_initial=50.0,
+            qty_current=5.0,
+            first_seen_ts=ts_ms - 1_000,
+            last_seen_ts=ts_ms,
+            side="ask",
+            sigma=3.0,
+        ),
+        29_980.0: WallState(
+            price=29_980.0,
+            qty_initial=30.0,
+            qty_current=30.0,
+            first_seen_ts=ts_ms - 500,
+            last_seen_ts=ts_ms,
+            side="bid",
+            sigma=3.0,
+        ),
+    }
+    engine._absorption_flags = {30_010.0: True}
+
+    engine._process_trade(ReplayEvent(
+        ts_ms=ts_ms,
+        kind="trade",
+        data={"price": 30_021.0, "qty": 1.0, "is_buyer_maker": 0},
+    ))
+
+    assert engine._open_position is not None
+    assert engine._open_position["signal"].cvd_std == pytest.approx(0.0)
+    assert engine._open_position["direction"] == "LONG"

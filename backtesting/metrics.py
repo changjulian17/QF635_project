@@ -251,8 +251,8 @@ def calculate_metrics(
     downside = daily_returns[daily_returns < rfr_daily]
     down_std = downside.std() if len(downside) > 1 else 0.0
     if down_std < 1e-9:
-        # No negative returns — assign a capped value rather than ±inf
-        sortino = 10.0 if excess.mean() > 0 else 0.0
+        # No downside days — cap proportionally to Sharpe rather than using a flat 10.0
+        sortino = min(3.0 * abs(sharpe), 10.0) if excess.mean() > 0 else 0.0
     else:
         sortino = excess.mean() / down_std * ann_factor
 

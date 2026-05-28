@@ -221,7 +221,8 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         win_start = int(snap_ms[0])
         win_end   = int(snap_ms[-1])
 
-        trades = fetch_agg_trades(win_start)
+        trade_limit = min(rows_needed * 20, 200_000)  # ~20 trades/s peak; cap to avoid OOM
+        trades = fetch_agg_trades(win_start, limit=trade_limit)
         buy_x,  buy_y,  buy_sz,  buy_txt  = [], [], [], []
         sell_x, sell_y, sell_sz, sell_txt = [], [], [], []
 

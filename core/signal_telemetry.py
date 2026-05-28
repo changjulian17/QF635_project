@@ -223,44 +223,54 @@ class SignalTelemetry:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS signal_records (
-                signal_id        TEXT PRIMARY KEY,
-                strategy_id      TEXT NOT NULL,
-                timestamp        TEXT NOT NULL,
-                micro_signal     TEXT,
-                gate_passed      TEXT,
-                rejection_reason TEXT,
-                lob_status       TEXT,
-                heartbeat_status TEXT,
-                obi_zscore       REAL,
-                cvd_delta        REAL,
-                spread_bps       REAL,
-                confidence       REAL,
-                direction        TEXT,
-                outcome          TEXT DEFAULT '',
-                pnl              REAL DEFAULT 0.0,
-                pnl_pct          REAL DEFAULT 0.0,
-                duration_min     REAL DEFAULT 0.0,
-                features_json    TEXT DEFAULT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_sigrecords_ts
-                ON signal_records(strategy_id, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_sigrecords_gate
-                ON signal_records(gate_passed, micro_signal);
-
-            CREATE TABLE IF NOT EXISTS system_events (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type   TEXT NOT NULL,
-                occurred_at  TEXT NOT NULL,
-                payload_json TEXT
-            );
-        """)
-        conn.commit()
-        # Migrate existing databases that predate the features_json column.
-        try:
-            conn.execute("ALTER TABLE signal_records ADD COLUMN features_json TEXT DEFAULT NULL")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        _ensure_signal_records_schema(conn)
         return conn
+
+
+def _ensure_signal_records_schema(conn: sqlite3.Connection) -> None:
+    """Create signal_records and system_events tables and apply column migrations.
+
+    Idempotent — safe to call on an existing database. Called by both
+    SignalTelemetry._open_db() and StrategyRegistry._init_db() so either class
+    can query signal_records without depending on the other having started first.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS signal_records (
+            signal_id        TEXT PRIMARY KEY,
+            strategy_id      TEXT NOT NULL,
+            timestamp        TEXT NOT NULL,
+            micro_signal     TEXT,
+            gate_passed      TEXT,
+            rejection_reason TEXT,
+            lob_status       TEXT,
+            heartbeat_status TEXT,
+            obi_zscore       REAL,
+            cvd_delta        REAL,
+            spread_bps       REAL,
+            confidence       REAL,
+            direction        TEXT,
+            outcome          TEXT DEFAULT '',
+            pnl              REAL DEFAULT 0.0,
+            pnl_pct          REAL DEFAULT 0.0,
+            duration_min     REAL DEFAULT 0.0,
+            features_json    TEXT DEFAULT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sigrecords_ts
+            ON signal_records(strategy_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sigrecords_gate
+            ON signal_records(gate_passed, micro_signal);
+
+        CREATE TABLE IF NOT EXISTS system_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type   TEXT NOT NULL,
+            occurred_at  TEXT NOT NULL,
+            payload_json TEXT
+        );
+    """)
+    conn.commit()
+    # Migrate databases that predate the features_json column.
+    try:
+        conn.execute("ALTER TABLE signal_records ADD COLUMN features_json TEXT DEFAULT NULL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists

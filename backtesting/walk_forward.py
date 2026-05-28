@@ -72,7 +72,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from backtesting.event_engine import EventDrivenEngine, SimulatedTrade
-from backtesting.metrics      import BacktestMetrics, calculate_metrics
+from backtesting.metrics      import BacktestMetrics, calculate_metrics, sensitivity_test
 from backtesting.signals      import ALL_STRATEGIES
 from backtesting.vectorbt_runner import run_phase1_optimisation
 from data.fetcher             import OHLCVFetcher, TIMEFRAME_MS
@@ -325,6 +325,29 @@ def run_walk_forward(
                     oos_trades_full.extend(tr_full)
                     oos_equity_full.append(eq_full)
 
+                # Parameter sensitivity — flag fragile (curve-fitted) parameter sets
+                try:
+                    factory = lambda p, _tf=tf, _tdf=test_df: EventDrivenEngine(
+                        strategy=strategy, params=p, raw_mode=True,
+                        starting_equity=starting_equity,
+                    ).run(_tdf)
+                    sens_df = sensitivity_test(factory, opt.best_params, test_df)
+                    logger.debug("  Window %d sensitivity:\n%s", w.window_idx + 1, sens_df.to_string())
+                    # Warn if any single ±10% nudge collapses Sharpe by > 50%
+                    base_col = "+0%"
+                    if base_col in sens_df.columns:
+                        for col in ("+10%", "-10%"):
+                            if col in sens_df.columns:
+                                worst_drop = (sens_df[base_col] - sens_df[col]).max()
+                                if worst_drop > sens_df[base_col].mean() * 0.5:
+                                    logger.warning(
+                                        "  Window %d: parameter sensitivity HIGH (%s nudge "
+                                        "drops Sharpe by %.2f) — possible curve-fitting.",
+                                        w.window_idx + 1, col, worst_drop,
+                                    )
+                except Exception as _e:
+                    logger.debug("  Sensitivity test skipped: %s", _e)
+
                 logger.info(
                     "  Window %d done | raw_trades=%d full_trades=%d",
                     w.window_idx + 1, len(tr_raw), len(tr_full),
@@ -364,7 +387,7 @@ def run_walk_forward(
                 "raw_sharpe":      metrics_raw.sharpe_ratio,
                 "raw_return_pct":  metrics_raw.total_return_pct,
                 "raw_trades":      metrics_raw.total_trades,
-                "best_params":     best_params_per_window[-1],   # most recent window
+                "best_params":     _median_params(best_params_per_window),
                 "n_wf_windows":    len(windows),
             })
             all_results.append(row)
@@ -493,6 +516,21 @@ def _compute_buy_and_hold(
         "is_benchmark":   True,   # excluded from strategy sort and minimum-bar gate
     })
     return row
+
+
+def _median_params(params_list: list[dict]) -> dict:
+    """Return a params dict whose numeric values are the per-key median across all windows."""
+    if not params_list:
+        return {}
+    import statistics
+    result = {}
+    for key in params_list[0]:
+        vals = [p[key] for p in params_list if key in p and isinstance(p[key], (int, float))]
+        if vals:
+            result[key] = statistics.median(vals)
+        else:
+            result[key] = params_list[-1].get(key)
+    return result
 
 
 def _trades_to_dicts(trades: list[SimulatedTrade]) -> list[dict]:

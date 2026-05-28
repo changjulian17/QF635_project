@@ -202,6 +202,14 @@ def test_scorer_max_score_long():
     assert score == pytest.approx(1.0)
 
 
+def test_scorer_ignores_cvd_alignment():
+    scorer = RuleBasedScorer()
+    sig = _signal("LONG")
+    aligned = _fv(obi_zscore=1.0, vol_ratio=2.0, spread_bps=3.0, cvd_positive=1)
+    misaligned = _fv(obi_zscore=1.0, vol_ratio=2.0, spread_bps=3.0, cvd_positive=0)
+    assert scorer.score(aligned, sig) == scorer.score(misaligned, sig)
+
+
 def test_scorer_zero_score_misaligned():
     scorer = RuleBasedScorer()
     fv  = _fv(obi_zscore=-5.0, vol_ratio=0.0, spread_bps=20.0, cvd_positive=0)
@@ -407,6 +415,12 @@ def test_gate3_fails_when_passive():
     assert "PASSIVE" in reason
 
 
+def test_gate3_fails_on_active_exposure():
+    ok, reason = gate_3_capital(None, "FULL", active_exposure=True)
+    assert ok is False
+    assert "active microstructure exposure" in reason
+
+
 def test_gate2_tier_min_confidence_minimal():
     """MINIMAL tier must require confidence >= 0.80; 0.65 passes Gate 2 base but should be rejected."""
     async def _run():
@@ -417,10 +431,8 @@ def test_gate2_tier_min_confidence_minimal():
 
         class _LowScoreFC:
             def compute(self, cvd_calculator, shared_state, **kwargs):
-                # Produce a score of ~0.65: OBI(0.30) + vol_ratio capped(0.25) + spread(0.20) = 0.75
-                # Use minimal alignment to land between 0.58 and 0.80
-                return _fv(obi_zscore=0.3, vol_ratio=2.0, spread_bps=3.0, cvd_positive=0)
-                # score = OBI(0.30) + vol(0.25) + spread(0.20) + CVD(0) = 0.75 — above FULL min but below MINIMAL
+                # Score lands above FULL min but below MINIMAL after CVD removal.
+                return _fv(obi_zscore=0.3, vol_ratio=1.4, spread_bps=3.0, cvd_positive=0)
 
         ex = StrategyExecutor(
             micro_signal_queue=micro_q,
@@ -475,7 +487,7 @@ def test_notional_hint_halved_in_reduced_tier():
 
 
 def test_rate_limit_rejects_rapid_second_signal(monkeypatch):
-    """A second signal within MIN_SIGNAL_INTERVAL_MS must be rejected as GATE_5_FAIL."""
+    """A second signal within MIN_SIGNAL_INTERVAL_MS must be rejected as RATE_LIMIT."""
     from config import settings as _settings
     monkeypatch.setattr(_settings, "MIN_SIGNAL_INTERVAL_MS", 500)
 
@@ -504,7 +516,7 @@ def test_rate_limit_rejects_rapid_second_signal(monkeypatch):
         recs = []
         while not telem_q.empty():
             recs.append(telem_q.get_nowait())
-        rejections = [r for r in recs if r.gate_passed == "GATE_5_FAIL" and "rate limit" in (r.rejection_reason or "")]
+        rejections = [r for r in recs if r.gate_passed == "RATE_LIMIT" and "rate limit" in (r.rejection_reason or "")]
         assert rejections, "rate-limit rejection telemetry must be emitted"
 
     asyncio.run(_run())

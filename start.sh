@@ -39,6 +39,8 @@ fi
 log_ok "Connectivity OK"
 
 # --- Launch each component in a new Terminal window ---
+# NOTE: macOS only — uses osascript / Terminal.app.
+# On Linux, start each component manually using the commands printed at the end of this script.
 open_window() {
     local label="$1"
     local cmd="$2"
