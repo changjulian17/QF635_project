@@ -1,3 +1,15 @@
+"""
+/lob page — real-time LOB microstructure view.
+
+Data arrives by **WebSocket subscription** (not polling): the engine pushes one
+snapshot per second to /ws/lob (see engine/realtime_hub.py + main.py). Each push
+is appended to a server-side rolling buffer; the chart redraws on every new tick.
+
+On page load the buffer is seeded once from the lob_snapshots table so the chart
+is populated immediately, then live pushes take over. If the engine is offline the
+WebSocket simply stays closed and the badge reflects that — the page still shows
+whatever history the DB holds.
+"""
 import json
 from datetime import datetime, timezone, timedelta
 
@@ -5,12 +17,14 @@ import dash
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import dcc, html, Input, Output, State, callback, no_update, Patch
+from dash import dcc, html, Input, Output, callback, no_update
 import dash_bootstrap_components as dbc
+from dash_extensions import WebSocket
 from plotly.subplots import make_subplots
 
 from config import settings
 from dashboard._db import fetch_lob_snapshots, fetch_agg_trades, DBOffline
+from dashboard._logic import update_lob_buffer
 from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/lob", name="LOB")
@@ -18,18 +32,28 @@ dash.register_page(__name__, path="/lob", name="LOB")
 _DEPTH_WARNING = settings.LOB_DEPTH < 100
 _STALE_THRESHOLD_S = 30  # flag data as stale after 30s without a new snapshot
 _SGT = timezone(timedelta(hours=8))
+_WS_URL = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/lob"
+
+# Server-side rolling buffer of streamed snapshots (shared across clients, which is
+# correct here — the engine pushes identical data to everyone). Sized to the largest
+# selectable window (60 min × 60 s) so the slider can widen without losing history.
+_MAX_BUFFER = 3600
+_BUFFER: list[dict] = []
+
 
 layout = html.Div([
-    dcc.Interval(id="lob-interval", interval=30_000),       # 30s — full rebuild
-    dcc.Interval(id="lob-lines-interval", interval=5_000),  # 5s — incremental line update
-    dcc.Interval(id="lob-clock-interval", interval=1_000),  # 1s — SGT clock
-    dcc.Store(id="lob-last-ts"),                            # tracks last snapshot ts
+    WebSocket(id="lob-ws", url=_WS_URL),
+    dcc.Store(id="lob-tick"),                                # bumps on each new snapshot
+    dcc.Interval(id="lob-backfill", interval=500, max_intervals=1),  # one-shot DB seed
+    dcc.Interval(id="lob-clock-interval", interval=1_000),   # 1s — SGT clock
 
-    # ── SGT clock ─────────────────────────────────────────────────────────
-    html.Div(id="lob-clock", style={
-        "textAlign": "right", "fontFamily": "monospace",
-        "fontSize": "1.1rem", "color": "#adb5bd", "marginBottom": "6px",
-    }),
+    # ── Header: SGT clock + connection badge ───────────────────────────────
+    html.Div([
+        html.Span(id="lob-conn-status"),
+        html.Span(id="lob-clock", style={
+            "fontFamily": "monospace", "fontSize": "1.1rem", "color": "#adb5bd",
+        }),
+    ], className="d-flex justify-content-between align-items-center mb-2"),
 
     # ── Depth warning banner ───────────────────────────────────────────────
     dbc.Alert(
@@ -67,43 +91,22 @@ layout = html.Div([
                        marks={70: "70", 80: "80", 90: "90", 99: "99"}),
         ], width=3),
     ], className="mb-3"),
-    dbc.Row([
-        dbc.Col([
-            dbc.Button("Refresh Now", id="lob-refresh-btn", color="secondary",
-                       size="sm"),
-        ], width=3),
-    ], className="mb-3"),
 
     # ── Chart ──────────────────────────────────────────────────────────────
     dcc.Graph(id="lob-chart", style={"height": "860px"}),
 ])
 
 
+def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pctile):
+    """Build the 4-row LOB figure from a list of snapshot dicts (ascending by ts).
 
-@callback(
-    Output("lob-chart", "figure"),
-    Output("lob-last-ts", "data"),
-    Input("lob-interval", "n_intervals"),
-    Input("lob-refresh-btn", "n_clicks"),
-    Input("lob-hm-window", "value"),
-    Input("lob-price-range", "value"),
-    Input("lob-contrast", "value"),
-    Input("lob-trade-pctile", "value"),
-)
-def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade_pctile):
+    Each snapshot: {ts, mid_price, spread, obi, cvd_delta, bid_levels, ask_levels}
+    where *_levels are [[price, qty], ...] lists.
+    """
     rows_needed = hm_minutes * 60
-    snapshots = fetch_lob_snapshots(limit=max(rows_needed, 3600))
+    df = pd.DataFrame(snaps)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
 
-    if isinstance(snapshots, DBOffline):
-        return _empty_fig("LOB DB offline — start engine first"), None
-
-    if not snapshots:
-        return _empty_fig("Waiting for LOB snapshot data…"), None
-
-    df = pd.DataFrame(snapshots)
-    df["ts"] = pd.to_datetime(df["ts"], format="ISO8601", utc=True)
-
-    # H1: staleness check
     age_s = (datetime.now(timezone.utc) - df["ts"].iloc[-1].to_pydatetime()).total_seconds()
     is_stale = age_s > _STALE_THRESHOLD_S
 
@@ -118,6 +121,7 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
     )
 
     # ── Row 1: heatmap ─────────────────────────────────────────────────────
+    ts_labels: list[str] = []
     if not hm_df.empty:
         current_mid   = float(hm_df["mid_price"].iloc[-1])
         window_center = float((hm_df["mid_price"].min() + hm_df["mid_price"].max()) / 2)
@@ -130,36 +134,24 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
         bid_matrix = np.zeros((n_prices, n_times))
         ask_matrix = np.zeros((n_prices, n_times))
 
-        # H3: track which columns parsed successfully for accurate x-axis labelling
         valid_cols = []
         for col_idx, row in enumerate(hm_df.itertuples(index=False)):
             col_ok = False
-            try:
-                bid_json = row.bid_levels_json
-                if bid_json:
-                    for p, q in json.loads(bid_json):
+            for levels, matrix in (("bid_levels", bid_matrix), ("ask_levels", ask_matrix)):
+                try:
+                    for p, q in getattr(row, levels) or []:
                         ri = int((p - price_lo) / bucket_size)
                         if 0 <= ri < n_prices:
-                            bid_matrix[ri, col_idx] += q
+                            matrix[ri, col_idx] += q
                     col_ok = True
-            except Exception:
-                pass
-            try:
-                ask_json = row.ask_levels_json
-                if ask_json:
-                    for p, q in json.loads(ask_json):
-                        ri = int((p - price_lo) / bucket_size)
-                        if 0 <= ri < n_prices:
-                            ask_matrix[ri, col_idx] += q
-                    col_ok = True
-            except Exception:
-                pass
+                except Exception:
+                    pass
             valid_cols.append(col_ok)
 
         ts_labels = hm_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
         mid_prices = hm_df["mid_price"].tolist()
 
-        # H3: drop columns where both bid and ask JSON failed — prevents x-axis misalignment
+        # Drop columns where both bid and ask levels failed — prevents x-axis misalignment
         if not all(valid_cols):
             vm = np.array(valid_cols, dtype=bool)
             bid_matrix = bid_matrix[:, vm]
@@ -194,10 +186,9 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
             line=dict(color="white", width=1.5), name="Mid price", hoverinfo="skip",
         ), row=1, col=1)
 
-    # ── Rows 2-4: OBI / CVD / Spread — guarded against empty data (H2) ────
+    # ── Rows 2-4: OBI / CVD / Spread ───────────────────────────────────────
     if not obi_df.empty:
         obi_ts = obi_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
-        # M4: fill NaN before cumsum so one bad row doesn't corrupt the rest
         cvd_running = obi_df["cvd_delta"].fillna(0.0).cumsum().tolist()
 
         fig.add_trace(go.Scatter(
@@ -221,11 +212,10 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
             line=dict(color="violet", width=1), name="Spread",
         ), row=4, col=1)
     else:
-        # preserve subplot structure with empty traces
         for row in (2, 3, 4):
             fig.add_trace(go.Scatter(x=[], y=[], showlegend=False), row=row, col=1)
 
-    # ── Row 1 overlay: market order bubbles (indices 6 & 7) ────────────────
+    # ── Row 1 overlay: market order bubbles (from DB agg_trades) ───────────
     if not hm_df.empty and ts_labels:
         snap_ms   = np.array([int(t.timestamp() * 1000) for t in hm_ts_snap], dtype=np.int64)
         win_start = int(snap_ms[0])
@@ -290,7 +280,6 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
     fig.update_xaxes(showticklabels=False, row=3, col=1)
     fig.update_xaxes(title_text="Time (SGT)", row=4, col=1)
 
-    # H1: staleness annotation overlaid on chart
     if is_stale:
         fig.add_annotation(
             text=f"⚠ Last snapshot {age_s:.0f}s ago — data may be stale",
@@ -298,53 +287,81 @@ def update_lob_chart(n, n_clicks, hm_minutes, half_range, contrast_pctile, trade
             showarrow=False, font=dict(color="orange", size=12),
             bgcolor="rgba(0,0,0,0.5)",
         )
-
-    last_ts = df["ts"].iloc[-1].isoformat() if not df.empty else None
-    return fig, last_ts
+    return fig
 
 
 @callback(
-    Output("lob-chart", "figure", allow_duplicate=True),
-    Input("lob-lines-interval", "n_intervals"),
-    State("lob-last-ts", "data"),
-    State("lob-hm-window", "value"),
+    Output("lob-tick", "data", allow_duplicate=True),
+    Input("lob-backfill", "n_intervals"),
     prevent_initial_call=True,
 )
-def update_lob_lines(n, last_ts, hm_minutes):
-    """Incremental update: replaces only OBI/CVD/Spread trace data every 5s."""
-    if last_ts is None:
+def backfill_buffer(_n):
+    """Seed the server-side buffer once from the DB so the chart isn't empty on load."""
+    global _BUFFER
+    if _BUFFER:
         return no_update
-
-    rows_needed = (hm_minutes or 15) * 60
-    snapshots = fetch_lob_snapshots(limit=rows_needed)
-
-    if isinstance(snapshots, DBOffline) or not snapshots:
+    rows = fetch_lob_snapshots(limit=_MAX_BUFFER)
+    if isinstance(rows, DBOffline) or not rows:
         return no_update
+    seeded = []
+    for r in rows:  # fetch_lob_snapshots returns ascending (oldest first)
+        try:
+            bid = json.loads(r.get("bid_levels_json") or "[]")
+            ask = json.loads(r.get("ask_levels_json") or "[]")
+        except Exception:
+            bid, ask = [], []
+        seeded.append({
+            "ts": r["ts"], "mid_price": r["mid_price"], "spread": r["spread"],
+            "obi": r["obi"], "cvd_delta": r["cvd_delta"],
+            "bid_levels": bid, "ask_levels": ask,
+        })
+    _BUFFER = seeded
+    return seeded[-1]["ts"]
 
-    df = pd.DataFrame(snapshots)
-    df["ts"] = pd.to_datetime(df["ts"], format="ISO8601", utc=True)
-    obi_df = df.tail(rows_needed)
 
-    if obi_df.empty:
+@callback(
+    Output("lob-tick", "data"),
+    Input("lob-ws", "message"),
+    prevent_initial_call=True,
+)
+def on_ws_message(message):
+    """Append one pushed snapshot to the buffer; return its ts to trigger a redraw."""
+    global _BUFFER
+    if not message or "data" not in message:
         return no_update
+    try:
+        msg = json.loads(message["data"])
+    except (TypeError, ValueError):
+        return no_update
+    _BUFFER = update_lob_buffer(_BUFFER, msg, _MAX_BUFFER)
+    return msg.get("ts", no_update)
 
-    obi_ts = obi_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
-    cvd_running = obi_df["cvd_delta"].fillna(0.0).cumsum().tolist()
 
-    # Trace order assumed from update_lob_chart (must stay in sync if traces are added/removed):
-    #   0 = Bids heatmap   1 = Asks heatmap   2 = Mid price line
-    #   3 = OBI            4 = CVD            5 = Spread
-    #   6 = Buy MO         7 = Sell MO
-    # Guard: this callback only runs when last_ts is set, which means hm_df was non-empty
-    # in the last full rebuild, so traces 0–2 exist and indices 3–5 are correct.
-    patched = Patch()
-    patched["data"][3]["x"] = obi_ts
-    patched["data"][3]["y"] = obi_df["obi"].tolist()
-    patched["data"][4]["x"] = obi_ts
-    patched["data"][4]["y"] = cvd_running
-    patched["data"][5]["x"] = obi_ts
-    patched["data"][5]["y"] = obi_df["spread"].tolist()
-    return patched
+@callback(
+    Output("lob-chart", "figure"),
+    Input("lob-tick", "data"),
+    Input("lob-hm-window", "value"),
+    Input("lob-price-range", "value"),
+    Input("lob-contrast", "value"),
+    Input("lob-trade-pctile", "value"),
+)
+def render_lob_chart(_tick, hm_minutes, half_range, contrast_pctile, trade_pctile):
+    if not _BUFFER:
+        return _empty_fig("Waiting for LOB data… (start the engine for the live stream)")
+    return _build_lob_figure(list(_BUFFER), hm_minutes, half_range, contrast_pctile, trade_pctile)
+
+
+@callback(
+    Output("lob-conn-status", "children"),
+    Input("lob-ws", "state"),
+)
+def update_conn_status(state):
+    ready = (state or {}).get("readyState")
+    if ready == 1:
+        return dbc.Badge("● LIVE", color="success", className="fs-6")
+    if ready == 0:
+        return dbc.Badge("● Connecting…", color="warning", className="fs-6")
+    return dbc.Badge("● Engine offline", color="secondary", className="fs-6")
 
 
 @callback(
