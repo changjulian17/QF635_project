@@ -470,3 +470,29 @@ def test_walk_forward_metrics_raises_on_zero_trades(tmp_path):
 def test_walk_forward_metrics_raises_on_single_fold(tmp_path):
     with pytest.raises(ValueError, match="n_folds must be >= 2"):
         StrategyBuilder.walk_forward_metrics(_MockEngine(), 0, 86_400_000, n_folds=1)
+
+
+# ── Fix 4: shared schema helper ───────────────────────────────────────────────
+
+def test_count_paper_trades_works_without_prior_telemetry_init(tmp_path):
+    """Registry must create signal_records via _init_db so count_paper_trades
+    never raises OperationalError even when SignalTelemetry has never run."""
+    db = str(tmp_path / "test.db")
+    reg = StrategyRegistry(db_path=db, yaml_dir=str(tmp_path))
+    spec = _make_spec()
+    reg.register(spec)
+    # No SignalTelemetry started — signal_records table must already exist
+    count = reg.count_paper_trades(spec.strategy_id)
+    assert count == 0   # correct: no trades yet, but no OperationalError
+
+
+def test_rolling_sharpe_works_without_prior_telemetry_init(tmp_path):
+    """compute_rolling_sharpe must return 0.0 (not raise) when SignalTelemetry
+    has never run but the registry was initialised."""
+    db = str(tmp_path / "test.db")
+    reg = StrategyRegistry(db_path=db, yaml_dir=str(tmp_path))
+    spec = _make_spec()
+    reg.register(spec)
+    sharpe = reg.compute_rolling_sharpe(spec.strategy_id, days=14)
+    assert sharpe == pytest.approx(0.0)
+

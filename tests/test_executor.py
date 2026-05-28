@@ -222,8 +222,11 @@ def test_scorer_zero_score_misaligned():
 
 class _MockFC:
     """Feature computer stub that always returns a passing FeatureVector."""
+    def __init__(self, spread_bps: float = 3.0) -> None:
+        self._spread_bps = spread_bps
+
     def compute(self, cvd_calculator, shared_state, **kwargs):
-        return _fv(obi_zscore=1.0, cvd_positive=1, vol_ratio=3.0, spread_bps=3.0)
+        return _fv(obi_zscore=1.0, cvd_positive=1, vol_ratio=3.0, spread_bps=self._spread_bps)
 
 
 def test_approved_order_request_contract():
@@ -265,7 +268,7 @@ def test_gate6_watch_starts_monitor_after_fill():
         state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
 
         class _MockLOB:
-            async def get_current_walls(self):
+            async def get_current_walls(self, sigma=2.5):
                 return []   # wall absent immediately → monitor exits on first check
 
         class _MockOM:
@@ -301,7 +304,7 @@ def test_gate6_monitor_stops_on_position_closed():
     """Monitor must exit cleanly without firing the wall alert when position closes normally."""
     async def _run():
         class _MockLOB:
-            async def get_current_walls(self):
+            async def get_current_walls(self, sigma=2.5):
                 return [{"price": 30000.0}]   # wall always present
 
         class _MockOM:
@@ -520,3 +523,136 @@ def test_rate_limit_rejects_rapid_second_signal(monkeypatch):
         assert rejections, "rate-limit rejection telemetry must be emitted"
 
     asyncio.run(_run())
+
+
+# ── Fix 1: strategy_id propagation ───────────────────────────────────────────
+
+def test_strategy_id_propagated_to_telemetry():
+    """Executor must stamp every SignalRecord with the injected strategy_id."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="UNINITIALISED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+            strategy_id="test-uuid-abc123",
+        )
+        await ex._evaluate(_signal())
+        rec = telem_q.get_nowait()
+        assert rec.strategy_id == "test-uuid-abc123"
+
+    asyncio.run(_run())
+
+
+def test_strategy_id_default_fallback():
+    """Default strategy_id must be 'v3.0' when none is provided."""
+    async def _run():
+        telem_q = asyncio.Queue()
+        state   = SharedState(lob_status="UNINITIALISED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+        ex = StrategyExecutor(
+            micro_signal_queue=asyncio.Queue(),
+            signal_queue=asyncio.Queue(),
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+        )
+        await ex._evaluate(_signal())
+        rec = telem_q.get_nowait()
+        assert rec.strategy_id == "v3.0"
+
+    asyncio.run(_run())
+
+
+# ── Fix 2: EntryRules applied to Gate 4 ──────────────────────────────────────
+
+def test_gate4_hard_cap_blocks_wide_spread():
+    """spread_max_bps from EntryRules must block spreads exceeding the hard cap."""
+    from strategy.spec import EntryRules
+
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(spread_bps=4.0),
+            shared_state=state,
+        )
+        ex.set_entry_rules(EntryRules(spread_max_bps=3.0))
+        await ex._evaluate(_signal())
+        assert signal_q.empty(), "signal must be rejected when spread exceeds hard cap"
+        recs = []
+        while not telem_q.empty():
+            recs.append(telem_q.get_nowait())
+        gate4_fails = [r for r in recs if r.gate_passed == "GATE_4_FAIL"]
+        assert gate4_fails, "GATE_4_FAIL telemetry must be emitted"
+        assert "hard cap" in gate4_fails[-1].rejection_reason
+
+    asyncio.run(_run())
+
+
+def test_gate4_adaptive_p95_still_applies_with_permissive_hard_cap():
+    """Adaptive p95 filter must reject signals independently of the hard cap."""
+    import math
+    from strategy.spec import EntryRules
+
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(spread_bps=12.0),
+            shared_state=state,
+        )
+        ex.set_entry_rules(EntryRules(spread_max_bps=100.0))  # hard cap disabled
+        # Seed spread stats so p95 ≈ 5 bps; a 12 bps spread should then fail
+        for _ in range(15):
+            ex._log_spread_stats.update(math.log(5.0))
+        await ex._evaluate(_signal())
+        assert signal_q.empty(), "signal must be rejected when spread exceeds 2×p95"
+        recs = []
+        while not telem_q.empty():
+            recs.append(telem_q.get_nowait())
+        gate4_fails = [r for r in recs if r.gate_passed == "GATE_4_FAIL"]
+        assert gate4_fails
+        assert "p95" in gate4_fails[-1].rejection_reason
+
+    asyncio.run(_run())
+
+
+def test_set_entry_rules_updates_rule_based_scorer():
+    """set_entry_rules must propagate obi_threshold into RuleBasedScorer."""
+    from strategy.spec import EntryRules
+    from strategy.executor import RuleBasedScorer
+
+    ex = StrategyExecutor(
+        micro_signal_queue=asyncio.Queue(),
+        signal_queue=asyncio.Queue(),
+        telemetry_queue=asyncio.Queue(),
+        feature_computer=_MockFC(),
+        shared_state=SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0),
+        rule_scorer=RuleBasedScorer(),
+    )
+    ex.set_entry_rules(EntryRules(obi_threshold=0.99))
+    assert isinstance(ex._scorer, RuleBasedScorer)
+    assert ex._scorer._rules.obi_threshold == pytest.approx(0.99)
+    # A signal with obi_zscore=0.5 must now score 0 on OBI component
+    fv  = _fv(obi_zscore=0.5)
+    sig = _signal("LONG")
+    score = ex._scorer.score(fv, sig)
+    assert score < 0.45, "OBI component must be 0 when zscore < new threshold"

@@ -206,6 +206,7 @@ class MicroSignal:
     cvd_std:           float = 0.0     # CVD spike in std multiples
     price_move_pct:    float = 0.0
     confidence:        float = 0.0     # filled by StrategyExecutor after scoring
+    mid_price:         float = 0.0     # BTC/USDT mid at signal fire time; set by detector
 
 
 @dataclass

@@ -69,13 +69,17 @@ CryptoSentinel/
 │   ├── cvd.py                 # Standalone CVD calculator
 │   ├── pattern_detector.py    # OHLCV chart pattern detection (context/boost)
 │   ├── signal_telemetry.py    # Signal record writer (all gates, pass + fail)
-│   └── startup_reconciler.py  # Exchange state reconciliation on startup + midnight reset
+│   ├── startup_reconciler.py  # Exchange state reconciliation on startup + midnight reset
+│   └── alerting.py            # AlertDispatcher — optional webhook notifications
 │
 ├── strategy/                  # Alpha generation and execution
 │   ├── features.py            # FeatureComputer + WelfordOnline (single source of truth)
 │   ├── microstructure.py      # Wall Identification / Absorption / Sweep + Fresh Wall
 │   ├── executor.py            # StrategyExecutor — 7-Gate pipeline + confidence scorer
-│   └── spec.py                # StrategySpec — immutable YAML-backed strategy descriptor
+│   ├── spec.py                # StrategySpec — immutable YAML-backed strategy descriptor
+│   ├── scorer.py              # XGBoostScorer + ScorerFactory (ML confidence gate, Gate 2)
+│   ├── registry.py            # StrategyRegistry — dual-store lifecycle (YAML + SQLite)
+│   └── builder.py             # StrategyBuilder — 3-stage pipeline: validate → register
 │
 ├── risk/                      # Risk management
 │   ├── engine.py              # RiskEngine — 5-tier throttling, DOV, circuit breakers
@@ -88,6 +92,7 @@ CryptoSentinel/
 │   └── orders.py              # Order domain classes and enums
 │
 ├── backtesting/               # Offline strategy research
+│   ├── tick_replay.py         # Path A: event-driven replay of lob_tick.db through live stack
 │   ├── event_engine.py        # Path A: tick-level event replay engine
 │   ├── signals.py             # Signal generation for backtesting
 │   ├── walk_forward.py        # Path B: OHLCV walk-forward (VectorBT + Optuna)
@@ -102,6 +107,7 @@ CryptoSentinel/
 ├── dashboard/                 # Dash multi-page application (Phase 3)
 │   ├── app.py                 # Entry point — dark theme, nav, engine status badge
 │   ├── _db.py                 # WAL-mode SQLite helpers shared by all pages
+│   ├── _logic.py              # Shared business logic for dashboard pages
 │   ├── _utils.py              # Shared Plotly utilities (empty_fig)
 │   └── pages/
 │       ├── live.py            # /live     — Portfolio metrics, signal funnel, kill switch
@@ -120,9 +126,14 @@ CryptoSentinel/
 │   ├── ohlcv_cache.db         # OHLCV SQLite cache (CCXT)
 │   └── backtest_results.db    # Backtest results storage
 │
+├── engine/                    # Legacy shim directory (re-exports to canonical locations)
+│   ├── db_writer.py           # SQLite persistence + rolling cleanup + lob_snapshots table
+│   └── lob_snapshot_writer.py # LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
+│
 ├── scripts/
 │   ├── test_connection.py     # Connectivity + auth check
-│   └── test_orders.py         # BUY + SELL round-trip test
+│   ├── test_orders.py         # BUY + SELL round-trip test
+│   └── signal_injector.py     # Synthetic signal injection — dev/testnet only (start_test.sh)
 │
 ├── tests/                     # pytest unit + integration tests
 │   ├── test_models.py
@@ -356,6 +367,22 @@ If all checks pass, it opens three separate Terminal windows — one for each co
 
 Sends SIGTERM to each process, waits up to 5 seconds, then SIGKILL if still running. Closes the three Terminal windows afterwards.
 
+### Testnet execution test (signal injection)
+
+To validate the full execution pipeline with synthetic signals against the Binance testnet:
+
+```bash
+./start_test.sh
+```
+
+Sets `DRY_RUN=false`, `MIN_CONFIDENCE=0.1`, `TEST_SIGNAL_INJECT=true`. After ~45 s LOB warmup, synthetic LONG/SHORT `SWEEP_WITH_PROTECTION` signals are injected every 30 s. Monitor:
+
+```bash
+tail -f logs/cryptosentinel.log | grep -E '\[Injector\]|\[Gate[0-6]\]|\[Executor\]'
+```
+
+> Not for paper trading, backtesting, or production — testnet orders only.
+
 ### Manual startup (alternative)
 
 ```bash
@@ -409,7 +436,28 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `LOB_WALL_SIGMA` | `2.5` | σ threshold for Wall identification |
 | `LOB_WALL_WINDOW` | `5` | Ticks each side for Wall median/std |
 | `LOB_DEPTH` | `1000` | Levels in the live LOB Engine's local book (LOB Recorder uses `_DEPTH_LEVELS = 100` hardcoded) |
+| `LOB_OBI_DEPTH` | `20` | Levels used for OBI calculation |
 | `LOB_HISTORY` | `18000` | In-memory bars retained (~5h) |
+| `LOB_HEATMAP_BUCKET` | `5.0` | USD bucket width for dashboard heatmap |
+| `RELOAD_SIGMA` | `3.0` | σ threshold for iceberg reload detection |
+| `ICEBERG_WINDOW_MS` | `500` | Lookback window for iceberg replenishment |
+| `ICEBERG_MIN_REPLENISH` | `0.80` | Min reload fraction to confirm iceberg |
+| `ICEBERG_MIN_QTY` | `0.5` | Min absolute qty to qualify as iceberg |
+| `SWEEP_LEVELS` | `5` | Top-N levels checked for sweep volume |
+| `SWEEP_THRESHOLD` | `0.80` | Buy/sell vol must exceed this fraction of top-N depth |
+| `BREAK_PROTECT_WINDOW_MS` | `2000` | Fresh-wall recency window post-sweep (ms) |
+| `OBI_BREAK_THRESH` | `0.40` | OBI threshold for breakout confirmation |
+| `MICRO_MAX_HOLD_MS` | `60_000` | Max hold before forced exit (Gate 6) |
+| `MICRO_EXIT_SPREAD_HARD_CAP_BPS` | `12.0` | Spread hard cap for Gate 4 order selection |
+| `LOB_FRESH_WALL_MS` | `3_000` | Protection wall must appear within this window |
+| `LOB_STALE_WALL_MS` | `30_000` | Prune wall states not seen for this long |
+| `PROTECTION_MAX_DISTANCE_BPS` | `25.0` | Max protection wall distance from mid |
+| `PRICE_PRUNE_INTERVAL` | `100` | Prune stale price keys every N bars |
+| `PRICE_PRUNE_BAND` | `0.02` | Keep prices within ±2% of current mid |
+| `MICRO_PRICE_MOVE_FLOOR_BPS` | `3.0` | Minimum price move to confirm sweep |
+| `MICRO_PRICE_MOVE_WINDOW` | `300` | Rolling window for dynamic price-move threshold |
+| `MICRO_PRICE_MOVE_PERCENTILE` | `0.90` | Percentile rank for dynamic threshold |
+| `MICRO_PRICE_MOVE_MIN_SAMPLES` | `50` | Min samples before dynamic threshold activates |
 
 ### Heartbeat
 | Setting | Default | Description |
@@ -441,11 +489,40 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `DRY_RUN` | `True` | Skip live order submission |
 | `IOC_TIMEOUT_MS` | `200` | IOC order expiry — do not retry |
 
+### Logging
+| Setting | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Root log level — set `DEBUG` in `.env` for full gate-input trace |
+| `LOG_FILE` | `logs/cryptosentinel.log` | Rotating log file path |
+| `LOG_MAX_BYTES` | `5_000_000` | Max bytes per log file before rotation (5 MB) |
+| `LOG_BACKUP_COUNT` | `5` | Rotated files retained (~25 MB total) |
+
+### Speed Bumps
+| Setting | Default | Description |
+|---|---|---|
+| `MIN_SIGNAL_INTERVAL_MS` | `0` | Min ms between signal approvals (0 = disabled) |
+
+### Test Harness
+| Setting | Default | Description |
+|---|---|---|
+| `TEST_SIGNAL_INJECT` | `False` | Enable synthetic signal injection — only active via `start_test.sh` |
+| `TEST_INJECT_INTERVAL_MS` | `30_000` | ms between injected synthetic signals |
+
 ### Persistence
 | Setting | Default | Description |
 |---|---|---|
 | `REGISTRY_DB` | `strategies/registry.db` | Strategy registry + signal telemetry |
 | `LOB_TICK_DB` | `data/lob_tick.db` | LOB Recorder tick data |
+
+### Dashboard
+| Setting | Default | Description |
+|---|---|---|
+| `DASHBOARD_API_PORT` | `8080` | Port for aiohttp REST API (`/api/health`, `/api/portfolio`, `/api/killswitch`) |
+
+### Alerting
+| Setting | Default | Description |
+|---|---|---|
+| `ALERT_WEBHOOK_URL` | `""` | Optional webhook URL for kill-switch alerts (empty = disabled) |
 
 ---
 
@@ -453,14 +530,14 @@ All settings live in `config.py` and can be overridden via `.env`.
 
 ```
 Phase 1 — Live trading engine
-tests/test_risk_engine.py           49 tests  — 5-tier, killswitch, pyramid, circuit breakers
+tests/test_risk_engine.py           51 tests  — 5-tier, killswitch, pyramid, circuit breakers
 tests/test_microstructure_engine.py 30 tests  — legacy microstructure engine
-tests/test_executor.py              29 tests  — all 7 gates, telemetry emission
-tests/test_order_manager.py         22 tests  — IOC entry, OCO bracket, fill handling
+tests/test_executor.py              40 tests  — all 7 gates, telemetry emission
+tests/test_order_manager.py         29 tests  — IOC entry, OCO bracket, fill handling
 tests/test_lob_engine.py            20 tests  — state machine, gap detection, wall scan
 tests/test_startup_reconciler.py    14 tests  — reconciliation, midnight reset
-tests/test_microstructure.py        14 tests  — wall identification, absorption, sweep
-tests/test_lob_recorder.py          14 tests  — recorder flush, reconnect, stats
+tests/test_microstructure.py        20 tests  — wall identification, absorption, sweep
+tests/test_lob_recorder.py          27 tests  — recorder flush, reconnect, stats
 tests/test_features.py              14 tests  — Welford, no-lookahead, VWAP reset
 tests/test_cvd.py                   14 tests  — buy/sell CVD, 5-bar delta, std
 tests/test_db_writer.py             12 tests  — SQLite write, upsert, purge
@@ -472,25 +549,27 @@ tests/test_models.py                 6 tests  — PortfolioState, WallState, Fea
 tests/test_integration.py            2 tests  — end-to-end signal → execution pipeline
 
 Phase 3 — REST API + LOB snapshot writer + Dash dashboard
-tests/test_rest_api.py              10 tests  — /api/health, /api/portfolio, /api/killswitch
-tests/test_lob_snapshot_writer.py    6 tests  — snapshot writer, rolling cap, WAL mode
-tests/test_dashboard_live.py         5 tests  — /live page callback, engine badge, kill switch
+tests/test_rest_api.py              11 tests  — /api/health, /api/portfolio, /api/killswitch
+tests/test_lob_snapshot_writer.py    7 tests  — snapshot writer, rolling cap, WAL mode
+tests/test_dashboard_live.py         6 tests  — /live page callback, engine badge, kill switch
 tests/test_dashboard_registry.py     4 tests  — /registry page, strategy lifecycle display
+tests/test_dashboard_walls.py        6 tests  — /walls page callback, trace structure, invalid-JSON guard
+tests/test_alerting.py               3 tests  — AlertDispatcher webhook, empty-URL guard
 
 Phase 2 — Backtesting + strategy lifecycle
-tests/test_bt_event_engine.py       23 tests  — event-driven engine: tiers, exits, full run
-tests/test_registry.py              16 tests  — lifecycle gates, YAML roundtrip, promotion
-tests/test_bt_tick_replay.py        13 tests  — tick replay fidelity, streaming, CVD reset
+tests/test_bt_event_engine.py       24 tests  — event-driven engine: tiers, exits, full run
+tests/test_registry.py              29 tests  — lifecycle gates, YAML roundtrip, promotion
+tests/test_bt_tick_replay.py        16 tests  — tick replay fidelity, streaming, CVD reset
 tests/test_bt_walk_forward.py        9 tests  — window splits, OOS isolation, leaderboard
-tests/test_bt_metrics.py             9 tests  — Sharpe, MDD, PF, composite score
+tests/test_bt_metrics.py            10 tests  — Sharpe, MDD, PF, composite score
 tests/test_validator.py              7 tests  — null repair, duplicate removal, gap detection
 tests/test_scorer.py                 7 tests  — XGBoost train, AUC, save/load, fallback
 tests/test_fetcher.py                6 tests  — OHLCV fetch, cache, resample
-tests/test_bt_signals.py             6 tests  — signal arrays, no-lookahead, SL/TP NaN
-tests/test_bt_vectorbt.py            5 tests  — Optuna optimisation, sensitivity
+tests/test_bt_signals.py             7 tests  — signal arrays, no-lookahead, SL/TP NaN
+tests/test_bt_vectorbt.py            6 tests  — Optuna optimisation, sensitivity
 tests/test_bt_costs.py               5 tests  — round-trip cost, maker/taker, zero qty
 ──────────────────────────────────────────────────────────────────────────────
-Total                              405 tests
+Total                              476 tests
 ```
 
 ---
@@ -529,7 +608,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 | Dashboard | Dash + dash-bootstrap | 2.17 + 1.6 | All UI pages (Phase 3) |
 | Charts | plotly | 5.22.x | All visualisations |
 | Persistence | SQLite | stdlib | All databases |
-| Logging | loguru | 0.7.x | Structured logs |
+| Logging | Python stdlib logging | 3.13+ | RotatingFileHandler, INFO/DEBUG configurable via `LOG_LEVEL` |
 | Serialisation | PyYAML | 6.0.1 | StrategySpec configs |
 
 ---

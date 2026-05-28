@@ -15,8 +15,10 @@ Startup sequence (master arch §9):
 """
 import asyncio
 import logging
+import os
 import signal
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 
 from aiohttp import web
 from binance import AsyncClient
@@ -44,10 +46,21 @@ from strategy.features import FeatureComputer
 from strategy.microstructure import MicrostructureDetector
 from strategy.registry import StrategyRegistry
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_LOG_LEVEL  = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+
+logging.basicConfig(level=_LOG_LEVEL, format=_LOG_FORMAT)
+
+os.makedirs(os.path.dirname(settings.LOG_FILE), exist_ok=True)
+_file_handler = RotatingFileHandler(
+    settings.LOG_FILE,
+    maxBytes=settings.LOG_MAX_BYTES,
+    backupCount=settings.LOG_BACKUP_COUNT,
 )
+_file_handler.setLevel(_LOG_LEVEL)
+_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+logging.getLogger().addHandler(_file_handler)
+
 logger = logging.getLogger(__name__)
 
 STARTING_EQUITY = 10_000.0
@@ -484,6 +497,13 @@ async def main() -> None:
                 ),
                 name="api_server",
             )
+            if settings.TEST_SIGNAL_INJECT:
+                logger.info("[Main] TEST_SIGNAL_INJECT=True — signal injector starting")
+                from scripts.signal_injector import run as _injector_run
+                tg.create_task(
+                    _injector_run(micro_signal_queue, lob_engine, feature_computer, shared_state, cvd_calculator),
+                    name="signal_injector",
+                )
     except* asyncio.CancelledError:
         pass
     except* Exception as eg:

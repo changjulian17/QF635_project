@@ -197,7 +197,7 @@ class PersistenceMonitor:
                             await order_manager.handle_safety_exit("SPREAD_HARD_CAP")
                         return
 
-            walls = await lob_engine.get_current_walls()
+            walls = await lob_engine.get_current_walls(sigma=settings.LOB_WALL_SIGMA)
             if not _wall_present(protection_wall_price, walls):
                 logger.warning(
                     "[Gate6] Protection wall at %.2f removed — alerting order manager",
@@ -342,9 +342,25 @@ class StrategyExecutor:
             strategy_id  = self._strategy_id,
         )
 
+        cw = signal.consumed_wall
+        pw = signal.protection_wall
+        logger.info(
+            "[Executor] --> %s %s mid=%.2f consumed=%s@%.2f(%.3f) protection=%s@%.2f(%.3f) absorption=%s cvd=%.1fstd move=%+.3f%%",
+            signal.direction, signal.signal_type, signal.mid_price,
+            cw.side if cw else "?", cw.price if cw else 0.0, cw.qty_current if cw else 0.0,
+            pw.side if pw else "?", pw.price if pw else 0.0, pw.qty_current if pw else 0.0,
+            signal.prior_absorption, signal.cvd_std, signal.price_move_pct * 100,
+        )
+
         # Gate 0 — data fidelity
         ok, reason = gate_0_data_fidelity(
             self._state.lob_status, self._state.heartbeat_status
+        )
+        logger.info(
+            "[Gate0] %s lob=%s hb=%s%s",
+            "PASS" if ok else "FAIL",
+            self._state.lob_status, self._state.heartbeat_status,
+            "" if ok else f" → {reason}",
         )
         if not ok:
             self._reject(rec, "GATE_0_FAIL", reason)
@@ -352,6 +368,15 @@ class StrategyExecutor:
 
         # Gate 1 — microstructure (prior absorption on protection wall required)
         ok, reason = gate_1_microstructure(signal, signal.prior_absorption)
+        logger.info(
+            "[Gate1] %s type=%s consumed=%s protection=%s absorption=%s%s",
+            "PASS" if ok else "FAIL",
+            signal.signal_type,
+            cw.side if cw else "?",
+            pw.side if pw else "?",
+            signal.prior_absorption,
+            "" if ok else f" → {reason}",
+        )
         if not ok:
             self._reject(rec, "GATE_1_FAIL", reason)
             return
@@ -360,6 +385,7 @@ class StrategyExecutor:
         fv = self._fc.compute(cvd_calculator=self._cvd, shared_state=self._state)
 
         if fv is None:
+            logger.info("[Gate2] FAIL fv=None (warmup incomplete)")
             self._reject(rec, "GATE_2_FAIL", "feature vector not ready")
             return
 
@@ -367,6 +393,11 @@ class StrategyExecutor:
         spread_p95 = self._spread_p95
         self._log_spread_stats.update(math.log(max(fv.spread_bps, 1e-4)))
 
+        # Effective minimum is the stricter of base threshold and tier-elevated threshold
+        effective_min_conf = max(
+            settings.MIN_CONFIDENCE,
+            TIER_MIN_CONFIDENCE.get(self._risk_tier, settings.MIN_CONFIDENCE),
+        )
         ok, reason, confidence = gate_2_confidence(fv, signal, self._scorer)
         rec.confidence       = confidence
         rec.obi_zscore       = fv.obi_zscore
@@ -375,14 +406,21 @@ class StrategyExecutor:
         rec.features_json    = json.dumps(fv.to_ml_array())
         rec.lob_status       = fv.lob_status
         rec.heartbeat_status = self._state.heartbeat_status
+
+        # Tier-elevated minimum confidence (REDUCED=0.65, MINIMAL=0.80)
+        if ok and confidence < effective_min_conf:
+            ok = False
+            reason = f"confidence {confidence:.3f} < tier-{self._risk_tier} min {effective_min_conf:.2f}"
+
+        logger.info(
+            "[Gate2] %s confidence=%.3f (min=%.3f) obi=%+.2f vol=%.1fx spread=%.1fbps cvd=%+.4f%s",
+            "PASS" if ok else "FAIL",
+            confidence, effective_min_conf,
+            fv.obi_zscore, fv.vol_ratio, fv.spread_bps, fv.cvd_delta,
+            "" if ok else f" → {reason}",
+        )
         if not ok:
             self._reject(rec, "GATE_2_FAIL", reason)
-            return
-        # Tier-elevated minimum confidence (REDUCED=0.65, MINIMAL=0.80)
-        min_conf = TIER_MIN_CONFIDENCE.get(self._risk_tier, settings.MIN_CONFIDENCE)
-        if confidence < min_conf:
-            self._reject(rec, "GATE_2_FAIL",
-                         f"confidence {confidence:.3f} < tier-{self._risk_tier} min {min_conf:.2f}")
             return
 
         # Gate 3 — capital
@@ -391,19 +429,41 @@ class StrategyExecutor:
             if self._order_manager and hasattr(self._order_manager, "has_active_exposure")
             else False
         )
+        budget_remaining = self._budget.remaining if self._budget is not None else float("inf")
         ok, reason = gate_3_capital(self._budget, self._risk_tier, active_exposure)
+        logger.info(
+            "[Gate3] %s tier=%s budget=%.2f exposure=%s%s",
+            "PASS" if ok else "FAIL",
+            self._risk_tier, budget_remaining, active_exposure,
+            "" if ok else f" → {reason}",
+        )
         if not ok:
             self._reject(rec, "GATE_3_FAIL", reason)
             return
 
-        # Gate 4 — order selection (session-aware spread p95)
-        ok, reason, order_type = gate_4_order_selection(fv.spread_bps, spread_p95)
+        # Gate 4 — order selection (session-aware spread p95 + strategy hard cap)
+        ok, reason, order_type = gate_4_order_selection(
+            fv.spread_bps, spread_p95, self._entry_rules.spread_max_bps
+        )
+        logger.info(
+            "[Gate4] %s spread=%.1fbps p95=%.1fbps hard_cap=%.1fbps%s",
+            "PASS" if ok else "FAIL",
+            fv.spread_bps, spread_p95, self._entry_rules.spread_max_bps,
+            "" if ok else f" → {reason}",
+        )
         if not ok:
             self._reject(rec, "GATE_4_FAIL", reason)
             return
 
         # Gate 5 — execution sync
         ok, reason = gate_5_execution_sync(signal.timestamp_ms, self._state.last_delta_ms)
+        signal_age_ms = int(time.time() * 1000) - signal.timestamp_ms
+        logger.info(
+            "[Gate5] %s age=%dms latency=%.0fms%s",
+            "PASS" if ok else "FAIL",
+            signal_age_ms, self._state.last_delta_ms,
+            "" if ok else f" → {reason}",
+        )
         if not ok:
             self._reject(rec, "GATE_5_FAIL", reason)
             return
@@ -413,6 +473,10 @@ class StrategyExecutor:
             now_ms = int(time.time() * 1000)
             elapsed_ms = now_ms - self._last_approved_ms
             if elapsed_ms < settings.MIN_SIGNAL_INTERVAL_MS:
+                logger.info(
+                    "[RateLimit] FAIL elapsed=%dms < min=%dms",
+                    elapsed_ms, settings.MIN_SIGNAL_INTERVAL_MS,
+                )
                 self._reject(rec, "RATE_LIMIT",
                              f"rate limit: {elapsed_ms}ms < {settings.MIN_SIGNAL_INTERVAL_MS}ms")
                 return
@@ -440,9 +504,12 @@ class StrategyExecutor:
         await self._signal_q.put(order_req)
         self._last_approved_ms = int(time.time() * 1000)
         logger.info(
-            "[Executor] APPROVED %s %s confidence=%.3f order_type=%s notional_hint=%.4f%%",
-            signal.direction, signal.signal_type, confidence, order_type,
-            notional_hint * 100,
+            "[Executor] APPROVED %s %s confidence=%.3f notional=%.4f%% tier=%s | consumed=%s@%.2f protection=%s@%.2f mid=%.2f",
+            signal.direction, order_type, confidence, notional_hint * 100,
+            self._risk_tier,
+            cw.side if cw else "?", cw.price if cw else 0.0,
+            pw.side if pw else "?", pw.price if pw else 0.0,
+            signal.mid_price,
         )
 
         # Gate 6 — watch for fill confirmation, then start persistence monitor.

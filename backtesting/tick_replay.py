@@ -464,6 +464,7 @@ class TickReplayEngine:
                     prior_absorption = self._absorption_flags.get(ws.price, False),
                     cvd_std          = cvd_spike_std,
                     price_move_pct   = price_move_pct,
+                    mid_price        = self._prev_mid,
                 )
                 del self._wall_states[ws.price]
                 self._absorption_flags.pop(ws.price, None)

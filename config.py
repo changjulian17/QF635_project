@@ -77,6 +77,8 @@ class Settings(BaseSettings):
     PROTECTION_MAX_DISTANCE_BPS: float = 25.0
     MICRO_MAX_HOLD_MS: int = 60_000
     MICRO_EXIT_SPREAD_HARD_CAP_BPS: float = 12.0
+    LOB_FRESH_WALL_MS: int = 3_000    # protection wall must appear within this window
+    LOB_STALE_WALL_MS: int = 30_000   # prune wall states not seen for this long
 
     # Heartbeat monitor (§4)
     HEARTBEAT_WARN_MS: int = 200
@@ -94,8 +96,19 @@ class Settings(BaseSettings):
     # Alerting
     ALERT_WEBHOOK_URL: str = ""         # optional; empty = disabled
 
+    # Logging
+    LOG_LEVEL: str = "INFO"             # set LOG_LEVEL=DEBUG in .env for full gate-input trace
+    LOG_FILE: str = "logs/cryptosentinel.log"
+    LOG_MAX_BYTES: int = 5_000_000      # 5 MB per file
+    LOG_BACKUP_COUNT: int = 5           # keep 5 rotated files (~25 MB total)
+
     # Speed bumps
     MIN_SIGNAL_INTERVAL_MS: int = 0     # 0 = disabled; e.g. 500 enforces ≤2 approvals/sec
+
+    # Test harness — inject synthetic signals to validate execution pipeline without
+    # waiting for a natural Sweep+Protection event (set in .env, never in prod)
+    TEST_SIGNAL_INJECT: bool = False
+    TEST_INJECT_INTERVAL_MS: int = 30_000   # ms between injected signals
 
     @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":
@@ -132,6 +145,12 @@ class Settings(BaseSettings):
             "MICRO_MAX_HOLD_MS must be > 0"
         assert self.MICRO_EXIT_SPREAD_HARD_CAP_BPS > 0.0, \
             "MICRO_EXIT_SPREAD_HARD_CAP_BPS must be > 0"
+        if self.MIN_SIGNAL_INTERVAL_MS > 0:
+            assert self.MIN_SIGNAL_INTERVAL_MS < self.IOC_TIMEOUT_MS, (
+                f"MIN_SIGNAL_INTERVAL_MS ({self.MIN_SIGNAL_INTERVAL_MS}ms) must be < "
+                f"IOC_TIMEOUT_MS ({self.IOC_TIMEOUT_MS}ms) — otherwise approved signals "
+                f"expire before the next approval window opens"
+            )
         return self
 
 

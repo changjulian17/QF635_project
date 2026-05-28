@@ -20,8 +20,6 @@ from models import AggTrade, MicroSignal, WallState
 logger = logging.getLogger(__name__)
 
 _CONSUMED_RATIO   = 0.15     # wall qty below this fraction of initial → consumed
-_FRESH_WALL_MS    = 3_000    # protection wall must appear within 3 s
-_STALE_WALL_MS    = 30_000   # prune wall states not seen for 30 s
 
 
 def price_move_floor_pct(floor_bps: float | None = None) -> float:
@@ -80,7 +78,7 @@ def valid_protection_walls(
     valid = [
         w for w in fresh_walls_behind
         if w.side == required_side
-        and (now_ms - w.first_seen_ts) <= _FRESH_WALL_MS
+        and (now_ms - w.first_seen_ts) <= settings.LOB_FRESH_WALL_MS
         and mid_price > 0.0
         and abs(w.price - mid_price) / mid_price * 10_000 <= max_bps
         and is_behind(w)
@@ -325,7 +323,10 @@ class MicrostructureDetector:
         for ws in self._wall_states.values():
             if detect_absorption(ws, cvd_delta_3t, price_move_pct, ws.reload_ratio):
                 self._absorption_armed[ws.price] = True
-                logger.debug("[MS] Absorption armed at price=%.2f side=%s", ws.price, ws.side)
+                logger.info(
+                    "[MS] Absorption armed price=%.2f side=%s reload=%.0f%%",
+                    ws.price, ws.side, ws.reload_ratio * 100,
+                )
 
         # Sweep + Protection check — 1-tick delta captures the momentary spike
         cvd_delta_1t  = self._cvd.get_cvd_delta(1)
@@ -338,7 +339,7 @@ class MicrostructureDetector:
             opposite = "ask" if ws.side == "bid" else "bid"
             fresh_behind = [
                 w for w in self._wall_states.values()
-                if w.side == opposite and (now_ms - w.first_seen_ts) <= _FRESH_WALL_MS
+                if w.side == opposite and (now_ms - w.first_seen_ts) <= settings.LOB_FRESH_WALL_MS
             ]
             fired, info = detect_sweep_with_protection(
                 ws,
@@ -350,27 +351,32 @@ class MicrostructureDetector:
                 price_move_threshold=price_move_threshold,
             )
             if fired:
+                pw = info.get("protection_wall")
                 signal = MicroSignal(
                     signal_type      = "SWEEP_WITH_PROTECTION",
                     direction        = info["direction"],
                     timestamp_ms     = now_ms,
                     consumed_wall    = ws,
-                    protection_wall  = info.get("protection_wall"),
+                    protection_wall  = pw,
                     prior_absorption = self._absorption_armed.get(price, False),
                     cvd_std          = cvd_spike_std,
                     price_move_pct   = price_move_pct,
+                    mid_price        = mid,
                 )
                 await self._signal_queue.put(signal)
                 logger.info(
-                    "[MS] Sweep+Protection %s @ %.2f → signal emitted",
-                    info["direction"], price,
+                    "[MS] Sweep+Protection %s mid=%.2f | consumed=%s@%.2f(%.3f) protection=%s@%.2f(%.3f) cvd=%.1fstd move=%+.3f%%",
+                    info["direction"], mid,
+                    ws.side, ws.price, ws.qty_current,
+                    pw.side if pw else "?", pw.price if pw else 0.0, pw.qty_current if pw else 0.0,
+                    cvd_spike_std, price_move_pct * 100,
                 )
                 self._absorption_armed.pop(price, None)
                 del self._wall_states[price]
                 break  # one signal per depth tick — prevents cascade signals from simultaneous sweeps
 
         # Prune stale walls and their absorption flags
-        stale = [p for p, w in self._wall_states.items() if (now_ms - w.last_seen_ts) >= _STALE_WALL_MS]
+        stale = [p for p, w in self._wall_states.items() if (now_ms - w.last_seen_ts) >= settings.LOB_STALE_WALL_MS]
         for p in stale:
             del self._wall_states[p]
             self._absorption_armed.pop(p, None)
