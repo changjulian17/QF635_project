@@ -17,7 +17,6 @@ core/
   lob_recorder.py      — Always-on LOB data collector (real Binance public stream)
   cvd.py               — Standalone CVD calculator (WelfordOnline std)
   signal_telemetry.py  — Async signal record writer (all gates, pass + fail)
-  pattern_detector.py  — OHLCV chart pattern detection (context/boost)
 
 strategy/
   features.py          — FeatureComputer + WelfordOnline (15 features, no look-ahead)
@@ -31,7 +30,6 @@ strategy/
 risk/
   engine.py            — RiskEngine — 5-tier throttling, DOV, circuit breakers
   budget.py            — DailyBudget — shared pool, remaining, loss_pct, reset
-  pyramid.py           — PyramidController — 3-leg scaling (100%/50%/25%)
   killswitch.py        — GlobalKillswitch — KS-1 budget / KS-2 heartbeat / KS-3 slippage
 
 execution/

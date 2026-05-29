@@ -9,7 +9,7 @@ Startup sequence (master arch §9):
   5. LOB warm-up guard (0.5 s)
   6. Start TaskGroup with all coroutines:
        lob_recorder, ws_consumer, depth_fanout, lob_engine, micro_detector,
-       pattern_detector, strategy_executor, risk_engine, order_manager,
+       feature_candle_loop, strategy_executor, order_manager,
        signal_telemetry, midnight_reset_loop, db_writer, fill_processor,
        portfolio_mtm_loop
 """
@@ -28,7 +28,6 @@ from core.alerting import AlertDispatcher
 from core.cvd import CVDCalculator
 from core.lob_engine import LocalOrderBook
 from core.lob_recorder import LOBRecorder
-from core.pattern_detector import PatternDetector
 from core.signal_telemetry import SignalTelemetry
 from core.startup_reconciler import reconcile_on_startup
 from core.ws_consumer import BinanceWebSocketConsumer
@@ -36,11 +35,10 @@ from engine.db_writer import DBWriter, init_db
 from engine.lob_snapshot_writer import lob_snapshot_writer as _lob_snapshot_writer
 from engine.realtime_hub import RealtimeHub
 from execution.order_manager import OrderManager
-from models import FillDetail, PortfolioState, SharedState
+from models import Candle, FillDetail, PortfolioState, SharedState
 from risk.budget import DailyBudget
 from risk.engine import RiskEngine
 from risk.killswitch import GlobalKillswitch
-from risk.pyramid import PyramidController
 from strategy.executor import StrategyExecutor
 from strategy.features import FeatureComputer
 from strategy.microstructure import MicrostructureDetector
@@ -187,11 +185,14 @@ async def _run_lob_engine(lob: LocalOrderBook, depth_q: asyncio.Queue) -> None:
         await lob.apply_snapshot(msg)
 
 
-async def _drain_queue(queue: asyncio.Queue) -> None:
-    """Consume and discard all messages so the queue never backs up."""
+async def _feature_candle_loop(
+    candle_q: asyncio.Queue,
+    feature_computer: FeatureComputer,
+) -> None:
+    """Feed closed candles into FeatureComputer without running the legacy pattern pipeline."""
     while True:
-        await queue.get()
-
+        candle: Candle = await candle_q.get()
+        feature_computer.update_candle(candle)
 
 
 async def _api_server(
@@ -340,18 +341,14 @@ async def main() -> None:
 
     killswitch      = GlobalKillswitch(STARTING_EQUITY)
     budget          = DailyBudget.from_equity(STARTING_EQUITY)
-    pyramid         = PyramidController()
     cvd_calculator  = CVDCalculator()
     lob_engine      = LocalOrderBook(shared_state=shared_state)
     feature_computer = FeatureComputer()
 
     # Queues ──────────────────────────────────────────────────────────────────
-    # Legacy pattern pipeline: PatternDetector → RiskEngine (kept running; output drained)
+    # Candle queue feeds FeatureComputer directly. Legacy pattern execution is disabled.
     candle_queue:       asyncio.Queue = asyncio.Queue(maxsize=200)
     candle_db_queue:    asyncio.Queue = asyncio.Queue(maxsize=200)
-    signal_queue:       asyncio.Queue = asyncio.Queue(maxsize=50)
-    signal_db_queue:    asyncio.Queue = asyncio.Queue(maxsize=50)
-    re_order_queue:     asyncio.Queue = asyncio.Queue(maxsize=50)
     ms_bar_queue:       asyncio.Queue = asyncio.Queue(maxsize=5000)
 
     # Micro pipeline: WSConsumer → depth fanout → LOB + MicroDetector → Executor → OrderManager
@@ -403,12 +400,6 @@ async def main() -> None:
         cvd_calculator=cvd_calculator,
         feature_computer=feature_computer,
     )
-    pattern_detector = PatternDetector(
-        candle_queue=candle_queue,
-        signal_queue=signal_queue,
-        signal_db_queue=signal_db_queue,
-        feature_computer=feature_computer,
-    )
     telemetry = SignalTelemetry(telemetry_queue=telemetry_queue)
 
     # Resolve active registered strategy so strategy_id and entry_rules can be
@@ -450,17 +441,13 @@ async def main() -> None:
     if _active_spec:
         strategy_executor.set_entry_rules(_active_spec.entry_rules)
     risk_engine = RiskEngine(
-        signal_queue=signal_queue,
-        order_queue=re_order_queue,
         portfolio=portfolio,
         budget=budget,
         killswitch=killswitch,
-        pyramid=pyramid,
         tier_change_cb=_on_tier_change,
     )
     db_writer = DBWriter(
         candle_queue=candle_db_queue,
-        signal_queue=signal_db_queue,
         portfolio=portfolio,
         ms_bar_queue=ms_bar_queue,
     )
@@ -504,14 +491,12 @@ async def main() -> None:
             tg.create_task(_depth_fanout(raw_depth_queue, lob_depth_queue, ms_depth_queue),  name="depth_fanout")
             tg.create_task(_run_lob_engine(lob_engine, lob_depth_queue),                     name="lob_engine")
             tg.create_task(micro_detector.run(),                                              name="micro_detector")
-            tg.create_task(pattern_detector.run(),                                            name="pattern_detector")
+            tg.create_task(_feature_candle_loop(candle_queue, feature_computer),              name="feature_candle_loop")
             tg.create_task(strategy_executor.run(),                                           name="strategy_executor")
-            tg.create_task(risk_engine.run(),                                                 name="risk_engine")
             tg.create_task(order_manager.start(),                                             name="order_manager")
             tg.create_task(telemetry.run(),                                                   name="signal_telemetry")
             tg.create_task(midnight_reset_loop(risk_engine, cvd_calculator),                  name="midnight_reset")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
-            tg.create_task(_drain_queue(re_order_queue),                                      name="re_order_drain")
             tg.create_task(_process_fills(fill_queue, portfolio, telemetry),                  name="fill_processor")
             tg.create_task(
                 _portfolio_mtm_loop(

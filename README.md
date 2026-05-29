@@ -663,3 +663,5 @@ These rules are invariants. Any code that violates them is incorrect.
 - [ ] Write up model documentation — FeatureComputer inputs, XGBoost scorer architecture, training pipeline. should include the diagram for how our components interact, including exchange, LOB, trade management.
 - [ ] Write up trading algorithm documentation — end-to-end flow from LOB tick to order submission
 - [ ] Consider placing a minimum-quantity resting order behind/after a significant liquidity wall — a fill on that order signals the wall has been consumed, providing a cleaner consumption trigger than depth-diff heuristics. Quantity must be as small as possible (min tick size on Binance Spot Testnet).
+- [ ] run through start_test.sh and make sure the trade execution with injector is working
+- [ ] review all code and test scripts to ensure no unused classes or functions

@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from config import settings
-from models import Candle, LOBSnapshot, MicrostructureBar, PatternSignal, PortfolioState
+from models import Candle, LOBSnapshot, MicrostructureBar, PortfolioState
 
 logger = logging.getLogger(__name__)
 
@@ -19,16 +19,6 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS candles (
                 open_time TEXT PRIMARY KEY,
                 open REAL, high REAL, low REAL, close REAL, volume REAL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                detected_at TEXT,
-                pattern TEXT, direction TEXT,
-                confidence REAL, entry_price REAL,
-                stop_loss REAL, take_profit REAL,
-                r2 REAL, volume_ratio REAL
             )
         """)
         conn.execute("""
@@ -88,12 +78,10 @@ class DBWriter:
     def __init__(
         self,
         candle_queue: asyncio.Queue,
-        signal_queue: asyncio.Queue,
         portfolio: PortfolioState,
         ms_bar_queue: asyncio.Queue,
     ) -> None:
         self._candle_queue = candle_queue
-        self._signal_queue = signal_queue
         self._portfolio = portfolio
         self._ms_bar_queue = ms_bar_queue
 
@@ -101,7 +89,6 @@ class DBWriter:
         logger.info("[DB] Writer started.")
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._candle_loop())
-            tg.create_task(self._signal_loop())
             tg.create_task(self._portfolio_loop())
             tg.create_task(self._ms_bar_loop())
             tg.create_task(self._cleanup_loop())
@@ -111,14 +98,6 @@ class DBWriter:
             candle: Candle = await self._candle_queue.get()
             try:
                 await asyncio.to_thread(self._write_candle, candle)
-            except Exception as e:
-                logger.warning("[DB] Write error (%s) — continuing", e)
-
-    async def _signal_loop(self) -> None:
-        while True:
-            signal: PatternSignal = await self._signal_queue.get()
-            try:
-                await asyncio.to_thread(self._write_signal, signal)
             except Exception as e:
                 logger.warning("[DB] Write error (%s) — continuing", e)
 
@@ -149,7 +128,7 @@ class DBWriter:
     def _purge_old_records(self) -> None:
         cutoff = f"-{self.RETENTION_DAYS} days"
         with sqlite3.connect(DB_PATH) as conn:
-            for table, col in [("candles", "open_time"), ("signals", "detected_at"), ("portfolio", "ts")]:
+            for table, col in [("candles", "open_time"), ("portfolio", "ts")]:
                 deleted = conn.execute(
                     f"DELETE FROM {table} WHERE {col} < datetime('now', ?)", (cutoff,)
                 ).rowcount
@@ -164,20 +143,6 @@ class DBWriter:
                 "INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?)",
                 (candle.open_time.isoformat(), candle.open, candle.high,
                  candle.low, candle.close, candle.volume),
-            )
-            conn.commit()
-
-    @staticmethod
-    def _write_signal(signal: PatternSignal) -> None:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                """INSERT INTO signals
-                   (detected_at, pattern, direction, confidence, entry_price,
-                    stop_loss, take_profit, r2, volume_ratio)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (signal.detected_at.isoformat(), signal.pattern.name,
-                 signal.direction.name, signal.confidence, signal.entry_price,
-                 signal.stop_loss, signal.take_profit, signal.r2, signal.volume_ratio),
             )
             conn.commit()
 

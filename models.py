@@ -1,16 +1,8 @@
 import asyncio
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from datetime import datetime, timezone
 from typing import Optional
-
-class PatternType(Enum):
-    RISING_WEDGE = auto()
-    FALLING_WEDGE = auto()
-    SYMMETRICAL_TRIANGLE = auto()
-    SUPPORT_BREAKOUT = auto()
-    RESISTANCE_BREAKOUT = auto()
-    TRENDLINE_BOUNCE = auto()
 
 class Direction(Enum):
     LONG = "BUY"
@@ -30,25 +22,6 @@ class Candle:
     close: float
     volume: float
     is_closed: bool = False
-
-@dataclass
-class PatternSignal:
-    pattern: PatternType
-    direction: Direction
-    confidence: float
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    r2: float = 0.0
-    volume_ratio: float = 1.0
-
-@dataclass
-class OrderRequest:
-    signal: PatternSignal
-    quantity: float
-    approved: bool = False
-    rejection_reason: str = ""
 
 @dataclass
 class Position:

@@ -324,6 +324,15 @@ class OrderManager:
             )
             return None
 
+        notional = qty * limit_price
+        if notional < settings.MIN_NOTIONAL:
+            logger.warning(
+                "[Exec] Notional %.2f < MIN_NOTIONAL %.2f for signal %s "
+                "(sl_distance=%.2f likely caused by real-LOB vs testnet price mismatch) — skipped",
+                notional, settings.MIN_NOTIONAL, req.signal_id[:8], sl_distance,
+            )
+            return None
+
         entry_order = IOCLimitOrder(
             symbol   = settings.SYMBOL,
             side     = side,

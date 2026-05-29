@@ -35,14 +35,14 @@ class Settings(BaseSettings):
     MAX_CONSECUTIVE_LOSSES: int = 3
     RISK_PER_TRADE_PCT: float = 0.01
     KELLY_FRACTION: float = 0.25
-    ATR_MULTIPLIER_SL: float = 1.5   # legacy — used by pattern_detector.py only; microstructure path uses wall-based SL
+    ATR_MULTIPLIER_SL: float = 1.5   # legacy/backtest default; microstructure path uses wall-based SL
     ATR_MULTIPLIER_TP: float = 3.0
-    PYRAMID_MAX_LEGS: int = 3
 
     # Execution
     DRY_RUN: bool = True
     IOC_TIMEOUT_MS: int = 200          # IOC order max age before cancel-no-retry
     QTY_STEP_SIZE: float = 0.00001     # BTCUSDT LOT_SIZE stepSize
+    MIN_NOTIONAL: float = 100.0        # BTCUSDT NOTIONAL filter minimum (USD)
     SLIPPAGE_RESEARCH_BPS: float = 3.0  # expected slippage assumption (KS-3 baseline)
     SLIPPAGE_MULTIPLIER: float = 1.5    # KS-3 fires when rolling avg > research × multiplier
 

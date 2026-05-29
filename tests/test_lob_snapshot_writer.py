@@ -44,7 +44,6 @@ def _make_writer(db_file, monkeypatch):
     q = asyncio.Queue()
     return DBWriter(
         candle_queue=q,
-        signal_queue=q,
         portfolio=MagicMock(
             equity=10_000.0, daily_pnl=0.0, drawdown_pct=0.0,
             circuit_breaker=MagicMock(name="ACTIVE"),

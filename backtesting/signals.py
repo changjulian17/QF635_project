@@ -6,9 +6,9 @@ VectorBT-compatible signal generators for all CryptoSentinel strategies.
 Architecture Role
 -----------------
 This module sits between the raw OHLCV data and VectorBT's portfolio
-simulation layer. It converts the *same pattern detection logic* used
-in the live system (pattern_detector.py) into boolean numpy arrays
-that VectorBT can consume.
+simulation layer. It converts offline OHLCV pattern rules into boolean
+numpy arrays that VectorBT can consume. The live system now uses the
+LOB microstructure path rather than a chart-pattern execution path.
 
   OHLCV DataFrame
         │
