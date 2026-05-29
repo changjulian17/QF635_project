@@ -343,7 +343,29 @@ async def test_book_fn_used_in_dry_run():
     assert book == (94_990.0, 95_002.0)
 
 
-# ── 14. M3: full fill_queue drops record, does not block ─────────────────────
+# ── 14. M2: entry qty floor-quantized to LOT_SIZE stepSize ──────────────────
+
+@pytest.mark.asyncio
+async def test_entry_qty_floor_quantized_to_step():
+    """Computed entry qty is truncated down to the nearest QTY_STEP_SIZE multiple.
+
+    _make_req uses notional_hint=0.001, equity=10_000, protection wall at 94_000
+    for LONG. With best_ask=95_010: sl_distance=1010, raw=0.00990099...
+    round(..., 6) would give 0.009901 (fails LOT_SIZE: 990.1 steps).
+    Floor-quantize must give 0.00990 (990 steps exactly).
+    """
+    om, _, fill_q, _ = _make_manager()
+    req = _make_req("LONG")
+
+    with patch.object(settings, "DRY_RUN", True):
+        await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
+
+    fill: FillDetail = fill_q.get_nowait()
+    assert fill.qty == pytest.approx(0.00990)
+    assert fill.qty % settings.QTY_STEP_SIZE == pytest.approx(0.0)
+
+
+# ── 15. M3: full fill_queue drops record, does not block ─────────────────────
 
 @pytest.mark.asyncio
 async def test_fill_queue_full_drops_without_blocking():
@@ -367,7 +389,7 @@ async def test_fill_queue_full_drops_without_blocking():
     assert fill_q.empty()
 
 
-# ── 15. m2: OCO list_id stored as int, cancel uses int ───────────────────────
+# ── 16. m2: OCO list_id stored as int, cancel uses int ───────────────────────
 
 @pytest.mark.asyncio
 async def test_oco_list_id_stored_as_int():
@@ -386,7 +408,7 @@ async def test_oco_list_id_stored_as_int():
     assert isinstance(om._open_oco_list_id, int)
 
 
-# ── 16. S2: position_closed_event not set when emergency close unfilled ───────
+# ── 17. S2: position_closed_event not set when emergency close unfilled ───────
 
 @pytest.mark.asyncio
 async def test_s2_closed_event_not_set_on_unfilled_exit():
@@ -429,7 +451,7 @@ def test_weighted_avg_fill_no_fills_uses_price():
     assert _weighted_avg_fill(resp) == pytest.approx(99.5)
 
 
-# ── 17. S1 race fix: _placing_oco defers Gate 6 action ───────────────────────
+# ── 18. S1 race fix: _placing_oco defers Gate 6 action ───────────────────────
 
 @pytest.mark.asyncio
 async def test_s1_placing_oco_defers_wall_removed_handler():
@@ -460,7 +482,7 @@ async def test_s1_placing_oco_defers_wall_removed_handler():
     assert not closed_event.is_set()
 
 
-# ── 18. S1 race fix: _place_oco performs deferred cancel-and-close ────────────
+# ── 19. S1 race fix: _place_oco performs deferred cancel-and-close ────────────
 
 @pytest.mark.asyncio
 async def test_s1_deferred_cancel_executed_after_oco_placed():
@@ -496,7 +518,7 @@ async def test_s1_deferred_cancel_executed_after_oco_placed():
     assert om._cancel_oco_on_placement    is False
 
 
-# ── 19. S2 fix: state reset after successful emergency close from _place_oco ──
+# ── 20. S2 fix: state reset after successful emergency close from _place_oco ──
 
 @pytest.mark.asyncio
 async def test_s2_state_reset_after_oco_failed_and_closed():
@@ -534,7 +556,7 @@ async def test_s2_state_reset_after_oco_failed_and_closed():
     assert closed_event.is_set()
 
 
-# ── 20. OCO watcher records WIN on natural TP fill ───────────────────────────
+# ── 21. OCO watcher records WIN on natural TP fill ───────────────────────────
 
 @pytest.mark.asyncio
 async def test_watch_oco_win_records_outcome_and_sets_event():
@@ -581,7 +603,7 @@ async def test_watch_oco_win_records_outcome_and_sets_event():
     assert outcomes[0][2] == pytest.approx((exit_price - entry_price) * 0.001)
 
 
-# ── 21. OCO watcher exits cleanly on external close ──────────────────────────
+# ── 22. OCO watcher exits cleanly on external close ──────────────────────────
 
 @pytest.mark.asyncio
 async def test_watch_oco_exits_cleanly_on_external_close():
@@ -607,7 +629,7 @@ async def test_watch_oco_exits_cleanly_on_external_close():
     om._client.get_oco_order.assert_not_called() # no REST call made
 
 
-# ── 22. OCO watcher continues polling while EXECUTING ────────────────────────
+# ── 23. OCO watcher continues polling while EXECUTING ────────────────────────
 
 @pytest.mark.asyncio
 async def test_watch_oco_continues_polling_while_executing():
@@ -644,7 +666,7 @@ async def test_watch_oco_continues_polling_while_executing():
     assert closed_event.is_set()
 
 
-# ── 23. Active exposure guard ────────────────────────────────────────────────
+# ── 24. Active exposure guard ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_active_exposure_blocks_second_submit():

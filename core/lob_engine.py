@@ -241,6 +241,11 @@ class LocalOrderBook:
     def is_ready(self) -> bool:
         return self._ready
 
+    def best_bid_ask(self) -> tuple[float, float] | None:
+        if not self._ready or not self._bids or not self._asks:
+            return None
+        return max(self._bids), min(self._asks)
+
     @property
     def lob_status(self) -> str:
         return self._state.value

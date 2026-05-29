@@ -24,41 +24,80 @@ class HeartbeatMonitor:
     Tracks delta between Binance event time (field E) and local system time
     on every WebSocket message — never sampled, never batched (Rule 11).
 
-    Testnet note: 150–400ms latency is normal on testnet. WARN will trigger
-    frequently — this is expected. CRITICAL (500ms × 3 consecutive) is the
-    genuine killswitch condition.
+    Status transitions (rate computed over rolling 10-message window):
+      HEALTHY → DEGRADED when ≥50% of window exceeds WARN_MS (single log on entry)
+      DEGRADED → SUSTAINED_DEGRADED after HEARTBEAT_SUSTAINED_MS elapsed at ≥50% rate
+      any → HEALTHY when <30% of window exceeds WARN_MS (hysteresis, single log on exit)
+      any → CRITICAL after CONSEC_LIMIT consecutive packets exceed CRITICAL_MS (KS-2)
     """
     WARN_MS      = settings.HEARTBEAT_WARN_MS
     CRITICAL_MS  = settings.HEARTBEAT_CRITICAL_MS
     CONSEC_LIMIT = settings.HEARTBEAT_CONSEC_LIMIT
 
     def __init__(self) -> None:
-        self._deltas: deque[float] = deque(maxlen=10)
-        self._critical_count: int  = 0
-        self.status: str           = "HEALTHY"
-        self.last_delta_ms: float  = 0.0
+        self._deltas: deque[float]    = deque(maxlen=10)
+        self._critical_count: int     = 0
+        self._degraded_since_ms: float | None = None
+        self.status: str              = "HEALTHY"
+        self.last_delta_ms: float     = 0.0
 
     def record(self, event_time_ms: int) -> str:
         delta_ms           = (time.time() * 1000) - event_time_ms
         self.last_delta_ms = delta_ms
         self._deltas.append(delta_ms)
 
+        # ── CRITICAL: consecutive check (unchanged) ──────────────────────────
         if delta_ms > self.CRITICAL_MS:
             self._critical_count += 1
         else:
-            self._critical_count = 0   # reset on any healthy packet
+            self._critical_count = 0
 
         if self._critical_count >= self.CONSEC_LIMIT:
             self.status = "CRITICAL"
+            self._degraded_since_ms = None
             logger.critical(
-                "[Heartbeat] CRITICAL: %d consecutive >%dms packets. Last=%.0fms",
+                "[Heartbeat] CRITICAL: Binance WS latency %d consecutive >%dms. Last=%.0fms",
                 self._critical_count, self.CRITICAL_MS, delta_ms,
             )
-        elif delta_ms > self.WARN_MS:
-            self.status = "DEGRADED"
-            logger.warning("[Heartbeat] DEGRADED: delta=%.0fms", delta_ms)
-        else:
+            return self.status
+
+        # ── RATE-GATE: wait for full window before evaluating ─────────────────
+        if len(self._deltas) < self._deltas.maxlen:
+            return self.status
+
+        degraded_in_window = sum(1 for d in self._deltas if d > self.WARN_MS)
+        rate   = degraded_in_window / len(self._deltas)
+        now_ms = time.time() * 1000
+
+        if rate >= settings.HEARTBEAT_DEGRADED_RATE_THRESH:
+            if self.status in ("HEALTHY", "CRITICAL"):
+                self.status = "DEGRADED"
+                self._degraded_since_ms = now_ms
+                logger.warning(
+                    "[Heartbeat] DEGRADED: Binance WS latency %d/%d messages >%dms avg=%.0fms",
+                    degraded_in_window, len(self._deltas), self.WARN_MS, self.avg_delta_ms,
+                )
+            elif self.status == "DEGRADED" and self._degraded_since_ms is not None:
+                if (now_ms - self._degraded_since_ms) >= settings.HEARTBEAT_SUSTAINED_MS:
+                    self.status = "SUSTAINED_DEGRADED"
+                    logger.warning(
+                        "[Heartbeat] SUSTAINED_DEGRADED: Binance WS latency >%.0fs above %.0f%% degraded rate avg=%.0fms",
+                        settings.HEARTBEAT_SUSTAINED_MS / 1000,
+                        settings.HEARTBEAT_DEGRADED_RATE_THRESH * 100,
+                        self.avg_delta_ms,
+                    )
+            # elif already SUSTAINED_DEGRADED: remain, no repeated log
+
+        elif rate < settings.HEARTBEAT_DEGRADED_RECOVERY_THRESH:
+            if self.status in ("DEGRADED", "SUSTAINED_DEGRADED", "CRITICAL"):
+                logger.info(
+                    "[Heartbeat] RECOVERED: Binance WS latency normal from %s avg=%.0fms",
+                    self.status, self.avg_delta_ms,
+                )
             self.status = "HEALTHY"
+            self._degraded_since_ms = None
+
+        # else: rate in hysteresis zone — no transition
 
         return self.status
 

@@ -32,6 +32,7 @@ Adding a new order type requires only a new subclass — not changes here.
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 
@@ -77,7 +78,7 @@ class OrderManager:
         fill_queue: asyncio.Queue,
         killswitch: GlobalKillswitch,
         equity_fn: Callable[[], float],
-        book_fn: Callable[[], tuple[float, float]] | None = None,
+        book_fn: Callable[[], tuple[float, float] | None] | None = None,
         ks_fire_cb: Callable[[str], Awaitable[None]] | None = None,
         update_outcome_cb: Callable[[str, str, float, float, float], Awaitable[None]] | None = None,
         budget_update_cb: Callable[[float], None] | None = None,
@@ -313,7 +314,9 @@ class OrderManager:
             )
             return None
 
-        qty = round((self._equity_fn() * req.notional_hint) / sl_distance, 6)
+        raw_qty = (self._equity_fn() * req.notional_hint) / sl_distance
+        step    = settings.QTY_STEP_SIZE
+        qty     = round(math.floor(raw_qty / step) * step, 5)
         if qty <= 0:
             logger.warning(
                 "[Exec] Zero qty for signal %s — skipped", req.signal_id[:8]

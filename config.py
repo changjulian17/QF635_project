@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     # Execution
     DRY_RUN: bool = True
     IOC_TIMEOUT_MS: int = 200          # IOC order max age before cancel-no-retry
+    QTY_STEP_SIZE: float = 0.00001     # BTCUSDT LOT_SIZE stepSize
     SLIPPAGE_RESEARCH_BPS: float = 3.0  # expected slippage assumption (KS-3 baseline)
     SLIPPAGE_MULTIPLIER: float = 1.5    # KS-3 fires when rolling avg > research × multiplier
 
@@ -84,6 +85,9 @@ class Settings(BaseSettings):
     HEARTBEAT_WARN_MS: int = 200
     HEARTBEAT_CRITICAL_MS: int = 500
     HEARTBEAT_CONSEC_LIMIT: int = 3
+    HEARTBEAT_DEGRADED_RATE_THRESH: float = 0.5    # ≥50% of 10-msg window → enter DEGRADED
+    HEARTBEAT_DEGRADED_RECOVERY_THRESH: float = 0.3 # <30% of window → exit (hysteresis)
+    HEARTBEAT_SUSTAINED_MS: int = 10_000            # ms in DEGRADED before SUSTAINED_DEGRADED
 
     # Persistence
     REGISTRY_DB: str = "strategies/registry.db"

@@ -399,6 +399,7 @@ async def main() -> None:
         fill_queue=fill_queue,
         killswitch=killswitch,
         equity_fn=lambda: portfolio.equity,
+        book_fn=lob_engine.best_bid_ask,
         ks_fire_cb=_ks_fire_cb,
         update_outcome_cb=telemetry.update_outcome,
         budget_update_cb=lambda pnl: setattr(budget, "realised_pnl", budget.realised_pnl + pnl),

@@ -40,8 +40,8 @@ def _wall_present(price: float, walls: list[dict], tol: float = 0.01) -> bool:
 def gate_0_data_fidelity(lob_status: str, heartbeat_status: str) -> tuple[bool, str]:
     if lob_status != "SYNCED":
         return False, f"LOB not SYNCED ({lob_status})"
-    if heartbeat_status == "CRITICAL":
-        return False, "heartbeat CRITICAL"
+    if heartbeat_status in ("CRITICAL", "SUSTAINED_DEGRADED"):
+        return False, f"heartbeat {heartbeat_status}"
     return True, ""
 
 
@@ -172,7 +172,7 @@ class PersistenceMonitor:
                 return
 
             if shared_state is not None and (
-                shared_state.heartbeat_status == "CRITICAL"
+                shared_state.heartbeat_status in ("CRITICAL", "SUSTAINED_DEGRADED")
                 or shared_state.last_delta_ms > settings.HEARTBEAT_CRITICAL_MS
             ):
                 logger.warning("[Gate6] Heartbeat/latency critical — triggering safety exit")

@@ -29,6 +29,17 @@ def test_ready_after_snapshot():
     assert lob.is_ready
 
 
+def test_best_bid_ask_not_ready():
+    lob = LocalOrderBook()
+    assert lob.best_bid_ask() is None
+
+
+def test_best_bid_ask_returns_top_of_book():
+    lob = LocalOrderBook()
+    lob.set_snapshot(snapshot_data())   # bids=[30000, 29999], asks=[30001, 30002]
+    assert lob.best_bid_ask() == (30000.0, 30001.0)
+
+
 async def test_snapshot_populates_bids_and_asks():
     lob = LocalOrderBook()
     lob.set_snapshot(snapshot_data())
