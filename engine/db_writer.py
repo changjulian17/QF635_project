@@ -35,7 +35,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS portfolio (
                 ts TEXT PRIMARY KEY,
                 equity REAL, daily_pnl REAL,
-                drawdown_pct REAL, circuit_breaker TEXT
+                drawdown_pct REAL, circuit_breaker TEXT,
+                num_trades INTEGER DEFAULT 0,
+                num_wins INTEGER DEFAULT 0,
+                budget_loss_pct REAL DEFAULT 0.0,
+                avg_slippage_bps REAL DEFAULT 0.0
             )
         """)
         conn.execute("""
@@ -62,6 +66,16 @@ def init_db() -> None:
                 ask_levels_json TEXT
             )
         """)
+        for col, typedef in [
+            ("num_trades",       "INTEGER DEFAULT 0"),
+            ("num_wins",         "INTEGER DEFAULT 0"),
+            ("budget_loss_pct",  "REAL DEFAULT 0.0"),
+            ("avg_slippage_bps", "REAL DEFAULT 0.0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE portfolio ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
     logger.info("[DB] Database initialized.")
 
@@ -171,9 +185,14 @@ class DBWriter:
     def _write_portfolio(pf: PortfolioState) -> None:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO portfolio VALUES (?,?,?,?,?)",
-                (datetime.now(timezone.utc).isoformat(), pf.equity,
-                 pf.daily_pnl, pf.drawdown_pct, pf.circuit_breaker.name),
+                "INSERT OR REPLACE INTO portfolio VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    pf.equity, pf.daily_pnl, pf.drawdown_pct,
+                    pf.circuit_breaker.name,
+                    pf.num_trades, pf.num_wins,
+                    pf.budget_loss_pct, pf.avg_slippage_bps,
+                ),
             )
             conn.commit()
 

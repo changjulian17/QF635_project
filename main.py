@@ -45,6 +45,7 @@ from strategy.executor import StrategyExecutor
 from strategy.features import FeatureComputer
 from strategy.microstructure import MicrostructureDetector
 from strategy.registry import StrategyRegistry
+from dashboard._db import DBOffline, fetch_pnl_by_pattern, fetch_session_stats
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _LOG_LEVEL  = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
@@ -232,7 +233,26 @@ async def _api_server(
             "daily_pnl": portfolio.daily_pnl,
             "drawdown_pct": portfolio.drawdown_pct,
             "consecutive_losses": portfolio.consecutive_losses,
+            "num_trades": portfolio.num_trades,
+            "num_wins": portfolio.num_wins,
+            "num_fill_samples": portfolio.num_fill_samples,
+            "avg_slippage_bps": portfolio.avg_slippage_bps,
+            "budget_loss_pct": portfolio.budget_loss_pct,
             "positions": positions,
+        })
+
+    async def _handle_session(request: web.Request) -> web.Response:
+        stats = await asyncio.to_thread(fetch_session_stats, 24)
+        if isinstance(stats, DBOffline):
+            return web.json_response({"error": "registry offline"}, status=503)
+        pnl_by_pattern = await asyncio.to_thread(fetch_pnl_by_pattern, 24)
+        total = stats.get("total_trades") or 0
+        wins  = stats.get("wins") or 0
+        return web.json_response({
+            **{k: (v if v is not None else 0) for k, v in stats.items()},
+            "win_rate":        wins / total if total > 0 else 0.0,
+            "budget_loss_pct": portfolio.budget_loss_pct,
+            "pnl_by_pattern":  pnl_by_pattern if not isinstance(pnl_by_pattern, DBOffline) else {},
         })
 
     async def _handle_killswitch(request: web.Request) -> web.Response:
@@ -263,6 +283,7 @@ async def _api_server(
     app = web.Application()
     app.router.add_get("/api/health", _handle_health)
     app.router.add_get("/api/portfolio", _handle_portfolio)
+    app.router.add_get("/api/session", _handle_session)
     app.router.add_post("/api/killswitch", _handle_killswitch)
     app.router.add_get("/ws/lob", _handle_ws_lob)
 
@@ -277,7 +298,11 @@ async def _api_server(
         await runner.cleanup()  # guarantee socket release on any exit path
 
 
-async def _process_fills(fill_q: asyncio.Queue) -> None:
+async def _process_fills(
+    fill_q: asyncio.Queue,
+    portfolio: PortfolioState,
+    telemetry: SignalTelemetry,
+) -> None:
     """Consume and log IOC entry fills. Outcome/PnL recording happens via update_outcome_cb."""
     while True:
         fill: FillDetail = await fill_q.get()
@@ -285,6 +310,12 @@ async def _process_fills(fill_q: asyncio.Queue) -> None:
             "[Fill] signal=%s side=%s qty=%.6f price=%.2f slippage=%.1f bps",
             fill.signal_id, fill.side, fill.qty, fill.fill_price, fill.slippage_bps,
         )
+        if portfolio.num_fill_samples == 0:
+            portfolio.avg_slippage_bps = fill.slippage_bps
+        else:
+            portfolio.avg_slippage_bps = 0.1 * fill.slippage_bps + 0.9 * portfolio.avg_slippage_bps
+        portfolio.num_fill_samples += 1
+        await telemetry.update_fill(fill.signal_id, fill.slippage_bps)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -481,7 +512,7 @@ async def main() -> None:
             tg.create_task(midnight_reset_loop(risk_engine, cvd_calculator),                  name="midnight_reset")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
             tg.create_task(_drain_queue(re_order_queue),                                      name="re_order_drain")
-            tg.create_task(_process_fills(fill_queue),                                        name="fill_processor")
+            tg.create_task(_process_fills(fill_queue, portfolio, telemetry),                  name="fill_processor")
             tg.create_task(
                 _portfolio_mtm_loop(
                     killswitch, budget, order_manager, portfolio, telemetry,

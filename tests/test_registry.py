@@ -362,10 +362,10 @@ def _seed_signal_records(db_path: str, strategy_id: str, n: int = 10) -> None:
         pnl_pct = 0.005 if outcome == "WIN" else -0.003
         ts = (base + timedelta(hours=i)).isoformat()
         conn.execute(
-            "INSERT INTO signal_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO signal_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (str(i), strategy_id, ts, "SWEEP_WITH_PROTECTION", "APPROVED",
              "", "SYNCED", "HEALTHY", 1.5, 0.8, 3.0, 0.7, "LONG",
-             outcome, pnl_pct * 1000, pnl_pct, 5.0, None),
+             outcome, pnl_pct * 1000, pnl_pct, 5.0, None, None, None),
         )
     conn.commit()
     conn.close()

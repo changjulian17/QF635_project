@@ -70,6 +70,11 @@ class PortfolioState:
     daily_pnl: float = 0.0
     consecutive_losses: int = 0
     circuit_breaker: CircuitBreakerStatus = CircuitBreakerStatus.ACTIVE
+    num_trades: int = 0
+    num_wins: int = 0
+    num_fill_samples: int = 0
+    avg_slippage_bps: float = 0.0
+    budget_loss_pct: float = 0.0
 
     @property
     def drawdown_pct(self) -> float:

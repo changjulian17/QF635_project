@@ -194,6 +194,7 @@ class SignalTelemetry:
         pnl: float,
         pnl_pct: float,
         duration_min: float,
+        r_multiple: float | None = None,
     ) -> None:
         """Called by OrderManager after a position closes."""
         if not self._conn:
@@ -204,10 +205,10 @@ class SignalTelemetry:
                 self._conn.execute(
                     """
                     UPDATE signal_records
-                    SET outcome=?, pnl=?, pnl_pct=?, duration_min=?
+                    SET outcome=?, pnl=?, pnl_pct=?, duration_min=?, r_multiple_achieved=?
                     WHERE signal_id=?
                     """,
-                    (outcome, pnl, pnl_pct, duration_min, signal_id),
+                    (outcome, pnl, pnl_pct, duration_min, r_multiple, signal_id),
                 )
                 self._conn.commit()
 
@@ -216,6 +217,25 @@ class SignalTelemetry:
                 await asyncio.to_thread(_do_update)
         except sqlite3.Error as exc:
             logger.error("[Telemetry] Outcome update failed: %s", exc)
+
+    async def update_fill(self, signal_id: str, slippage_bps: float) -> None:
+        """Called by _process_fills after a confirmed entry fill."""
+        if not self._conn:
+            return
+
+        def _do() -> None:
+            with self._write_lock:
+                self._conn.execute(
+                    "UPDATE signal_records SET entry_slippage_bps=? WHERE signal_id=?",
+                    (slippage_bps, signal_id),
+                )
+                self._conn.commit()
+
+        try:
+            async with self._db_lock:
+                await asyncio.to_thread(_do)
+        except sqlite3.Error as exc:
+            logger.error("[Telemetry] Fill update failed: %s", exc)
 
     # ── Schema ────────────────────────────────────────────────────────────────
 
@@ -268,9 +288,13 @@ def _ensure_signal_records_schema(conn: sqlite3.Connection) -> None:
         );
     """)
     conn.commit()
-    # Migrate databases that predate the features_json column.
-    try:
-        conn.execute("ALTER TABLE signal_records ADD COLUMN features_json TEXT DEFAULT NULL")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    for col, typedef in [
+        ("features_json",       "TEXT DEFAULT NULL"),
+        ("entry_slippage_bps",  "REAL DEFAULT NULL"),
+        ("r_multiple_achieved", "REAL DEFAULT NULL"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE signal_records ADD COLUMN {col} {typedef}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists

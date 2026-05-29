@@ -126,13 +126,18 @@ CryptoSentinel/
 │   ├── ohlcv_cache.db         # OHLCV SQLite cache (CCXT)
 │   └── backtest_results.db    # Backtest results storage
 │
-├── engine/                    # Legacy shim directory (re-exports to canonical locations)
+├── engine/                    # Legacy shim directory + real-time hub
 │   ├── db_writer.py           # SQLite persistence + rolling cleanup + lob_snapshots table
-│   └── lob_snapshot_writer.py # LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
+│   ├── lob_snapshot_writer.py # LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
+│   ├── realtime_hub.py        # RealtimeHub — fan-out JSON pushes to /ws/lob WebSocket clients
+│   ├── websocket_consumer.py  # Shim re-exporting core.ws_consumer
+│   ├── pattern_detector.py    # Shim re-exporting core.pattern_detector
+│   └── order_manager.py       # Shim re-exporting execution.order_manager
 │
 ├── scripts/
 │   ├── test_connection.py     # Connectivity + auth check
 │   ├── test_orders.py         # BUY + SELL round-trip test
+│   ├── run_backtest.py        # CLI for tick-level walk-forward backtest (writes to backtest_results.db)
 │   └── signal_injector.py     # Synthetic signal injection — dev/testnet only (start_test.sh)
 │
 ├── tests/                     # pytest unit + integration tests
@@ -533,31 +538,33 @@ Phase 1 — Live trading engine
 tests/test_risk_engine.py           51 tests  — 5-tier, killswitch, pyramid, circuit breakers
 tests/test_microstructure_engine.py 30 tests  — legacy microstructure engine
 tests/test_executor.py              40 tests  — all 7 gates, telemetry emission
-tests/test_order_manager.py         29 tests  — IOC entry, OCO bracket, fill handling
-tests/test_lob_engine.py            20 tests  — state machine, gap detection, wall scan
+tests/test_order_manager.py         30 tests  — IOC entry, OCO bracket, fill handling
+tests/test_lob_engine.py            22 tests  — state machine, gap detection, wall scan
 tests/test_startup_reconciler.py    14 tests  — reconciliation, midnight reset
-tests/test_microstructure.py        20 tests  — wall identification, absorption, sweep
+tests/test_microstructure.py        22 tests  — wall identification, absorption, sweep
 tests/test_lob_recorder.py          27 tests  — recorder flush, reconnect, stats
 tests/test_features.py              14 tests  — Welford, no-lookahead, VWAP reset
 tests/test_cvd.py                   14 tests  — buy/sell CVD, 5-bar delta, std
 tests/test_db_writer.py             12 tests  — SQLite write, upsert, purge
 tests/test_signal_telemetry.py      10 tests  — flush, batch, timeout, outcome update
 tests/test_orders.py                10 tests  — order domain classes and enums
-tests/test_pattern_detector.py       8 tests  — ATR, swing detection, S/R breakout
-tests/test_ws_consumer.py            6 tests  — heartbeat states, shared state update
+tests/test_pattern_detector.py      10 tests  — ATR, swing detection, S/R breakout
+tests/test_ws_consumer.py           12 tests  — heartbeat states, rate thresholds, hysteresis
 tests/test_models.py                 6 tests  — PortfolioState, WallState, FeatureVector
 tests/test_integration.py            2 tests  — end-to-end signal → execution pipeline
 
 Phase 3 — REST API + LOB snapshot writer + Dash dashboard
 tests/test_rest_api.py              11 tests  — /api/health, /api/portfolio, /api/killswitch
-tests/test_lob_snapshot_writer.py    7 tests  — snapshot writer, rolling cap, WAL mode
+tests/test_lob_snapshot_writer.py    9 tests  — snapshot writer, rolling cap, WAL mode
+tests/test_realtime_hub.py           6 tests  — RealtimeHub fan-out, connection drop, /ws/lob endpoint
 tests/test_dashboard_live.py         6 tests  — /live page callback, engine badge, kill switch
+tests/test_dashboard_lob.py          6 tests  — /lob buffer helpers, CVD accumulation, dedup
 tests/test_dashboard_registry.py     4 tests  — /registry page, strategy lifecycle display
 tests/test_dashboard_walls.py        6 tests  — /walls page callback, trace structure, invalid-JSON guard
 tests/test_alerting.py               3 tests  — AlertDispatcher webhook, empty-URL guard
 
 Phase 2 — Backtesting + strategy lifecycle
-tests/test_bt_event_engine.py       24 tests  — event-driven engine: tiers, exits, full run
+tests/test_bt_event_engine.py       17 tests  — event-driven engine: tiers, exits, full run
 tests/test_registry.py              29 tests  — lifecycle gates, YAML roundtrip, promotion
 tests/test_bt_tick_replay.py        16 tests  — tick replay fidelity, streaming, CVD reset
 tests/test_bt_walk_forward.py        9 tests  — window splits, OOS isolation, leaderboard
@@ -569,7 +576,7 @@ tests/test_bt_signals.py             7 tests  — signal arrays, no-lookahead, S
 tests/test_bt_vectorbt.py            6 tests  — Optuna optimisation, sensitivity
 tests/test_bt_costs.py               5 tests  — round-trip cost, maker/taker, zero qty
 ──────────────────────────────────────────────────────────────────────────────
-Total                              476 tests
+Total                              496 tests
 ```
 
 ---
@@ -647,3 +654,12 @@ These rules are invariants. Any code that violates them is incorrect.
 | **Phase 2I** | 7 | Strategy Registry: `strategy/spec.py`, `registry.py`, `builder.py` — full lifecycle RESEARCH→BACKTEST→PAPER→LIVE with dual-store (YAML+SQLite), 4-gate PAPER promotion, 3-gate LIVE promotion | ✅ Done |
 | **Phase 2J** | 7–8 | Strategy config tuning: accumulate ≥30 days of `depth@100` LOB data, run walk-forward backtests, tune params, run tick replay validation, promote first spec to PAPER | 🔜 Next |
 | **Phase 3** | 9–12 | Dashboard: Dash multi-page app (6 pages: /live, /lob, /walls, /backtest, /registry, /config), REST API, LOB snapshot writer, decay monitoring, LIVE promotion pipeline | ✅ Done |
+
+---
+
+## TODO
+
+- [ ] Write up strategy documentation — entry logic, gate rationale, Wall/Absorption/Sweep signal design
+- [ ] Write up model documentation — FeatureComputer inputs, XGBoost scorer architecture, training pipeline. should include the diagram for how our components interact, including exchange, LOB, trade management.
+- [ ] Write up trading algorithm documentation — end-to-end flow from LOB tick to order submission
+- [ ] Consider placing a minimum-quantity resting order behind/after a significant liquidity wall — a fill on that order signals the wall has been consumed, providing a cleaner consumption trigger than depth-diff heuristics. Quantity must be as small as possible (min tick size on Binance Spot Testnet).

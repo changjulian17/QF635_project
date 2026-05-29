@@ -574,7 +574,7 @@ async def test_watch_oco_win_records_outcome_and_sets_event():
     om._open_position_closed_event = closed_event
 
     outcomes: list = []
-    async def capture_outcome(signal_id, outcome, pnl, pnl_pct, duration_min):
+    async def capture_outcome(signal_id, outcome, pnl, pnl_pct, duration_min, r_multiple=None):
         outcomes.append((signal_id, outcome, pnl))
     om._update_outcome_cb = capture_outcome
 

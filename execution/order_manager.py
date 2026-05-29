@@ -80,7 +80,7 @@ class OrderManager:
         equity_fn: Callable[[], float],
         book_fn: Callable[[], tuple[float, float] | None] | None = None,
         ks_fire_cb: Callable[[str], Awaitable[None]] | None = None,
-        update_outcome_cb: Callable[[str, str, float, float, float], Awaitable[None]] | None = None,
+        update_outcome_cb: Callable[[str, str, float, float, float, float | None], Awaitable[None]] | None = None,
         budget_update_cb: Callable[[float], None] | None = None,
     ) -> None:
         """
@@ -88,7 +88,7 @@ class OrderManager:
         round-trip — wire to the LOB engine's current top-of-book for lowest latency
         and accurate DRY_RUN position sizing. Falls back to REST when None.
         ks_fire_cb: called with a reason string when KS-3 slippage fires.
-        update_outcome_cb: called with (signal_id, outcome, pnl, pnl_pct, duration_min)
+        update_outcome_cb: called with (signal_id, outcome, pnl, pnl_pct, duration_min, r_multiple)
         after each position closes — wire to SignalTelemetry.update_outcome.
         budget_update_cb: called with realised pnl (float) on every close — wire to
         increment DailyBudget.realised_pnl so KS-1 budget checks reflect actual trades.
@@ -117,6 +117,7 @@ class OrderManager:
         self._open_signal_id:             str | None          = None
         self._open_entry_price:           float               = 0.0
         self._open_entry_time:            float               = 0.0   # time.monotonic()
+        self._open_sl_price:              float               = 0.0   # set by _place_oco; used to compute R-multiple
         self._oco_watcher_task:           asyncio.Task | None = None  # polls OCO until natural fill
 
         # ── OCO placement race flags (S1 fix) ────────────────────────────────────
@@ -428,6 +429,7 @@ class OrderManager:
         sl_price    = req.micro_signal.protection_wall.price
         sl_distance = abs(fill_price - sl_price)
         exit_side   = "SELL" if entry_side == "BUY" else "BUY"
+        self._open_sl_price = sl_price
 
         if entry_side == "BUY":
             tp_price = fill_price + settings.ATR_MULTIPLIER_TP * sl_distance
@@ -484,9 +486,10 @@ class OrderManager:
                 )
                 async with self._position_lock:
                     entry_t = self._open_entry_time
+                    entry_sl = self._open_sl_price
                     self._reset_open_position()
                 if closed:
-                    self._record_outcome(req.signal_id, entry_side, fill_price, close_p, fill_qty, entry_t)
+                    self._record_outcome(req.signal_id, entry_side, fill_price, close_p, fill_qty, entry_t, entry_sl)
                     if req.position_closed_event:
                         req.position_closed_event.set()
             else:
@@ -519,8 +522,9 @@ class OrderManager:
             if closed:
                 async with self._position_lock:
                     entry_t = self._open_entry_time
+                    entry_sl = self._open_sl_price
                     self._reset_open_position()
-                self._record_outcome(req.signal_id, entry_side, fill_price, close_p, fill_qty, entry_t)
+                self._record_outcome(req.signal_id, entry_side, fill_price, close_p, fill_qty, entry_t, entry_sl)
                 if req.position_closed_event:
                     req.position_closed_event.set()
 
@@ -595,9 +599,10 @@ class OrderManager:
                 async with self._position_lock:
                     # Guard: only reset if this watcher's signal still owns the position.
                     et = self._open_entry_time if self._open_signal_id == signal_id else entry_time
+                    sl = self._open_sl_price if self._open_signal_id == signal_id else 0.0
                     if self._open_signal_id == signal_id:
                         self._reset_open_position()
-                self._record_outcome(signal_id, entry_side, entry_price, exit_price, fill_qty, et)
+                self._record_outcome(signal_id, entry_side, entry_price, exit_price, fill_qty, et, sl)
                 position_closed_event.set()
                 logger.info(
                     "[Exec] OCO natural fill — %s exit=%.2f signal=%s",
@@ -616,6 +621,7 @@ class OrderManager:
         close_price: float,
         qty: float,
         entry_time: float,
+        sl_price: float = 0.0,
     ) -> None:
         """Record trade outcome: update budget and schedule telemetry write. No-op when not wired."""
         if not signal_id or entry_price <= 0 or qty <= 0:
@@ -624,13 +630,18 @@ class OrderManager:
         pnl_pct = pnl / (entry_price * qty)
         outcome = "WIN" if pnl > 0.0 else "LOSS" if pnl < 0.0 else "FLAT"
         duration_min = (time.monotonic() - entry_time) / 60.0
+        r_multiple: float | None = None
+        if sl_price > 0:
+            initial_risk = abs(entry_price - sl_price) * qty
+            if initial_risk > 1e-8:
+                r_multiple = pnl / initial_risk
         if self._budget_update_cb is not None:
             self._budget_update_cb(pnl)
         if self._update_outcome_cb is None:
             return
         try:
             asyncio.create_task(
-                self._update_outcome_cb(signal_id, outcome, pnl, pnl_pct, duration_min)
+                self._update_outcome_cb(signal_id, outcome, pnl, pnl_pct, duration_min, r_multiple)
             )
         except RuntimeError:
             logger.error("[Exec] No running event loop — outcome not scheduled for %s", signal_id)
@@ -730,8 +741,9 @@ class OrderManager:
                 sig_id  = self._open_signal_id
                 ep      = self._open_entry_price
                 et      = self._open_entry_time
+                sl      = self._open_sl_price
                 self._reset_open_position()
-            self._record_outcome(sig_id, side or "", ep, ep, qty, et)
+            self._record_outcome(sig_id, side or "", ep, ep, qty, et, sl)
             if event:
                 event.set()
             return
@@ -757,10 +769,11 @@ class OrderManager:
             sig_id = self._open_signal_id
             ep     = self._open_entry_price
             et     = self._open_entry_time
+            sl     = self._open_sl_price
             self._reset_open_position()
 
         if closed:
-            self._record_outcome(sig_id, side or "", ep, close_p, qty, et)
+            self._record_outcome(sig_id, side or "", ep, close_p, qty, et, sl)
             if event:
                 event.set()
         else:
@@ -788,6 +801,7 @@ class OrderManager:
         self._open_signal_id              = None
         self._open_entry_price            = 0.0
         self._open_entry_time             = 0.0
+        self._open_sl_price               = 0.0
         self._placing_oco                 = False
         self._cancel_oco_on_placement     = False
         self._entry_in_flight             = False
@@ -822,8 +836,9 @@ class OrderManager:
                 sig_id = self._open_signal_id
                 ep     = self._open_entry_price
                 et     = self._open_entry_time
+                sl     = self._open_sl_price
                 self._reset_open_position()
-            self._record_outcome(sig_id, side or "", ep, ep, qty, et)
+            self._record_outcome(sig_id, side or "", ep, ep, qty, et, sl)
             if event:
                 event.set()
             return
@@ -853,10 +868,11 @@ class OrderManager:
             sig_id = self._open_signal_id
             ep     = self._open_entry_price
             et     = self._open_entry_time
+            sl     = self._open_sl_price
             self._reset_open_position()
 
         if closed:
-            self._record_outcome(sig_id, side or "", ep, close_p, qty, et)
+            self._record_outcome(sig_id, side or "", ep, close_p, qty, et, sl)
             if event:
                 event.set()
         elif not closed:

@@ -1,10 +1,11 @@
 import requests
 import dash
+import plotly.graph_objects as go
 from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 
 from config import settings
-from dashboard._db import fetch_signal_funnel, DBOffline
+from dashboard._db import fetch_pnl_by_pattern, fetch_session_stats, fetch_signal_funnel, DBOffline
 from dashboard._logic import validate_ks_confirm as _validate_ks, fire_killswitch as _fire_ks
 
 dash.register_page(__name__, path="/", name="Live", redirect_from=["/live"])
@@ -37,6 +38,13 @@ layout = html.Div([
 
     # ── Portfolio metrics ──────────────────────────────────────────────────
     dbc.Row(id="live-metrics-row", className="mb-3 g-3"),
+
+    # ── Session stats ──────────────────────────────────────────────────────
+    html.H5("Session Stats (last 24h)", className="mb-2 mt-1"),
+    dbc.Row(id="live-session-row", className="mb-2 g-3"),
+    dbc.Row([
+        dbc.Col(dcc.Graph(id="live-pnl-pattern-chart", style={"height": "220px"}), width=12),
+    ], className="mb-4"),
 
     # ── Signal funnel ──────────────────────────────────────────────────────
     dbc.Row([
@@ -88,6 +96,8 @@ layout = html.Div([
 
 @callback(
     Output("live-metrics-row", "children"),
+    Output("live-session-row", "children"),
+    Output("live-pnl-pattern-chart", "figure"),
     Output("live-funnel-table", "children"),
     Output("live-positions-table", "children"),
     Output("live-ks-status", "children"),
@@ -134,6 +144,49 @@ def update_live_page(n, engine_state):
             width=3,
         ),
     ]
+
+    # ── Session stats ──────────────────────────────────────────────────────
+    session_result = fetch_session_stats(hours=24)
+    if isinstance(session_result, DBOffline) or not session_result:
+        session_row = [dbc.Col(dbc.Alert("No session data yet.", color="secondary"), width=12)]
+        pnl_fig = go.Figure()
+    else:
+        s = session_result
+        total_t = s.get("total_trades") or 0
+        wins    = s.get("wins") or 0
+        win_rate  = wins / total_t if total_t > 0 else 0.0
+        pf        = s.get("profit_factor")
+        avg_r     = s.get("avg_r_multiple")
+        avg_dur   = s.get("avg_duration_min")
+        avg_slip  = s.get("avg_slippage_bps")
+        losses    = total_t - wins
+
+        session_row = [
+            _metric_card("Trades", f"{total_t}  ({wins}W / {losses}L)"),
+            _metric_card("Win Rate", f"{win_rate * 100:.1f}%",
+                         "success" if win_rate >= 0.5 else "warning"),
+            _metric_card("Profit Factor", f"{pf:.2f}" if pf is not None else "—",
+                         "success" if (pf or 0) >= 1.3 else "warning"),
+            _metric_card("Avg R-Multiple", f"{avg_r:.2f}R" if avg_r is not None else "—"),
+            _metric_card("Avg Duration", f"{avg_dur:.1f} min" if avg_dur is not None else "—"),
+            _metric_card("Avg Slippage", f"{avg_slip:.1f} bps" if avg_slip is not None else "—"),
+        ]
+
+        pnl_by_pat = fetch_pnl_by_pattern(hours=24)
+        if isinstance(pnl_by_pat, DBOffline) or not pnl_by_pat:
+            pnl_fig = go.Figure()
+        else:
+            labels = list(pnl_by_pat.keys())
+            values = list(pnl_by_pat.values())
+            colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in values]
+            pnl_fig = go.Figure(go.Bar(x=labels, y=values, marker_color=colors))
+            pnl_fig.update_layout(
+                title="P&L by Signal Type (last 24h)",
+                template="plotly_dark",
+                margin=dict(l=40, r=20, t=40, b=30),
+                yaxis_title="P&L (USDT)",
+                showlegend=False,
+            )
 
     # ── Signal funnel ──────────────────────────────────────────────────────
     funnel_result = fetch_signal_funnel(hours=24)
@@ -192,7 +245,7 @@ def update_live_page(n, engine_state):
         ks_status = html.Span()
         ks_disabled = False
 
-    return metrics_row, funnel_table, pos_table, ks_status, ks_disabled
+    return metrics_row, session_row, pnl_fig, funnel_table, pos_table, ks_status, ks_disabled
 
 
 @callback(

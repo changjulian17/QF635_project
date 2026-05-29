@@ -208,7 +208,10 @@ class RiskEngine:
             self.portfolio.consecutive_losses += 1
         else:
             self.portfolio.consecutive_losses = 0
+            self.portfolio.num_wins += 1
 
+        self.portfolio.num_trades += 1
+        self.portfolio.budget_loss_pct = self._budget.loss_pct
         self._killswitch.check_budget(self._budget.realised_pnl, self._budget.unrealised_pnl)
         self._pyramid.close_leg()   # one leg settled; close FIFO
 
@@ -224,6 +227,7 @@ class RiskEngine:
     def mark_unrealised(self, pnl: float) -> None:
         """Update the budget's unrealised exposure so tier transitions fire proactively."""
         self._budget.unrealised_pnl = pnl
+        self.portfolio.budget_loss_pct = self._budget.loss_pct
 
     # ── Tier sync (called by MTM loop, not on inbound signals) ───────────────────
 
@@ -242,6 +246,11 @@ class RiskEngine:
         """Called by midnight reset loop to clear daily counters."""
         self.portfolio.daily_pnl          = 0.0
         self.portfolio.consecutive_losses = 0
+        self.portfolio.num_trades         = 0
+        self.portfolio.num_wins           = 0
+        self.portfolio.num_fill_samples   = 0
+        self.portfolio.avg_slippage_bps   = 0.0
+        self.portfolio.budget_loss_pct    = 0.0
         self._cooldown_until              = None
         self._tier                        = _Tier.FULL
         self.portfolio.circuit_breaker    = CircuitBreakerStatus.ACTIVE

@@ -148,11 +148,56 @@ def fetch_strategies() -> Union[list[dict], DBOffline]:
     return [dict(r) for r in rows]
 
 
+def fetch_session_stats(hours: int = 24) -> Union[dict, DBOffline]:
+    with registry_db() as conn:
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                  COUNT(*)                                                        AS total_trades,
+                  SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END)                 AS wins,
+                  SUM(pnl)                                                        AS total_pnl,
+                  SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END) /
+                    NULLIF(ABS(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END)), 0)  AS profit_factor,
+                  AVG(r_multiple_achieved)                                        AS avg_r_multiple,
+                  AVG(duration_min)                                               AS avg_duration_min,
+                  AVG(entry_slippage_bps)                                         AS avg_slippage_bps
+                FROM signal_records
+                WHERE outcome IN ('WIN','LOSS','FLAT')
+                  AND datetime(timestamp) >= datetime('now', ?)
+                """,
+                (f"-{hours} hours",),
+            ).fetchone()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] registry offline: %s", e)
+            return DBOffline(str(e))
+    return dict(row) if row else {}
+
+
+def fetch_pnl_by_pattern(hours: int = 24) -> Union[dict, DBOffline]:
+    with registry_db() as conn:
+        try:
+            rows = conn.execute(
+                """
+                SELECT micro_signal, SUM(pnl) AS total_pnl
+                FROM signal_records
+                WHERE outcome IN ('WIN','LOSS','FLAT')
+                  AND datetime(timestamp) >= datetime('now', ?)
+                GROUP BY micro_signal
+                """,
+                (f"-{hours} hours",),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] registry offline: %s", e)
+            return DBOffline(str(e))
+    return {r["micro_signal"]: r["total_pnl"] for r in rows}
+
+
 def fetch_system_events(limit: int = 50) -> Union[list[dict], DBOffline]:
     with registry_db() as conn:
         try:
             rows = conn.execute(
-                "SELECT occurred_at, event_type, payload FROM system_events "
+                "SELECT occurred_at, event_type, payload_json FROM system_events "
                 "ORDER BY occurred_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
