@@ -30,7 +30,7 @@ def _make_risk_engine():
     return engine
 
 
-def _make_client(open_orders=None, account_balances=None):
+def _make_client(open_orders=None, account_balances=None, ticker_price="73628.96"):
     client = AsyncMock()
     client.get_open_orders = AsyncMock(return_value=open_orders or [])
     client.get_account = AsyncMock(return_value={
@@ -39,6 +39,7 @@ def _make_client(open_orders=None, account_balances=None):
             {"asset": "USDT", "free": "9900.0", "locked": "0.0"},
         ]
     })
+    client.get_symbol_ticker = AsyncMock(return_value={"price": ticker_price})
     return client
 
 
@@ -77,9 +78,11 @@ def test_write_event_idempotent_table_creation(tmp_path):
 
 # ── reconcile_on_startup — DRY_RUN ───────────────────────────────────────────
 
-def test_dry_run_skips_exchange_queries(tmp_path):
+def test_dry_run_fetches_balance_skips_order_submission(tmp_path):
+    """Balance is always fetched so equity is real, even in DRY_RUN mode.
+    Only order submission (in order_manager.py) is skipped in DRY_RUN."""
     db_path = str(tmp_path / "registry.db")
-    client = AsyncMock()
+    client = _make_client()
     portfolio = _make_portfolio()
     risk_engine = _make_risk_engine()
 
@@ -90,10 +93,10 @@ def test_dry_run_skips_exchange_queries(tmp_path):
             reconcile_on_startup(client, portfolio, risk_engine)
         )
 
-    client.get_open_orders.assert_not_called()
-    client.get_account.assert_not_called()
+    client.get_open_orders.assert_called_once()
+    client.get_account.assert_called_once()
     assert result["open_orders"] == []
-    assert result["errors"] == []
+    assert "get_account" not in " ".join(result["errors"])
 
 
 # ── reconcile_on_startup — S1: open orders ───────────────────────────────────
@@ -161,6 +164,67 @@ def test_s2_missing_btc_asset_returns_zero(tmp_path):
         result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
 
     assert result["btc_balance"] == 0.0
+
+
+def test_s2_equity_set_from_usdt_and_btc(tmp_path):
+    db_path = str(tmp_path / "registry.db")
+    balances = [
+        {"asset": "BTC",  "free": "1.0", "locked": "0.0"},
+        {"asset": "USDT", "free": "8000.0", "locked": "0.0"},
+    ]
+    # ticker price = 10000 → total equity = 8000 + 1.0 × 10000 = 18000
+    client = _make_client(account_balances=balances, ticker_price="10000.0")
+    portfolio = _make_portfolio(equity=10_000.0)
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.REGISTRY_DB = db_path
+        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    assert abs(portfolio.equity - 18_000.0) < 1e-6
+    assert abs(portfolio.starting_equity - 18_000.0) < 1e-6   # no trades today
+    assert abs(portfolio.peak_equity - 18_000.0) < 1e-6
+
+
+def test_s2_ticker_failure_falls_back_to_zero_btc_price(tmp_path):
+    db_path = str(tmp_path / "registry.db")
+    balances = [
+        {"asset": "BTC",  "free": "1.0", "locked": "0.0"},
+        {"asset": "USDT", "free": "5000.0", "locked": "0.0"},
+    ]
+    client = _make_client(account_balances=balances)
+    client.get_symbol_ticker = AsyncMock(side_effect=Exception("ticker timeout"))
+    portfolio = _make_portfolio(equity=10_000.0)
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.REGISTRY_DB = db_path
+        result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    # equity = USDT only (BTC priced at 0)
+    assert abs(portfolio.equity - 5_000.0) < 1e-6
+    assert any("get_symbol_ticker" in e for e in result["errors"])
+
+
+def test_s2_account_failure_keeps_initialised_equity(tmp_path):
+    db_path = str(tmp_path / "registry.db")
+    client = AsyncMock()
+    client.get_open_orders = AsyncMock(return_value=[])
+    client.get_account = AsyncMock(side_effect=Exception("network error"))
+    client.get_symbol_ticker = AsyncMock(return_value={"price": "73628.0"})
+    portfolio = _make_portfolio(equity=10_000.0)
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.REGISTRY_DB = db_path
+        result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    # if actual_equity == 0 the guard keeps the initialised value
+    assert abs(portfolio.equity - 10_000.0) < 1e-6
+    assert any("get_account" in e for e in result["errors"])
 
 
 # ── reconcile_on_startup — S3: position reconciliation ───────────────────────

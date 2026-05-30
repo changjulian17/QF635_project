@@ -62,15 +62,34 @@ class OCOOrder(Order):
     """
     tp_price: float = 0.0
     sl_price: float = 0.0
-    sl_limit: float = 0.0    # stopLimitPrice
+    sl_limit: float = 0.0    # maps to belowPrice (SELL bracket) or abovePrice (BUY bracket)
 
     def to_entry_params(self) -> dict:
-        return {
-            "symbol":               self.symbol,
-            "side":                 self.side,
-            "quantity":             self.quantity,
-            "price":                str(round(self.tp_price, 2)),
-            "stopPrice":            str(round(self.sl_price, 2)),
-            "stopLimitPrice":       str(round(self.sl_limit, 2)),
-            "stopLimitTimeInForce": "GTC",
+        # python-binance ≥1.0.28 targets the new /api/v3/orderList/oco endpoint
+        # which uses aboveType/belowType instead of the old stopPrice/stopLimitPrice flat params.
+        # SELL bracket (exit LONG): TP limit is above price, SL stop-limit is below.
+        # BUY  bracket (exit SHORT): SL stop-limit is above price, TP limit is below.
+        base: dict = {
+            "symbol":   self.symbol,
+            "side":     self.side,
+            "quantity": self.quantity,
         }
+        if self.side == "SELL":
+            base.update({
+                "aboveType":        "LIMIT_MAKER",
+                "abovePrice":       str(round(self.tp_price, 2)),
+                "belowType":        "STOP_LOSS_LIMIT",
+                "belowStopPrice":   str(round(self.sl_price, 2)),
+                "belowPrice":       str(round(self.sl_limit, 2)),
+                "belowTimeInForce": "GTC",
+            })
+        else:
+            base.update({
+                "aboveType":        "STOP_LOSS_LIMIT",
+                "aboveStopPrice":   str(round(self.sl_price, 2)),
+                "abovePrice":       str(round(self.sl_limit, 2)),
+                "aboveTimeInForce": "GTC",
+                "belowType":        "LIMIT_MAKER",
+                "belowPrice":       str(round(self.tp_price, 2)),
+            })
+        return base

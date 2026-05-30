@@ -40,7 +40,7 @@ def test_ioc_limit_order_is_order_subclass():
 # ── 2. OCOOrder ───────────────────────────────────────────────────────────────
 
 def test_oco_order_to_entry_params_sell_exit():
-    """Closing a LONG: exit side is SELL, TP above fill, SL below fill."""
+    """Closing a LONG: exit side is SELL, TP above fill (aboveType=LIMIT_MAKER), SL below (belowType=STOP_LOSS_LIMIT)."""
     order = OCOOrder(
         symbol   = "BTCUSDT",
         side     = "SELL",
@@ -50,17 +50,19 @@ def test_oco_order_to_entry_params_sell_exit():
         sl_limit = 93_906.0,
     )
     params = order.to_entry_params()
-    assert params["symbol"]               == "BTCUSDT"
-    assert params["side"]                 == "SELL"
-    assert params["quantity"]             == 0.001
-    assert params["price"]                == "96000.0"        # TP limit
-    assert params["stopPrice"]            == "94000.0"        # SL trigger
-    assert params["stopLimitPrice"]       == "93906.0"        # SL limit (inside)
-    assert params["stopLimitTimeInForce"] == "GTC"
+    assert params["symbol"]           == "BTCUSDT"
+    assert params["side"]             == "SELL"
+    assert params["quantity"]         == 0.001
+    assert params["aboveType"]        == "LIMIT_MAKER"
+    assert params["abovePrice"]       == "96000.0"   # TP limit
+    assert params["belowType"]        == "STOP_LOSS_LIMIT"
+    assert params["belowStopPrice"]   == "94000.0"   # SL trigger
+    assert params["belowPrice"]       == "93906.0"   # SL limit (inside)
+    assert params["belowTimeInForce"] == "GTC"
 
 
 def test_oco_order_to_entry_params_buy_exit():
-    """Closing a SHORT: exit side is BUY, TP below fill, SL above fill."""
+    """Closing a SHORT: exit side is BUY, SL above fill (aboveType=STOP_LOSS_LIMIT), TP below (belowType=LIMIT_MAKER)."""
     order = OCOOrder(
         symbol   = "BTCUSDT",
         side     = "BUY",
@@ -70,21 +72,35 @@ def test_oco_order_to_entry_params_buy_exit():
         sl_limit = 96_096.0,
     )
     params = order.to_entry_params()
-    assert params["side"]          == "BUY"
-    assert params["price"]         == "94000.0"
-    assert params["stopPrice"]     == "96000.0"
-    assert params["stopLimitPrice"] == "96096.0"
+    assert params["side"]             == "BUY"
+    assert params["aboveType"]        == "STOP_LOSS_LIMIT"
+    assert params["aboveStopPrice"]   == "96000.0"   # SL trigger
+    assert params["abovePrice"]       == "96096.0"   # SL limit (inside)
+    assert params["aboveTimeInForce"] == "GTC"
+    assert params["belowType"]        == "LIMIT_MAKER"
+    assert params["belowPrice"]       == "94000.0"   # TP limit
 
 
-def test_oco_order_prices_rounded_to_2dp():
+def test_oco_order_prices_rounded_to_2dp_sell():
     order = OCOOrder(
         symbol="BTCUSDT", side="SELL", quantity=0.001,
         tp_price=96_000.1234, sl_price=94_000.5678, sl_limit=93_906.9999,
     )
     params = order.to_entry_params()
-    assert params["price"]          == "96000.12"
-    assert params["stopPrice"]      == "94000.57"
-    assert params["stopLimitPrice"] == "93907.0"
+    assert params["abovePrice"]     == "96000.12"
+    assert params["belowStopPrice"] == "94000.57"
+    assert params["belowPrice"]     == "93907.0"
+
+
+def test_oco_order_prices_rounded_to_2dp_buy():
+    order = OCOOrder(
+        symbol="BTCUSDT", side="BUY", quantity=0.001,
+        tp_price=93_900.1234, sl_price=96_000.5678, sl_limit=96_096.9999,
+    )
+    params = order.to_entry_params()
+    assert params["aboveStopPrice"] == "96000.57"
+    assert params["abovePrice"]     == "96097.0"
+    assert params["belowPrice"]     == "93900.12"
 
 
 def test_oco_order_is_order_subclass():
@@ -117,6 +133,7 @@ def test_polymorphic_dispatch():
     assert param_sets[0]["timeInForce"] == "IOC"
     assert "stopPrice" not in param_sets[0]
 
-    # OCO: has stopPrice, no timeInForce at top level
-    assert "stopPrice" in param_sets[1]
+    # OCO: has aboveType/belowType, no top-level timeInForce
+    assert "aboveType" in param_sets[1]
+    assert "belowType" in param_sets[1]
     assert "timeInForce" not in param_sets[1]

@@ -308,7 +308,9 @@ class OrderManager:
             signal_price = best_bid
 
         protection_wall_price = req.micro_signal.protection_wall.price
-        sl_distance = abs(signal_price - protection_wall_price)
+        raw_bps    = abs(signal_price - protection_wall_price) / signal_price * 10_000
+        capped_bps = min(raw_bps, settings.PROTECTION_MAX_DISTANCE_BPS)
+        sl_distance = signal_price * capped_bps / 10_000
         if sl_distance < 1e-8:
             logger.warning(
                 "[Exec] Zero SL distance for signal %s — skipped", req.signal_id[:8]
@@ -317,7 +319,8 @@ class OrderManager:
 
         raw_qty = (self._equity_fn() * req.notional_hint) / sl_distance
         step    = settings.QTY_STEP_SIZE
-        qty     = round(math.floor(raw_qty / step) * step, 5)
+
+        qty = round(math.floor(raw_qty / step) * step, 5)
         if qty <= 0:
             logger.warning(
                 "[Exec] Zero qty for signal %s — skipped", req.signal_id[:8]
@@ -435,8 +438,13 @@ class OrderManager:
           close, _reset_open_position() is called and position_closed_event is
           set so Gate 6 cannot fire a second close attempt.
         """
-        sl_price    = req.micro_signal.protection_wall.price
-        sl_distance = abs(fill_price - sl_price)
+        raw_wall   = req.micro_signal.protection_wall.price
+        raw_bps    = abs(fill_price - raw_wall) / fill_price * 10_000
+        capped_bps = min(raw_bps, settings.PROTECTION_MAX_DISTANCE_BPS)
+        sl_distance = fill_price * capped_bps / 10_000
+        sl_price    = round(
+            fill_price - sl_distance if entry_side == "BUY" else fill_price + sl_distance, 2
+        )
         exit_side   = "SELL" if entry_side == "BUY" else "BUY"
         self._open_sl_price = sl_price
 

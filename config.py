@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     IOC_TIMEOUT_MS: int = 200          # IOC order max age before cancel-no-retry
     QTY_STEP_SIZE: float = 0.00001     # BTCUSDT LOT_SIZE stepSize
     MIN_NOTIONAL: float = 100.0        # BTCUSDT NOTIONAL filter minimum (USD)
+    MAX_ORDER_NOTIONAL_PCT: float = 0.90  # gate rejects signals whose estimated notional exceeds 90% of equity
     SLIPPAGE_RESEARCH_BPS: float = 3.0  # expected slippage assumption (KS-3 baseline)
     SLIPPAGE_MULTIPLIER: float = 1.5    # KS-3 fires when rolling avg > research × multiplier
 

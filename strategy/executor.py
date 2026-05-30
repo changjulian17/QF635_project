@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Callable
 
 from config import settings
 from core.cvd import WelfordOnline
@@ -75,6 +76,21 @@ def gate_3_capital(budget, tier: str, active_exposure: bool = False) -> tuple[bo
         return False, f"risk tier {tier} — no new entries"
     if budget is not None and budget.remaining <= 0:
         return False, f"daily budget exhausted (remaining={budget.remaining:.2f})"
+    return True, ""
+
+
+def gate_3_position_size(
+    estimated_notional: float,
+    equity: float,
+    max_notional_pct: float,
+) -> tuple[bool, str]:
+    """Reject signals whose estimated position size would exceed max_notional_pct of equity."""
+    max_notional = equity * max_notional_pct
+    if estimated_notional > max_notional:
+        return False, (
+            f"est. notional ${estimated_notional:,.0f} exceeds "
+            f"{max_notional_pct * 100:.0f}% equity (${max_notional:,.0f})"
+        )
     return True, ""
 
 
@@ -256,6 +272,7 @@ class StrategyExecutor:
         order_manager=None,
         gate6_check_interval_ms: int = 200,
         strategy_id: str = "v3.0",
+        equity_fn: Callable[[], float] | None = None,
     ) -> None:
         self._micro_q       = micro_signal_queue
         self._signal_q      = signal_queue
@@ -264,6 +281,7 @@ class StrategyExecutor:
         self._state         = shared_state
         self._budget        = budget
         self._strategy_id   = strategy_id
+        self._equity_fn     = equity_fn
         self._entry_rules   = EntryRules()
         if rule_scorer is not None:
             self._scorer = rule_scorer
@@ -423,6 +441,13 @@ class StrategyExecutor:
             self._reject(rec, "GATE_2_FAIL", reason)
             return
 
+        # notional_hint needs confidence (Gate 2) and risk_tier — compute here so
+        # Gate 3 position-size check can use it before the order request is built.
+        tier_scalar   = TIER_SCALARS.get(self._risk_tier, 1.0)
+        notional_hint = round(
+            confidence * settings.KELLY_FRACTION * settings.RISK_PER_TRADE_PCT * tier_scalar, 6
+        )
+
         # Gate 3 — capital
         active_exposure = (
             bool(self._order_manager.has_active_exposure())
@@ -440,6 +465,25 @@ class StrategyExecutor:
         if not ok:
             self._reject(rec, "GATE_3_FAIL", reason)
             return
+
+        # Gate 3 position-size check — reject if estimated notional exceeds MAX_ORDER_NOTIONAL_PCT
+        # of equity. Uses bps-capped sl_distance from mid_price for a consistent estimate with
+        # the execution layer. Skipped when equity_fn is not injected (e.g. tests, backtests).
+        if self._equity_fn is not None and signal.protection_wall and signal.mid_price > 0:
+            equity     = self._equity_fn()
+            pw_price   = signal.protection_wall.price
+            raw_bps    = abs(signal.mid_price - pw_price) / signal.mid_price * 10_000
+            capped_bps = min(raw_bps, settings.PROTECTION_MAX_DISTANCE_BPS)
+            sl_est     = signal.mid_price * capped_bps / 10_000
+            if sl_est > 0:
+                est_notional = (equity * notional_hint / sl_est) * signal.mid_price
+                ok, reason   = gate_3_position_size(
+                    est_notional, equity, settings.MAX_ORDER_NOTIONAL_PCT
+                )
+                if not ok:
+                    logger.info("[Gate3] FAIL position-size %s", reason)
+                    self._reject(rec, "GATE_3_FAIL", reason)
+                    return
 
         # Gate 4 — order selection (session-aware spread p95 + strategy hard cap)
         ok, reason, order_type = gate_4_order_selection(
@@ -485,12 +529,6 @@ class StrategyExecutor:
         rec.gate_passed = "APPROVED"
         self._emit_telemetry(rec)
 
-        # notional_hint = risk fraction of equity; execution layer applies:
-        #   qty = (equity × notional_hint) / abs(entry_price − protection_wall_price)
-        tier_scalar   = TIER_SCALARS.get(self._risk_tier, 1.0)
-        notional_hint = round(
-            confidence * settings.KELLY_FRACTION * settings.RISK_PER_TRADE_PCT * tier_scalar, 6
-        )
         order_req = MicroOrderRequest(
             micro_signal   = signal,
             signal_id      = rec.signal_id,

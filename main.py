@@ -437,6 +437,7 @@ async def main() -> None:
         lob_engine=lob_engine,
         order_manager=order_manager,
         strategy_id=_strategy_id,
+        equity_fn=lambda: portfolio.equity,
     )
     if _active_spec:
         strategy_executor.set_entry_rules(_active_spec.entry_rules)

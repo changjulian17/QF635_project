@@ -350,9 +350,10 @@ async def test_entry_qty_floor_quantized_to_step():
     """Computed entry qty is truncated down to the nearest QTY_STEP_SIZE multiple.
 
     _make_req uses notional_hint=0.001, equity=10_000, protection wall at 94_000
-    for LONG. With best_ask=95_010: sl_distance=1010, raw=0.00990099...
-    round(..., 6) would give 0.009901 (fails LOT_SIZE: 990.1 steps).
-    Floor-quantize must give 0.00990 (990 steps exactly).
+    for LONG. With best_ask=95_010: raw_bps=106.3 → capped to 25 bps →
+    sl_distance = 95_010 × 0.0025 = 237.525, raw_qty = 10/237.525 = 0.042099...
+    round(..., 5) would give 0.04210 (not a whole number of steps).
+    Floor-quantize must give 0.04209 (4209 steps exactly).
     """
     om, _, fill_q, _ = _make_manager()
     req = _make_req("LONG")
@@ -361,7 +362,7 @@ async def test_entry_qty_floor_quantized_to_step():
         await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
 
     fill: FillDetail = fill_q.get_nowait()
-    assert fill.qty == pytest.approx(0.00990)
+    assert fill.qty == pytest.approx(0.04209)
     assert fill.qty % settings.QTY_STEP_SIZE == pytest.approx(0.0)
 
 
