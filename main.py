@@ -117,8 +117,14 @@ async def _portfolio_mtm_loop(
     risk_engine: RiskEngine,
     strategy_executor: StrategyExecutor,
     alert_dispatcher: AlertDispatcher,
+    hub: RealtimeHub | None = None,
 ) -> None:
-    """Check KS-1 budget breach and sync risk tier every second."""
+    """Check KS-1 budget breach, sync risk tier, and broadcast portfolio state each tick.
+
+    The broadcast (when ``hub`` is provided) carries the same fields as
+    ``/api/portfolio`` plus ``risk_tier`` and ``killswitch_active`` so /live can
+    render entirely from this stream without an extra REST poll.
+    """
     while True:
         await asyncio.sleep(1.0)
         if killswitch.is_active:
@@ -130,6 +136,11 @@ async def _portfolio_mtm_loop(
             return
         new_tier = risk_engine.sync_tier()
         strategy_executor.set_risk_tier(new_tier)
+        if hub is not None:
+            payload = _build_portfolio_payload(portfolio, risk_tier=new_tier, killswitch_active=killswitch.is_active)
+            payload["type"] = "portfolio"
+            payload["ts"]   = datetime.now(timezone.utc).isoformat()
+            await hub.broadcast(payload)
 
 
 # ── Midnight reset ────────────────────────────────────────────────────────────
@@ -195,6 +206,45 @@ async def _feature_candle_loop(
         feature_computer.update_candle(candle)
 
 
+def _build_portfolio_payload(
+    portfolio: PortfolioState,
+    risk_tier: str | None = None,
+    killswitch_active: bool | None = None,
+) -> dict:
+    """Serialise portfolio + risk state for /api/portfolio and the /ws/portfolio stream.
+
+    Shared by the REST handler and the realtime broadcast so the two never drift.
+    """
+    payload: dict = {
+        "equity":             portfolio.equity,
+        "daily_pnl":          portfolio.daily_pnl,
+        "drawdown_pct":       portfolio.drawdown_pct,
+        "consecutive_losses": portfolio.consecutive_losses,
+        "num_trades":         portfolio.num_trades,
+        "num_wins":           portfolio.num_wins,
+        "num_fill_samples":   portfolio.num_fill_samples,
+        "avg_slippage_bps":   portfolio.avg_slippage_bps,
+        "budget_loss_pct":    portfolio.budget_loss_pct,
+        "positions": [
+            {
+                "symbol":         p.symbol,
+                "side":           p.side.name,
+                "entry_price":    p.entry_price,
+                "quantity":       p.quantity,
+                "stop_loss":      p.stop_loss,
+                "take_profit":    p.take_profit,
+                "unrealised_pnl": p.unrealised_pnl,
+            }
+            for p in portfolio.positions
+        ],
+    }
+    if risk_tier is not None:
+        payload["risk_tier"] = risk_tier
+    if killswitch_active is not None:
+        payload["killswitch_active"] = killswitch_active
+    return payload
+
+
 async def _api_server(
     killswitch: GlobalKillswitch,
     portfolio: PortfolioState,
@@ -203,7 +253,8 @@ async def _api_server(
     telemetry: SignalTelemetry,
     port: int,
     alert_dispatcher: AlertDispatcher | None = None,
-    hub: RealtimeHub | None = None,
+    lob_hub: RealtimeHub | None = None,
+    portfolio_hub: RealtimeHub | None = None,
 ) -> None:
     """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
 
@@ -217,30 +268,7 @@ async def _api_server(
         })
 
     async def _handle_portfolio(request: web.Request) -> web.Response:
-        positions = [
-            {
-                "symbol": p.symbol,
-                "side": p.side.name,
-                "entry_price": p.entry_price,
-                "quantity": p.quantity,
-                "stop_loss": p.stop_loss,
-                "take_profit": p.take_profit,
-                "unrealised_pnl": p.unrealised_pnl,
-            }
-            for p in portfolio.positions
-        ]
-        return web.json_response({
-            "equity": portfolio.equity,
-            "daily_pnl": portfolio.daily_pnl,
-            "drawdown_pct": portfolio.drawdown_pct,
-            "consecutive_losses": portfolio.consecutive_losses,
-            "num_trades": portfolio.num_trades,
-            "num_wins": portfolio.num_wins,
-            "num_fill_samples": portfolio.num_fill_samples,
-            "avg_slippage_bps": portfolio.avg_slippage_bps,
-            "budget_loss_pct": portfolio.budget_loss_pct,
-            "positions": positions,
-        })
+        return web.json_response(_build_portfolio_payload(portfolio))
 
     async def _handle_session(request: web.Request) -> web.Response:
         stats = await asyncio.to_thread(fetch_session_stats, 24)
@@ -268,7 +296,8 @@ async def _api_server(
         )
         return web.json_response({"fired": True})
 
-    async def _handle_ws_lob(request: web.Request) -> web.WebSocketResponse:
+    async def _handle_ws(request: web.Request, hub: RealtimeHub | None) -> web.WebSocketResponse:
+        """Generic WebSocket handler: register on a hub, keep open until client closes."""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         if hub is not None:
@@ -281,12 +310,19 @@ async def _api_server(
                 hub.unregister(ws)
         return ws
 
+    async def _handle_ws_lob(request: web.Request) -> web.WebSocketResponse:
+        return await _handle_ws(request, lob_hub)
+
+    async def _handle_ws_portfolio(request: web.Request) -> web.WebSocketResponse:
+        return await _handle_ws(request, portfolio_hub)
+
     app = web.Application()
     app.router.add_get("/api/health", _handle_health)
     app.router.add_get("/api/portfolio", _handle_portfolio)
     app.router.add_get("/api/session", _handle_session)
     app.router.add_post("/api/killswitch", _handle_killswitch)
     app.router.add_get("/ws/lob", _handle_ws_lob)
+    app.router.add_get("/ws/portfolio", _handle_ws_portfolio)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -480,8 +516,11 @@ async def main() -> None:
     # 5. LOB warm-up guard ────────────────────────────────────────────────────
     await asyncio.sleep(0.5)
 
-    # Real-time broadcast hub — streams LOB snapshots to dashboard WS clients
-    realtime_hub = RealtimeHub()
+    # Real-time broadcast hubs — one per logical stream. Keeping them separate so
+    # clients only receive the messages they care about (no client-side filtering,
+    # no bandwidth waste on multi-page dashboards).
+    lob_hub       = RealtimeHub()  # /ws/lob: snapshots + microstructure events
+    portfolio_hub = RealtimeHub()  # /ws/portfolio: equity / PnL / positions / risk tier
 
     # 6. Start TaskGroup with all coroutines ──────────────────────────────────
     try:
@@ -503,18 +542,19 @@ async def main() -> None:
                 _portfolio_mtm_loop(
                     killswitch, budget, order_manager, portfolio, telemetry,
                     risk_engine, strategy_executor, alert_dispatcher,
+                    hub=portfolio_hub,
                 ),
                 name="portfolio_mtm_loop",
             )
             tg.create_task(
-                _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer, hub=realtime_hub),
+                _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer, hub=lob_hub),
                 name="lob_snapshot_writer",
             )
             tg.create_task(
                 _api_server(
                     killswitch, portfolio, shared_state,
                     order_manager, telemetry, settings.DASHBOARD_API_PORT,
-                    alert_dispatcher, realtime_hub,
+                    alert_dispatcher, lob_hub=lob_hub, portfolio_hub=portfolio_hub,
                 ),
                 name="api_server",
             )
