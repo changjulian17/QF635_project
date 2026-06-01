@@ -670,6 +670,7 @@ These rules are invariants. Any code that violates them is incorrect.
 - [x] Write up strategy documentation — entry logic, gate rationale, Wall/Absorption/Sweep signal design (`documentation/strategy.md`)
 - [x] Write up model documentation — FeatureComputer inputs, XGBoost scorer architecture, training pipeline including component interaction diagram (`documentation/model.md`)
 - [x] Write up trading algorithm documentation — end-to-end flow from LOB tick to order submission (`documentation/algorithm.md`)
+- [ ] Fix gate 3 issue; risk management is not using live position data. need to ensure BTC, USDT data is being passed through
 - [ ] run through start_test.sh and make sure the trade execution with injector is working
 - [ ] review all code and test scripts to ensure no unused classes or functions
 
