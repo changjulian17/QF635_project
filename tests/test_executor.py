@@ -1,8 +1,11 @@
 """Tests for the 7-gate StrategyExecutor in strategy/executor.py."""
 import asyncio
 import time
+from unittest.mock import patch
 
 import pytest
+
+from config import settings
 
 from strategy.executor import (
     PersistenceMonitor,
@@ -13,6 +16,7 @@ from strategy.executor import (
     gate_1_microstructure,
     gate_2_confidence,
     gate_3_capital,
+    gate_3_position_size,
     gate_4_order_selection,
     gate_5_execution_sync,
 )
@@ -656,3 +660,124 @@ def test_set_entry_rules_updates_rule_based_scorer():
     sig = _signal("LONG")
     score = ex._scorer.score(fv, sig)
     assert score < 0.45, "OBI component must be 0 when zscore < new threshold"
+
+
+# ── Fix 3: gate_3_position_size helpers and tests ─────────────────────────────
+
+def _wall_at(price: float, side: str) -> WallState:
+    """WallState at an explicit price (unlike _wall() which hardcodes $30k)."""
+    now = int(time.time() * 1000)
+    return WallState(
+        price=price, qty_initial=50.0, qty_current=5.0,
+        first_seen_ts=now - 600, last_seen_ts=now,
+        side=side, sigma=3.0,
+    )
+
+
+def _signal_with_mid(mid: float, wall_distance_bps: float, direction: str = "LONG") -> MicroSignal:
+    """Signal with explicit mid_price so gate_3_position_size check is not skipped."""
+    pw_price = (
+        mid * (1 - wall_distance_bps / 10_000) if direction == "LONG"
+        else mid * (1 + wall_distance_bps / 10_000)
+    )
+    return MicroSignal(
+        signal_type="SWEEP_WITH_PROTECTION",
+        direction=direction,
+        timestamp_ms=int(time.time() * 1000) - 10,
+        consumed_wall=_wall_at(mid * 1.01, "ask"),
+        protection_wall=_wall_at(pw_price, "bid" if direction == "LONG" else "ask"),
+        prior_absorption=True,
+        mid_price=mid,
+    )
+
+
+def test_gate_3_position_size_unit_passes():
+    ok, _ = gate_3_position_size(8_000.0, 10_000.0, 0.90)
+    assert ok is True
+
+
+def test_gate_3_position_size_unit_rejects():
+    ok, reason = gate_3_position_size(10_000.0, 10_000.0, 0.90)
+    assert ok is False
+    assert "est. notional" in reason
+
+
+def test_gate_3_position_size_rejects_in_executor():
+    """5 bps wall → est_notional ~$35k >> $9k (90% of $10k) → GATE_3_FAIL."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+            equity_fn=lambda: 10_000.0,
+        )
+        await ex._evaluate(_signal_with_mid(mid=73_628.0, wall_distance_bps=5))
+
+        assert signal_q.empty(), "oversized signal must not reach order queue"
+        rec = await telem_q.get()
+        assert rec.gate_passed == "GATE_3_FAIL"
+        assert "est. notional" in (rec.rejection_reason or "")
+
+    asyncio.run(_run())
+
+
+def test_gate_3_position_size_passes_in_executor():
+    """25 bps wall with cap=0.95 → est_notional $9,120 < $9,500 → APPROVED.
+    Uses patch to set MAX_ORDER_NOTIONAL_PCT=0.95 because MockFC confidence=0.912
+    gives notional_hint=0.00228, so est_notional=equity×0.00228×400=$9,120
+    which is slightly above the default 0.90 cap ($9,000)."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+            equity_fn=lambda: 10_000.0,
+        )
+        with patch.object(settings, "MAX_ORDER_NOTIONAL_PCT", 0.95):
+            await ex._evaluate(_signal_with_mid(mid=73_628.0, wall_distance_bps=25))
+        await asyncio.sleep(0)  # let gate6_watch task self-terminate
+
+        assert not signal_q.empty(), "signal within size limit must reach order queue"
+        rec = await telem_q.get()
+        assert rec.gate_passed == "APPROVED"
+
+    asyncio.run(_run())
+
+
+def test_gate_3_position_size_skipped_when_no_equity_fn():
+    """Without equity_fn the position-size check is skipped and signal is approved."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+            # equity_fn intentionally omitted
+        )
+        # Even a very tight wall passes when no equity_fn is wired
+        await ex._evaluate(_signal_with_mid(mid=73_628.0, wall_distance_bps=1))
+        await asyncio.sleep(0)
+
+        assert not signal_q.empty(), "gate must be skipped when equity_fn is None"
+
+    asyncio.run(_run())

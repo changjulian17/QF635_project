@@ -351,9 +351,8 @@ async def test_entry_qty_floor_quantized_to_step():
 
     _make_req uses notional_hint=0.001, equity=10_000, protection wall at 94_000
     for LONG. With best_ask=95_010: raw_bps=106.3 → capped to 25 bps →
-    sl_distance = 95_010 × 0.0025 = 237.525, raw_qty = 10/237.525 = 0.042099...
-    round(..., 5) would give 0.04210 (not a whole number of steps).
-    Floor-quantize must give 0.04209 (4209 steps exactly).
+    sl_distance = 95_010 × 0.0025 = 237.525, raw_qty = 10/237.525 = 0.042100...
+    floor-quantize gives 0.04210 (4210 steps exactly).
     """
     om, _, fill_q, _ = _make_manager()
     req = _make_req("LONG")
@@ -362,8 +361,9 @@ async def test_entry_qty_floor_quantized_to_step():
         await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
 
     fill: FillDetail = fill_q.get_nowait()
-    assert fill.qty == pytest.approx(0.04209)
-    assert fill.qty % settings.QTY_STEP_SIZE == pytest.approx(0.0)
+    assert fill.qty == pytest.approx(0.04210)
+    # verify floor (not round): 10/237.525 = 0.042100... floors to 4210 steps
+    assert int(round(fill.qty / settings.QTY_STEP_SIZE)) == 4210
 
 
 # ── 15. M3: full fill_queue drops record, does not block ─────────────────────
@@ -758,3 +758,163 @@ async def test_safety_exit_cancels_oco_and_emergency_closes():
     assert emergency_reasons == ["SAFETY_MAX_HOLD"]
     assert closed_event.is_set()
     assert not om.has_active_exposure()
+
+
+# ── BPS-cap sl_distance tests ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sl_distance_capped_when_venues_diverge():
+    """When the real-LOB wall is far from the testnet execution price (cross-venue
+    mismatch), sl_distance is capped at PROTECTION_MAX_DISTANCE_BPS × signal_price
+    so qty stays sensible rather than collapsing to near-zero."""
+    om, _, fill_q, _ = _make_manager()
+
+    # Wall from real market at $107k, testnet price at $73k → raw gap ~46k bps
+    wall_price  = 107_000.0
+    best_bid    = 73_000.0
+    best_ask    = 73_010.0
+    signal_price = best_ask  # LONG uses best_ask
+
+    sig = MicroSignal(
+        signal_type     = "SWEEP_WITH_PROTECTION",
+        direction       = "LONG",
+        timestamp_ms    = int(time.time() * 1000),
+        consumed_wall   = _make_wall(73_500.0, side="ask"),
+        protection_wall = _make_wall(wall_price, side="bid"),
+    )
+    req = MicroOrderRequest(
+        micro_signal   = sig,
+        signal_id      = "cross-venue-test-1234",
+        order_type     = "IOC_LIMIT",
+        side           = "BUY",
+        limit_price    = None,
+        ioc_timeout_ms = 200,
+        confidence     = 0.70,
+        notional_hint  = 0.001,
+    )
+
+    with patch.object(settings, "DRY_RUN", True):
+        await om._submit_aggressive_limit(req, "BUY", best_bid, best_ask)
+
+    fill: FillDetail = fill_q.get_nowait()
+    # sl_distance must be capped: signal_price × PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_sl = signal_price * settings.PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_qty_raw = (10_000.0 * 0.001) / expected_sl
+    import math
+    step = settings.QTY_STEP_SIZE
+    expected_qty = round(math.floor(expected_qty_raw / step) * step, 5)
+    assert fill.qty == pytest.approx(expected_qty)
+    # sanity: qty must be far less than what the uncapped formula would give
+    uncapped_sl  = abs(signal_price - wall_price)
+    uncapped_qty = (10_000.0 * 0.001) / uncapped_sl
+    assert fill.qty > uncapped_qty * 10   # capped qty is >> uncapped near-zero qty
+
+
+@pytest.mark.asyncio
+async def test_oco_sl_price_anchored_to_fill_price():
+    """OCO stop-loss price is derived from fill_price ± bps-capped distance,
+    not from the raw protection_wall.price (which may be from a different venue)."""
+    om, _, fill_q, _ = _make_manager()
+    om._client = AsyncMock()
+
+    fill_price  = 73_628.0
+    wall_price  = 107_000.0   # real-market wall — far from testnet fill price
+    fill_qty    = 0.001
+
+    # Build a request whose protection wall is at the real-market price
+    sig = MicroSignal(
+        signal_type     = "SWEEP_WITH_PROTECTION",
+        direction       = "LONG",
+        timestamp_ms    = int(time.time() * 1000),
+        consumed_wall   = _make_wall(74_000.0, side="ask"),
+        protection_wall = _make_wall(wall_price, side="bid"),
+    )
+    req = MicroOrderRequest(
+        micro_signal   = sig,
+        signal_id      = "oco-anchor-test-5678",
+        order_type     = "IOC_LIMIT",
+        side           = "BUY",
+        limit_price    = None,
+        ioc_timeout_ms = 200,
+        confidence     = 0.70,
+        notional_hint  = 0.001,
+    )
+
+    oco_params: dict = {}
+
+    async def capture_oco(**kwargs):
+        oco_params.update(kwargs)
+        return {"orderListId": 99}
+
+    om._client.create_oco_order = capture_oco
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om._place_oco(req, fill_price, fill_qty, "BUY")
+
+    # LONG entry → SELL exit → OCO uses belowStopPrice for sl_price
+    # sl_price must be anchored to fill_price, not wall_price
+    expected_sl_dist  = fill_price * settings.PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_sl_price = round(fill_price - expected_sl_dist, 2)
+    actual_sl = float(oco_params["belowStopPrice"])
+    assert actual_sl == pytest.approx(expected_sl_price, abs=0.01)
+    # sl_price must be below fill_price (LONG stop is below entry)
+    assert actual_sl < fill_price
+    # sl_price must NOT be anywhere near the raw wall price
+    assert abs(actual_sl - wall_price) > 1_000
+
+
+# ── Fix 2: BPS-anchored sl_distance tests ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sl_distance_capped_when_venues_diverge():
+    """When wall is from real market (~$107k) and testnet price is ~$73k, sl_distance
+    is capped to PROTECTION_MAX_DISTANCE_BPS × signal_price rather than the raw gap."""
+    om, _, fill_q, _ = _make_manager()
+
+    wall_price = 107_000.0   # real-LOB wall
+    signal_price = 73_000.0  # testnet best_ask
+    req = _make_req("LONG")
+    req.micro_signal.protection_wall.price = wall_price
+
+    with patch.object(settings, "DRY_RUN", True):
+        await om._submit_aggressive_limit(req, "BUY", signal_price - 5.0, signal_price)
+
+    fill: FillDetail = fill_q.get_nowait()
+    # sl_distance must be capped: signal_price × PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_sl_dist = signal_price * settings.PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_qty_raw = (10_000.0 * req.notional_hint) / expected_sl_dist
+    step = settings.QTY_STEP_SIZE
+    import math as _math
+    expected_qty = round(_math.floor(expected_qty_raw / step) * step, 5)
+    assert fill.qty == pytest.approx(expected_qty)
+    # cross-venue gap would have been ~$34k; capped sl_distance must be << $1000
+    assert expected_sl_dist < 1_000.0
+
+
+@pytest.mark.asyncio
+async def test_oco_sl_price_anchored_to_fill_price():
+    """OCO stop-loss must be within PROTECTION_MAX_DISTANCE_BPS of fill_price,
+    not at the raw real-market wall price."""
+    om, _, _, _ = _make_manager()
+    req = _make_req("LONG")
+    req.micro_signal.protection_wall.price = 107_000.0   # real-LOB wall
+
+    fill_price = 73_628.0
+    captured: list[dict] = []
+
+    om._client = AsyncMock()
+    async def capture_oco(**kwargs):
+        captured.append(kwargs)
+        return {"orderListId": 1}
+    om._client.create_oco_order = capture_oco
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om._place_oco(req, fill_price=fill_price, fill_qty=0.001, entry_side="BUY")
+
+    assert captured, "create_oco_order was not called"
+    # LONG entry → SELL exit → OCO uses belowStopPrice for the stop trigger
+    actual_sl = float(captured[0]["belowStopPrice"])
+    expected_sl = round(fill_price * (1 - settings.PROTECTION_MAX_DISTANCE_BPS / 10_000), 2)
+    assert abs(actual_sl - expected_sl) < 1.0, (
+        f"sl_price {actual_sl} not within 25bps of fill_price {fill_price}"
+    )

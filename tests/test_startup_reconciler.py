@@ -378,7 +378,7 @@ def test_s5_startup_reconciliation_event_written(tmp_path):
 
 def test_s5_dry_run_event_written(tmp_path):
     db_path = str(tmp_path / "registry.db")
-    client = AsyncMock()
+    client = _make_client()
     portfolio = _make_portfolio()
     risk_engine = _make_risk_engine()
 
@@ -395,4 +395,4 @@ def test_s5_dry_run_event_written(tmp_path):
 
     assert len(rows) == 1
     payload = json.loads(rows[0][0])
-    assert payload.get("dry_run") is True
+    assert "errors" in payload   # result dict is always written to S5

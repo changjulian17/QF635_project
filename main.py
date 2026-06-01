@@ -63,8 +63,8 @@ logging.getLogger("websockets").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-STARTING_EQUITY = 10_000.0
-SYMBOL = "BTCUSDT"
+SYMBOL          = "BTCUSDT"
+STARTING_EQUITY = settings.STARTING_EQUITY
 
 
 # ── Shutdown handler ──────────────────────────────────────────────────────────
@@ -329,9 +329,9 @@ async def main() -> None:
     alert_dispatcher = AlertDispatcher(settings.ALERT_WEBHOOK_URL)
 
     portfolio = PortfolioState(
-        equity=STARTING_EQUITY,
-        starting_equity=STARTING_EQUITY,
-        peak_equity=STARTING_EQUITY,
+        equity=settings.STARTING_EQUITY,
+        starting_equity=settings.STARTING_EQUITY,
+        peak_equity=settings.STARTING_EQUITY,
     )
     shared_state = SharedState(
         heartbeat_status="HEALTHY",
@@ -339,8 +339,8 @@ async def main() -> None:
         lob_status="UNINITIALISED",
     )
 
-    killswitch      = GlobalKillswitch(STARTING_EQUITY)
-    budget          = DailyBudget.from_equity(STARTING_EQUITY)
+    killswitch      = GlobalKillswitch(settings.STARTING_EQUITY)
+    budget          = DailyBudget.from_equity(settings.STARTING_EQUITY)
     cvd_calculator  = CVDCalculator()
     lob_engine      = LocalOrderBook(shared_state=shared_state)
     feature_computer = FeatureComputer()
@@ -470,6 +470,19 @@ async def main() -> None:
         await reconcile_on_startup(client, portfolio, risk_engine, symbol=SYMBOL)
     else:
         logger.info("[Main] Skipping reconciliation — no Binance client")
+
+    # Rebase risk limits to actual Binance account equity
+    actual_equity = portfolio.equity
+    if actual_equity > 0:
+        killswitch.update_dov(actual_equity)
+        budget.rebase(actual_equity)
+        logger.info(
+            "[Main] Risk limits rebased to actual equity=%.2f "
+            "(KS-1 hard_limit=%.2f budget hard_limit=%.2f)",
+            actual_equity,
+            actual_equity * 0.01,
+            actual_equity * 0.01,
+        )
 
     # 4. Register SIGTERM/SIGINT handlers ─────────────────────────────────────
     shutdown_event = asyncio.Event()

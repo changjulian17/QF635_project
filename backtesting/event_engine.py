@@ -86,8 +86,6 @@ from backtesting.signals import (
 
 logger = logging.getLogger(__name__)
 
-STARTING_EQUITY = 10_000.0   # Default starting equity (USDT)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trade Record
