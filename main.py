@@ -203,7 +203,8 @@ async def _api_server(
     telemetry: SignalTelemetry,
     port: int,
     alert_dispatcher: AlertDispatcher | None = None,
-    hub: RealtimeHub | None = None,
+    lob_hub: RealtimeHub | None = None,
+    signal_hub: RealtimeHub | None = None,
 ) -> None:
     """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
 
@@ -268,18 +269,25 @@ async def _api_server(
         )
         return web.json_response({"fired": True})
 
-    async def _handle_ws_lob(request: web.Request) -> web.WebSocketResponse:
+    async def _handle_ws(request: web.Request, target_hub: RealtimeHub | None) -> web.WebSocketResponse:
+        """Generic WebSocket handler: register on a hub, keep open until client closes."""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        if hub is not None:
-            hub.register(ws)
+        if target_hub is not None:
+            target_hub.register(ws)
         try:
             async for _msg in ws:  # keep connection open; client never sends
                 pass
         finally:
-            if hub is not None:
-                hub.unregister(ws)
+            if target_hub is not None:
+                target_hub.unregister(ws)
         return ws
+
+    async def _handle_ws_lob(request: web.Request) -> web.WebSocketResponse:
+        return await _handle_ws(request, lob_hub)
+
+    async def _handle_ws_signals(request: web.Request) -> web.WebSocketResponse:
+        return await _handle_ws(request, signal_hub)
 
     app = web.Application()
     app.router.add_get("/api/health", _handle_health)
@@ -287,6 +295,7 @@ async def _api_server(
     app.router.add_get("/api/session", _handle_session)
     app.router.add_post("/api/killswitch", _handle_killswitch)
     app.router.add_get("/ws/lob", _handle_ws_lob)
+    app.router.add_get("/ws/signals", _handle_ws_signals)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -383,6 +392,11 @@ async def main() -> None:
             alert_dispatcher.notify_tier_change(old_tier, new_tier, budget.loss_pct)
         )
 
+    # Real-time broadcast hubs — one per logical stream so clients receive only
+    # the messages their page renders.
+    realtime_hub = RealtimeHub()  # /ws/lob: snapshots + microstructure events
+    signal_hub   = RealtimeHub()  # /ws/signals: live gate-decision tape
+
     # Components ──────────────────────────────────────────────────────────────
     ws_consumer = BinanceWebSocketConsumer(
         candle_queue=candle_queue,
@@ -400,7 +414,7 @@ async def main() -> None:
         cvd_calculator=cvd_calculator,
         feature_computer=feature_computer,
     )
-    telemetry = SignalTelemetry(telemetry_queue=telemetry_queue)
+    telemetry = SignalTelemetry(telemetry_queue=telemetry_queue, hub=signal_hub)
 
     # Resolve active registered strategy so strategy_id and entry_rules can be
     # passed into StrategyExecutor. Falls back to defaults when no spec is registered.
@@ -480,8 +494,6 @@ async def main() -> None:
     # 5. LOB warm-up guard ────────────────────────────────────────────────────
     await asyncio.sleep(0.5)
 
-    # Real-time broadcast hub — streams LOB snapshots to dashboard WS clients
-    realtime_hub = RealtimeHub()
 
     # 6. Start TaskGroup with all coroutines ──────────────────────────────────
     try:
@@ -514,7 +526,7 @@ async def main() -> None:
                 _api_server(
                     killswitch, portfolio, shared_state,
                     order_manager, telemetry, settings.DASHBOARD_API_PORT,
-                    alert_dispatcher, realtime_hub,
+                    alert_dispatcher, lob_hub=realtime_hub, signal_hub=signal_hub,
                 ),
                 name="api_server",
             )
