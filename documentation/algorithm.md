@@ -30,7 +30,7 @@ flowchart TD
     LOBQ --> LOB[LocalOrderBook]
     MSQ --> MS[MicrostructureDetector]
     TRADES --> MS
-    TRADES --> CVD[CVDCalculator]
+    MS --> CVD[CVDCalculator]
     CANDLES --> FCL[feature_candle_loop]
     FCL --> FC[FeatureComputer]
     MS --> FC
