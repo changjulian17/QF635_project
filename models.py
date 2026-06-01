@@ -47,6 +47,9 @@ class PortfolioState:
     num_fill_samples: int = 0
     avg_slippage_bps: float = 0.0
     budget_loss_pct: float = 0.0
+    usdt_balance: float = 0.0   # USDT cash at last reconcile
+    btc_balance:  float = 0.0   # BTC quantity at last reconcile
+    btc_price:    float = 0.0   # BTC/USDT price used for MTM at last reconcile
 
     @property
     def drawdown_pct(self) -> float:

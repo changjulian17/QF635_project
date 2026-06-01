@@ -122,6 +122,35 @@ def test_outcome_update(tmp_path):
     t._conn.close()
 
 
+def test_approved_record_flushes_immediately_for_outcome_update(tmp_path):
+    """APPROVED flush is immediate so a racing update_outcome always finds the row.
+
+    This test would FAIL without the fix in _drain_loop that triggers an immediate
+    flush when gate_passed == 'APPROVED' — the row would not be committed within 0.3s.
+    """
+    tmp = str(tmp_path / "test.db")
+
+    async def _run():
+        t, q = _telemetry(tmp)
+        rec = _record()  # gate_passed="APPROVED" by default
+        await q.put(rec)
+        try:
+            await asyncio.wait_for(t._drain_loop(), timeout=0.3)
+        except asyncio.TimeoutError:
+            pass
+        # Row must already be in DB from the immediate flush triggered by APPROVED
+        await t.update_outcome(rec.signal_id, "WIN", pnl=50.0, pnl_pct=0.005, duration_min=10.0)
+        return t, rec.signal_id
+
+    t, sid = asyncio.run(_run())
+    row = t._conn.execute(
+        "SELECT outcome FROM signal_records WHERE signal_id=?", (sid,)
+    ).fetchone()
+    assert row is not None, "APPROVED record must be in DB before update_outcome is called"
+    assert row[0] == "WIN"
+    t._conn.close()
+
+
 def test_duplicate_signal_id_ignored(tmp_path):
     """INSERT OR IGNORE should silently drop duplicate signal_ids."""
     tmp = str(tmp_path / "test.db")

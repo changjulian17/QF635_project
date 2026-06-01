@@ -23,7 +23,7 @@ from dash_extensions import WebSocket
 from plotly.subplots import make_subplots
 
 from config import settings
-from dashboard._db import fetch_lob_snapshots, fetch_agg_trades, DBOffline
+from dashboard._db import fetch_lob_snapshots, fetch_agg_trades, fetch_cvd_series_24h, DBOffline
 from dashboard._logic import update_lob_buffer
 from dashboard._utils import empty_fig as _empty_fig
 
@@ -92,6 +92,14 @@ layout = html.Div([
         ], width=3),
     ], className="mb-3"),
 
+    # ── Refresh button ─────────────────────────────────────────────────────
+    dbc.Row([
+        dbc.Col(
+            dbc.Button("Refresh Now", id="lob-refresh-btn", color="secondary", size="sm"),
+            width="auto",
+        ),
+    ], className="mb-3"),
+
     # ── Chart ──────────────────────────────────────────────────────────────
     dcc.Graph(id="lob-chart", style={"height": "860px"}),
 ])
@@ -117,13 +125,12 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         rows=4, cols=1, shared_xaxes=True,
         row_heights=[0.50, 0.17, 0.17, 0.16],
         vertical_spacing=0.03,
-        subplot_titles=("Liquidity Heatmap", "OBI", "CVD", "Spread"),
+        subplot_titles=("Liquidity Heatmap", "OBI", "CVD (24h)", "Spread"),
     )
 
     # ── Row 1: heatmap ─────────────────────────────────────────────────────
     ts_labels: list[str] = []
     if not hm_df.empty:
-        current_mid   = float(hm_df["mid_price"].iloc[-1])
         window_center = float((hm_df["mid_price"].min() + hm_df["mid_price"].max()) / 2)
         price_lo = window_center - half_range
         price_hi = window_center + half_range
@@ -163,10 +170,11 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         all_nonzero = np.concatenate([bid_matrix[bid_matrix > 0], ask_matrix[ask_matrix > 0]])
         max_vol = np.percentile(all_nonzero, contrast_pctile) if len(all_nonzero) else 1.0
 
-        mid_ri = int((current_mid - price_lo) / bucket_size)
-        for ri in range(max(0, mid_ri - 5), min(n_prices, mid_ri + 6)):
-            bid_matrix[ri, :] = 0.0
-            ask_matrix[ri, :] = 0.0
+        for col_idx, mp in enumerate(mid_prices):
+            col_mid_ri = int((mp - price_lo) / bucket_size)
+            for ri in range(max(0, col_mid_ri - 5), min(n_prices, col_mid_ri + 6)):
+                bid_matrix[ri, col_idx] = 0.0
+                ask_matrix[ri, col_idx] = 0.0
 
         fig.add_trace(go.Heatmap(
             z=bid_matrix, x=ts_labels, y=price_buckets,
@@ -189,8 +197,6 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
     # ── Rows 2-4: OBI / CVD / Spread ───────────────────────────────────────
     if not obi_df.empty:
         obi_ts = obi_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
-        cvd_running = obi_df["cvd_delta"].fillna(0.0).cumsum().tolist()
-
         fig.add_trace(go.Scatter(
             x=obi_ts, y=obi_df["obi"].tolist(), mode="lines",
             line=dict(color="cyan", width=1.2), name="OBI",
@@ -200,9 +206,21 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         fig.add_hline(y=-settings.OBI_BREAK_THRESH, line=dict(dash="dot", color="red",  width=1), row=2, col=1)
         fig.add_hline(y=0, line=dict(color="white", width=0.5), row=2, col=1)
 
+        since_24h_ms = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
+        cvd_rows = fetch_cvd_series_24h(since_24h_ms)
+        if cvd_rows and not isinstance(cvd_rows, DBOffline):
+            cvd_ms  = np.array([r["ts_sec_ms"] for r in cvd_rows], dtype=np.int64)
+            cvd_cum = np.cumsum([r["delta"]     for r in cvd_rows])
+            # Use .timestamp()*1000: obi_df["ts"] is datetime64[us, UTC] in pandas 3.x,
+            # so astype(int64) gives microseconds — // 10**6 would yield seconds, not ms.
+            obi_ms  = np.array([int(t.timestamp() * 1000) for t in obi_df["ts"]], dtype=np.int64)
+            cvd_y   = [float(cvd_cum[np.argmin(np.abs(cvd_ms - t))]) for t in obi_ms]
+        else:
+            cvd_y = [0.0] * len(obi_ts)
+
         fig.add_trace(go.Scatter(
-            x=obi_ts, y=cvd_running, mode="lines",
-            line=dict(color="orange", width=1.2), name="CVD",
+            x=obi_ts, y=cvd_y, mode="lines",
+            line=dict(color="orange", width=1.2), name="CVD (24h)",
             fill="tozeroy", fillcolor="rgba(255,165,0,0.12)",
         ), row=3, col=1)
         fig.add_hline(y=0, line=dict(color="white", width=0.5), row=3, col=1)
@@ -221,8 +239,7 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         win_start = int(snap_ms[0])
         win_end   = int(snap_ms[-1])
 
-        trade_limit = min(rows_needed * 20, 200_000)  # ~20 trades/s peak; cap to avoid OOM
-        trades = fetch_agg_trades(win_start, limit=trade_limit)
+        trades = fetch_agg_trades(win_start, until_ts_ms=win_end, limit=None)
         buy_x,  buy_y,  buy_sz,  buy_txt  = [], [], [], []
         sell_x, sell_y, sell_sz, sell_txt = [], [], [], []
 
@@ -290,21 +307,14 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
     return fig
 
 
-@callback(
-    Output("lob-tick", "data", allow_duplicate=True),
-    Input("lob-backfill", "n_intervals"),
-    prevent_initial_call=True,
-)
-def backfill_buffer(_n):
-    """Seed the server-side buffer once from the DB so the chart isn't empty on load."""
+def _seed_buffer_from_db() -> str | None:
+    """Fetch LOB snapshots from DB into _BUFFER. Returns latest ts or None."""
     global _BUFFER
-    if _BUFFER:
-        return no_update
     rows = fetch_lob_snapshots(limit=_MAX_BUFFER)
     if isinstance(rows, DBOffline) or not rows:
-        return no_update
+        return None
     seeded = []
-    for r in rows:  # fetch_lob_snapshots returns ascending (oldest first)
+    for r in rows:  # ascending (oldest first)
         try:
             bid = json.loads(r.get("bid_levels_json") or "[]")
             ask = json.loads(r.get("ask_levels_json") or "[]")
@@ -317,6 +327,30 @@ def backfill_buffer(_n):
         })
     _BUFFER = seeded
     return seeded[-1]["ts"]
+
+
+@callback(
+    Output("lob-tick", "data", allow_duplicate=True),
+    Input("lob-backfill", "n_intervals"),
+    prevent_initial_call=True,
+)
+def backfill_buffer(_n):
+    """Seed the server-side buffer once from the DB so the chart isn't empty on load."""
+    if _BUFFER:
+        return no_update
+    ts = _seed_buffer_from_db()
+    return ts if ts else no_update
+
+
+@callback(
+    Output("lob-tick", "data", allow_duplicate=True),
+    Input("lob-refresh-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def refresh_buffer(_n_clicks):
+    """Re-seed the buffer from DB on manual refresh and trigger a redraw."""
+    ts = _seed_buffer_from_db()
+    return ts if ts else no_update
 
 
 @callback(

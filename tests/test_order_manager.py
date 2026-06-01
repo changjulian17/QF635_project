@@ -68,13 +68,90 @@ def _make_manager(
     return om, sig_q, fill_q, ks
 
 
-def _filled_resp(price: float = 95_015.0, qty: float = 0.001) -> dict:
+def _filled_resp(
+    price: float = 95_015.0,
+    qty: float = 0.001,
+    commission: float = 0.0,
+    commission_asset: str = "BNB",
+) -> dict:
     return {
         "orderId":     "101",
         "status":      "FILLED",
         "executedQty": str(qty),
-        "fills":       [{"price": str(price), "qty": str(qty)}],
+        "fills":       [{
+            "price":           str(price),
+            "qty":             str(qty),
+            "commission":      str(commission),
+            "commissionAsset": commission_asset,
+        }],
     }
+
+
+# ── BTC fee deduction ─────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_btc_fee_deducted_from_oco_and_position_qty():
+    """
+    When Binance deducts the BUY fee in BTC (commissionAsset='BTC'), both
+    _open_position_qty and the OCO quantity must use the net qty (gross - fee).
+    Using gross executedQty triggers -2010 when the full amount is not in the account.
+    """
+    import math as _math
+    gross    = 0.1
+    fee      = 0.0001          # 0.1% in BTC
+    step     = settings.QTY_STEP_SIZE
+    net_raw  = gross - fee     # 0.0999
+    expected = round(_math.floor(net_raw / step) * step, 5)
+
+    om, _, _, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
+    req = _make_req("LONG")
+
+    om._client = AsyncMock()
+    om._client.create_order = AsyncMock(
+        return_value=_filled_resp(qty=gross, commission=fee, commission_asset="BTC")
+    )
+    captured_oco: list[dict] = []
+    async def capture_oco(**kwargs):
+        captured_oco.append(kwargs)
+        return {"orderListId": 55}
+    om._client.create_oco_order = capture_oco
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om._submit(req)
+
+    assert om._open_position_qty == pytest.approx(expected), (
+        f"_open_position_qty {om._open_position_qty} != net qty {expected}"
+    )
+    assert captured_oco, "create_oco_order was not called"
+    assert float(captured_oco[0]["quantity"]) == pytest.approx(expected), (
+        f"OCO quantity {captured_oco[0]['quantity']} != net qty {expected}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_skipped_when_insufficient_btc():
+    """
+    SELL (SHORT) entry is skipped with a warning when the account's free BTC
+    is less than the required qty. Prevents -2010 on Spot accounts funded only
+    with USDT (as happens after the startup reconciler liquidates BTC).
+    """
+    om, _, fill_q, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
+    req = _make_req("SHORT")
+
+    om._client = AsyncMock()
+    om._client.get_account = AsyncMock(return_value={
+        "balances": [
+            {"asset": "BTC",  "free": "0.00001", "locked": "0.0"},
+            {"asset": "USDT", "free": "10000.0", "locked": "0.0"},
+        ]
+    })
+    om._client.create_order = AsyncMock()
+
+    with patch.object(settings, "DRY_RUN", False):
+        result = await om._submit_aggressive_limit(req, "SELL", 95_000.0, 95_010.0)
+
+    assert result is None
+    om._client.create_order.assert_not_called()
 
 
 # ── 1. LONG limit price formula ───────────────────────────────────────────────
@@ -496,7 +573,7 @@ async def test_s1_deferred_cancel_executed_after_oco_placed():
 
     om._client = AsyncMock()
     om._client.create_oco_order = AsyncMock(return_value={"orderListId": 42})
-    om._client.delete_oco_order = AsyncMock()
+    om._client.v3_delete_order_list = AsyncMock()
 
     emergency_calls: list = []
     async def spy_emergency(qty, entry_side, reason):
@@ -511,7 +588,7 @@ async def test_s1_deferred_cancel_executed_after_oco_placed():
         await om._place_oco(req, fill_price=95_015.0, fill_qty=0.001, entry_side="BUY")
 
     assert emergency_calls == ["WALL_REMOVED_DURING_OCO"]
-    om._client.delete_oco_order.assert_called_once()
+    om._client.v3_delete_order_list.assert_called_once()
     # After deferred close, position state must be fully reset
     assert om._open_position_side         is None
     assert om._open_position_qty          == 0.0
@@ -580,7 +657,7 @@ async def test_watch_oco_win_records_outcome_and_sets_event():
     om._update_outcome_cb = capture_outcome
 
     om._client = AsyncMock()
-    om._client.get_oco_order = AsyncMock(return_value={
+    om._client.v3_get_order_list = AsyncMock(return_value={
         "listStatusType": "ALL_DONE",
         "orders": [{"orderId": 42}],
     })
@@ -627,7 +704,7 @@ async def test_watch_oco_exits_cleanly_on_external_close():
     )
 
     assert not outcomes                          # no outcome recorded
-    om._client.get_oco_order.assert_not_called() # no REST call made
+    om._client.v3_get_order_list.assert_not_called() # no REST call made
 
 
 # ── 23. OCO watcher continues polling while EXECUTING ────────────────────────
@@ -651,7 +728,7 @@ async def test_watch_oco_continues_polling_while_executing():
         return {"listStatusType": "ALL_DONE", "orders": [{"orderId": 1}]}
 
     om._client = AsyncMock()
-    om._client.get_oco_order = AsyncMock(side_effect=oco_side)
+    om._client.v3_get_order_list = AsyncMock(side_effect=oco_side)
     om._client.get_order = AsyncMock(return_value={
         "executedQty": "0.001", "avgPrice": "96000.0"
     })
@@ -711,7 +788,7 @@ async def test_natural_oco_close_clears_active_exposure():
     om._open_position_closed_event = closed_event
 
     om._client = AsyncMock()
-    om._client.get_oco_order = AsyncMock(return_value={
+    om._client.v3_get_order_list = AsyncMock(return_value={
         "listStatusType": "ALL_DONE",
         "orders": [{"orderId": 42}],
     })
@@ -743,7 +820,7 @@ async def test_safety_exit_cancels_oco_and_emergency_closes():
     om._open_entry_price = 95_000.0
     om._open_entry_time = time.monotonic()
     om._client = AsyncMock()
-    om._client.delete_oco_order = AsyncMock()
+    om._client.v3_delete_order_list = AsyncMock()
 
     emergency_reasons = []
     async def confirmed_close(qty, entry_side, reason):
@@ -754,7 +831,7 @@ async def test_safety_exit_cancels_oco_and_emergency_closes():
     with patch.object(settings, "DRY_RUN", False):
         await om.handle_safety_exit("MAX_HOLD")
 
-    om._client.delete_oco_order.assert_called_once()
+    om._client.v3_delete_order_list.assert_called_once()
     assert emergency_reasons == ["SAFETY_MAX_HOLD"]
     assert closed_event.is_set()
     assert not om.has_active_exposure()
