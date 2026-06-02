@@ -224,7 +224,7 @@ Every potential trade passes through seven sequential gates. Failure at any gate
 | **Gate 0** | Data Fidelity | `lob_status == SYNCED` AND `heartbeat` not in `(CRITICAL, SUSTAINED_DEGRADED)` | `GATE_0_FAIL: LOB_STALE` or `GATE_0_FAIL: HEARTBEAT_CRITICAL` or `GATE_0_FAIL: HEARTBEAT_SUSTAINED_DEGRADED` |
 | **Gate 1** | Microstructure Trigger | Sweep + Fresh Wall confirmed | `GATE_1_FAIL: NO_SWEEP_SIGNAL` |
 | **Gate 2** | Confidence Score | `confidence >= 0.58` | `GATE_2_FAIL: LOW_CONFIDENCE 0.47 < 0.58` |
-| **Gate 3** | Capital Gate | `remaining_budget > 0` AND `tier != HALTED` | `GATE_3_FAIL: BUDGET_EXHAUSTED` |
+| **Gate 3** | Capital Gate | `remaining_budget > 0` AND `tier not in (HALTED, PASSIVE)` AND `no active exposure` | `GATE_3_FAIL: BUDGET_EXHAUSTED` or `GATE_3_FAIL: RISK_TIER_{tier}` or `GATE_3_FAIL: ACTIVE_EXPOSURE` |
 | **Gate 4** | Order Selection | `spread_bps <= spread_p95 × 2` | `GATE_4_FAIL: SPREAD_TOO_WIDE` |
 | **Gate 5** | Execution Sync | `signal_age < 200ms` AND `last_delta < 200ms` | `GATE_5_FAIL: SIGNAL_STALE` |
 | **Gate 6** | Persistence Monitor | Protection Wall still present (post-entry) | `GATE_6_ALERT: PROTECTION_WALL_REMOVED` |
@@ -474,21 +474,21 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `LOB_OBI_DEPTH` | `20` | Levels used for OBI calculation |
 | `LOB_HISTORY` | `18000` | In-memory bars retained (~5h) |
 | `LOB_HEATMAP_BUCKET` | `5.0` | USD bucket width for dashboard heatmap |
-| `RELOAD_SIGMA` | `3.0` | σ threshold for iceberg reload detection |
-| `ICEBERG_WINDOW_MS` | `500` | Lookback window for iceberg replenishment |
-| `ICEBERG_MIN_REPLENISH` | `0.80` | Min reload fraction to confirm iceberg |
-| `ICEBERG_MIN_QTY` | `0.5` | Min absolute qty to qualify as iceberg |
-| `SWEEP_LEVELS` | `5` | Top-N levels checked for sweep volume |
-| `SWEEP_THRESHOLD` | `0.80` | Buy/sell vol must exceed this fraction of top-N depth |
-| `BREAK_PROTECT_WINDOW_MS` | `2000` | Fresh-wall recency window post-sweep (ms) |
-| `OBI_BREAK_THRESH` | `0.40` | OBI threshold for breakout confirmation |
+| `RELOAD_SIGMA` | `3.0` | σ threshold for iceberg reload detection — **legacy-engine-only; see TODO** |
+| `ICEBERG_WINDOW_MS` | `500` | Lookback window for iceberg replenishment — **legacy-engine-only; see TODO** |
+| `ICEBERG_MIN_REPLENISH` | `0.80` | Min reload fraction to confirm iceberg — **legacy-engine-only; see TODO** |
+| `ICEBERG_MIN_QTY` | `0.5` | Min absolute qty to qualify as iceberg — **legacy-engine-only; see TODO** |
+| `SWEEP_LEVELS` | `5` | Top-N levels checked for sweep volume — **legacy-engine-only; see TODO** |
+| `SWEEP_THRESHOLD` | `0.80` | Buy/sell vol fraction threshold — **legacy-engine-only; see TODO** |
+| `BREAK_PROTECT_WINDOW_MS` | `2000` | Break+protect window (ms) — **legacy-engine-only; see TODO** |
+| `OBI_BREAK_THRESH` | `0.40` | OBI reference level — used by dashboard `/lob` page as a visual reference line only (not a trading gate) |
 | `MICRO_MAX_HOLD_MS` | `60_000` | Max hold before forced exit (Gate 6) |
 | `MICRO_EXIT_SPREAD_HARD_CAP_BPS` | `12.0` | Spread hard cap for Gate 6 post-entry exit trigger (not Gate 4; Gate 4 uses `EntryRules.spread_max_bps` = 8.0) |
 | `LOB_FRESH_WALL_MS` | `3_000` | Protection wall must appear within this window |
 | `LOB_STALE_WALL_MS` | `30_000` | Prune wall states not seen for this long |
 | `PROTECTION_MAX_DISTANCE_BPS` | `25.0` | Max protection wall distance from mid |
-| `PRICE_PRUNE_INTERVAL` | `100` | Prune stale price keys every N bars |
-| `PRICE_PRUNE_BAND` | `0.02` | Keep prices within ±2% of current mid |
+| `PRICE_PRUNE_INTERVAL` | `100` | Prune stale price keys every N bars — **legacy-engine-only; see TODO** |
+| `PRICE_PRUNE_BAND` | `0.02` | Keep prices within ±2% of current mid — **legacy-engine-only; see TODO** |
 | `MICRO_PRICE_MOVE_FLOOR_BPS` | `3.0` | Minimum price move to confirm sweep |
 | `MICRO_PRICE_MOVE_WINDOW` | `300` | Rolling window for dynamic price-move threshold |
 | `MICRO_PRICE_MOVE_PERCENTILE` | `0.90` | Percentile rank for dynamic threshold |
@@ -717,7 +717,7 @@ These rules are invariants. Any code that violates them is incorrect.
 - [x] **Test coverage gap — HeartbeatMonitor SUSTAINED_DEGRADED**: `test_ws_consumer.py` now includes `test_heartbeat_sustained_degraded` and `test_heartbeat_recovery_from_sustained` covering the 10 s transition and hysteresis band recovery (12 tests total).
 - [ ] **Test coverage gap — RiskEngine throttle and circuit breakers**: `test_risk_engine.py` has only 8 tests (sync_tier transitions and basic record_trade_result). The 5-tier drawdown circuit breaker, consecutive-loss cooldown timer, budget-loss tier thresholds, and all `_check_circuit_breakers()` branches are untested. This is a liability for a risk-critical module — expand to at least 25 tests covering the full tier ladder and each circuit breaker trigger.
 - [ ] **Dead config — CANDLE_INTERVAL**: `config.py` defines `CANDLE_INTERVAL: str = "1s"` with the comment "legacy — ws_consumer uses this", but `ws_consumer.py` never imports or reads this setting (it uses `TIMEFRAME` for klines). Remove the setting or delete it before more code takes a dependency on it.
-- [ ] **Dead config — legacy-engine-only settings**: `SWEEP_THRESHOLD`, `SWEEP_LEVELS`, `BREAK_PROTECT_WINDOW_MS`, `OBI_BREAK_THRESH`, `ICEBERG_PRICE_TOL`, `BOOK_FLIP_SIGMA`, `BOOK_FLIP_MIN_CONSUMED`, `BOOK_FLIP_AGG_RATIO`, `BREAK_MIN_VOL` are defined in `config.py` but consumed exclusively by `engine/microstructure_engine.py` (the legacy engine that is not started in the live path). Removing the legacy engine (see Dead code — MicrostructureEngine TODO above) removes all consumers for these settings. Annotate clearly as "legacy-engine-only" now; delete when the engine is removed.
+- [ ] **Dead config — legacy-engine-only settings**: `SWEEP_THRESHOLD`, `SWEEP_LEVELS`, `BREAK_PROTECT_WINDOW_MS`, `ICEBERG_PRICE_TOL`, `BOOK_FLIP_SIGMA`, `BOOK_FLIP_MIN_CONSUMED`, `BOOK_FLIP_AGG_RATIO`, `BREAK_MIN_VOL`, `RELOAD_SIGMA`, `ICEBERG_WINDOW_MS`, `ICEBERG_MIN_REPLENISH`, `ICEBERG_MIN_QTY`, `PRICE_PRUNE_INTERVAL`, `PRICE_PRUNE_BAND` are defined in `config.py` but consumed exclusively by `engine/microstructure_engine.py` (the legacy engine that is not started in the live path). Note: `OBI_BREAK_THRESH` remains in the list above but IS used — it drives a reference line in `dashboard/pages/lob.py` (visual only, not a trading gate). Removing the legacy engine removes all consumers for the other settings listed; delete them at that point.
 - [ ] **STARTING_EQUITY duplication**: `main.py` defines `STARTING_EQUITY = 10_000.0` as a module-level constant instead of reading `settings.STARTING_EQUITY`. If someone sets `STARTING_EQUITY` in `.env`, the main orchestrator ignores it — only `backtesting/event_engine.py` picks it up. Consolidate: replace the `main.py` constant with `settings.STARTING_EQUITY` so the value is controlled from a single source.
 - [ ] **Absorption prerequisite adds false negatives**: `gate_1_microstructure()` hard-gates on `prior_absorption == True`. A wall that appears and is immediately consumed (e.g. within the first 500ms of its first_seen_ts) will always be rejected — absorption can never arm a wall that is gone before it persists. At the 100ms tick rate this blocks genuine fast institutional sweeps of newly-posted deep liquidity. Evaluate demoting Absorption from a Gate 1 hard prerequisite to a Gate 2 scoring bonus (e.g. `absorption_ratio > 0 → +0.10` in `RuleBasedScorer`) to recover these signals without opening a false-positive flood.
 - [ ] **Dual-store registry is over-engineered for a single-strategy system**: `strategy/registry.py` writes every spec to both a YAML file and a SQLite `strategies` table. For the current single-strategy deployment, a single SQLite store would suffice; the YAML mirror adds sync risk (YAML written first, then DB — a crash between the two leaves them inconsistent). Consolidate into SQLite-only in `strategy/registry.py` and `strategy/builder.py`, retaining YAML export as an explicit `export()` method for human review.
@@ -725,3 +725,4 @@ These rules are invariants. Any code that violates them is incorrect.
 - [ ] **Parallel depth consumers double memory pressure**: `main.py` line 492 fans out each reconstructed depth snapshot to both `lob_depth_queue` (consumed by `_run_lob_engine`) and `ms_depth_queue` (consumed by `MicrostructureDetector`). Both consumers parse the same `{"bids": [...], "asks": [...]}` dict independently. Evaluate whether `MicrostructureDetector` could subscribe to `LocalOrderBook`'s processed output instead of the raw diff queue, halving snapshot copies in memory at the cost of adding a processing dependency.
 - [ ] **Test coverage gap — strategy/builder.py and strategy/spec.py**: Neither `tests/test_builder.py` nor `tests/test_spec.py` exists. `StrategyBuilder.walk_forward_metrics()` and `StrategyBuilder.build()` (which drive the BACKTEST→PAPER promotion path) are untested. `StrategySpec.to_dict()` / `StrategySpec.from_dict()` roundtrip is exercised only indirectly via `test_registry.py`. Add dedicated test files for both modules.
 - [ ] **Gate 3 capital gate has a belt-and-suspenders budget check**: `gate_3_capital()` (`strategy/executor.py` lines 75–79) checks both `tier in ("HALTED", "PASSIVE")` and `budget.remaining <= 0`. These are not independent — when DOV loss reaches `TIER_HALTED_PCT`, `RiskEngine._check_circuit_breakers()` (`risk/engine.py` lines 82–86) sets `tier = HALTED`, so the tier check would already reject. The `budget.remaining <= 0` path only fires during the ~1-second gap before the next MTM loop tier sync. Evaluate whether increasing the MTM loop frequency or making the tier sync synchronous on budget update would allow the `budget.remaining` check to be removed.
+- [ ] **Test coverage gap — risk/budget.py and risk/killswitch.py**: Neither `tests/test_budget.py` nor `tests/test_killswitch.py` exists. `DailyBudget.remaining`, `DailyBudget.loss_pct`, reset on midnight boundary, and `GlobalKillswitch` trigger conditions (KS-1 budget breach, KS-2 heartbeat, KS-3 slippage) are only tested indirectly through `test_risk_engine.py` fixtures. These are risk-critical code paths — add dedicated unit tests for each module (`risk/budget.py` and `risk/killswitch.py`).
