@@ -138,7 +138,7 @@ CryptoSentinel/
 │   ├── run_backtest.py        # CLI for tick-level walk-forward backtest (writes to backtest_results.db)
 │   └── signal_injector.py     # Synthetic signal injection — dev/testnet only (start_test.sh)
 │
-├── tests/                     # pytest unit + integration tests (444 total)
+├── tests/                     # pytest unit + integration tests (451 total)
 │   │                          # Phase 1 — live trading engine
 │   ├── test_models.py
 │   ├── test_lob_engine.py
@@ -225,8 +225,8 @@ Every potential trade passes through seven sequential gates. Failure at any gate
 | **Gate 1** | Microstructure Trigger | Sweep + Fresh Wall confirmed | `GATE_1_FAIL: NO_SWEEP_SIGNAL` |
 | **Gate 2** | Confidence Score | `confidence >= 0.58` | `GATE_2_FAIL: LOW_CONFIDENCE 0.47 < 0.58` |
 | **Gate 3** | Capital Gate | `remaining_budget > 0` AND `tier not in (HALTED, PASSIVE)` AND `no active exposure` | `GATE_3_FAIL: BUDGET_EXHAUSTED` or `GATE_3_FAIL: RISK_TIER_{tier}` or `GATE_3_FAIL: ACTIVE_EXPOSURE` |
-| **Gate 4** | Order Selection | `spread_bps <= spread_p95 × 2` | `GATE_4_FAIL: SPREAD_TOO_WIDE` |
-| **Gate 5** | Execution Sync | `signal_age < 200ms` AND `last_delta < 200ms` | `GATE_5_FAIL: SIGNAL_STALE` |
+| **Gate 4** | Order Selection | `spread_bps <= EntryRules.spread_max_bps` (8.0 bps hard cap) AND `spread_bps <= spread_p95 × 2` | `GATE_4_FAIL: SPREAD_TOO_WIDE` |
+| **Gate 5** | Execution Sync | `signal_age < 200ms` AND `last_delta < HEARTBEAT_CRITICAL_MS` (500ms) | `GATE_5_FAIL: SIGNAL_STALE` |
 | **Gate 6** | Persistence Monitor | Protection Wall still present (post-entry) | `GATE_6_ALERT: PROTECTION_WALL_REMOVED` |
 
 Gate 6 is the only post-entry gate. It runs as an async task after fill confirmation and triggers early exit if the protection wall is cancelled.
