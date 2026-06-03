@@ -703,7 +703,7 @@ def test_gate_3_position_size_unit_rejects():
 
 
 def test_gate_3_position_size_rejects_in_executor():
-    """5 bps wall → est_notional ~$35k >> $9k (90% of $10k) → GATE_3_FAIL."""
+    """1 bps wall → est_notional ~$22,800 >> $9k (90% of $10k) → GATE_3_FAIL."""
     async def _run():
         micro_q  = asyncio.Queue()
         signal_q = asyncio.Queue()
@@ -718,7 +718,7 @@ def test_gate_3_position_size_rejects_in_executor():
             shared_state=state,
             equity_fn=lambda: 10_000.0,
         )
-        await ex._evaluate(_signal_with_mid(mid=73_628.0, wall_distance_bps=5))
+        await ex._evaluate(_signal_with_mid(mid=73_628.0, wall_distance_bps=1))
 
         assert signal_q.empty(), "oversized signal must not reach order queue"
         rec = await telem_q.get()
@@ -729,10 +729,9 @@ def test_gate_3_position_size_rejects_in_executor():
 
 
 def test_gate_3_position_size_passes_in_executor():
-    """25 bps wall with cap=0.95 → est_notional $9,120 < $9,500 → APPROVED.
-    Uses patch to set MAX_ORDER_NOTIONAL_PCT=0.95 because MockFC confidence=0.912
-    gives notional_hint=0.00228, so est_notional=equity×0.00228×400=$9,120
-    which is slightly above the default 0.90 cap ($9,000)."""
+    """25 bps wall → est_notional ~$912 << $9k (90% of $10k) → APPROVED.
+    notional_hint=0.000228 (confidence=0.912 × KELLY=0.25 × RISK_PCT=0.001),
+    so est_notional = equity × 0.000228 × 10_000/25 = $912 < $9,000."""
     async def _run():
         micro_q  = asyncio.Queue()
         signal_q = asyncio.Queue()
@@ -747,8 +746,7 @@ def test_gate_3_position_size_passes_in_executor():
             shared_state=state,
             equity_fn=lambda: 10_000.0,
         )
-        with patch.object(settings, "MAX_ORDER_NOTIONAL_PCT", 0.95):
-            await ex._evaluate(_signal_with_mid(mid=73_628.0, wall_distance_bps=25))
+        await ex._evaluate(_signal_with_mid(mid=73_628.0, wall_distance_bps=25))
         await asyncio.sleep(0)  # let gate6_watch task self-terminate
 
         assert not signal_q.empty(), "signal within size limit must reach order queue"
