@@ -191,9 +191,9 @@ The LOB Recorder subscribes to `btcusdt@depth@100ms` — the **incremental diff-
 | Stream | Purpose | Update Rate |
 |--------|---------|-------------|
 | `btcusdt@aggTrade` | CVD · aggressive volume | Per taker sweep |
-| `btcusdt@depth@100ms` | Wall detection · OBI · spread — incremental diff, 100 levels, $25 buckets | 100ms |
-| `btcusdt@bookTicker` | Best bid/ask for spread calc | Real-time |
-| `btcusdt@kline_5m` | OHLCV candles for patterns | On close (5m) |
+| `btcusdt@depth@100ms` | Wall detection · OBI · spread — incremental diff, 100 levels; LOB Recorder aggregates to $25 buckets before writing to `lob_tick.db` (live engine processes raw levels) | 100ms |
+| `btcusdt@bookTicker` | Heartbeat tracking only; raw dict routed to `trade_queue` but discarded by `MicrostructureDetector._collect_trades()` — spread is computed from the reconstructed depth snapshot | Real-time |
+| `btcusdt@kline_5m` | OHLCV candles for FeatureComputer (VWAP, ATR, RSI, volume) | On close (5m) |
 
 ### Async Queue Architecture
 

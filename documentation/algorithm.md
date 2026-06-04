@@ -162,7 +162,7 @@ This feedback loop keeps the live algorithm aligned with current data quality, r
 
 ## Current Boundaries
 
-The current live microstructure path submits approved `MicroOrderRequest` objects directly from `StrategyExecutor` to `OrderManager`. `RiskEngine` is still instantiated for budget/tier state, midnight reset, and tier synchronization into `StrategyExecutor`, but its legacy pattern-signal queue runner is not started in live startup.
+The current live microstructure path submits approved `MicroOrderRequest` objects directly from `StrategyExecutor` to `OrderManager`. `RiskEngine` is instantiated for budget/tier state, midnight reset, and tier synchronization into `StrategyExecutor`. The legacy `MicrostructureEngine` (`engine/microstructure_engine.py`) is not started in the live `TaskGroup` — it has no task in `main.py`'s `asyncio.TaskGroup` and the `ms_bar_queue` it would produce to has no active producer.
 
 The algorithm currently detects wall consumption from depth changes and wall reload ratio. It does not yet use a minimum-quantity probe order behind or after a wall as a cleaner consumption trigger; that remains a future design item.
 
