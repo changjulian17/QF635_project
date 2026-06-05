@@ -266,6 +266,7 @@ async def _api_server(
     alert_dispatcher: AlertDispatcher | None = None,
     lob_hub: RealtimeHub | None = None,
     portfolio_hub: RealtimeHub | None = None,
+    signal_hub: RealtimeHub | None = None,
 ) -> None:
     """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
 
@@ -309,18 +310,18 @@ async def _api_server(
         )
         return web.json_response({"fired": True})
 
-    async def _handle_ws(request: web.Request, hub: RealtimeHub | None) -> web.WebSocketResponse:
+    async def _handle_ws(request: web.Request, target_hub: RealtimeHub | None) -> web.WebSocketResponse:
         """Generic WebSocket handler: register on a hub, keep open until client closes."""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        if hub is not None:
-            hub.register(ws)
+        if target_hub is not None:
+            target_hub.register(ws)
         try:
             async for _msg in ws:  # keep connection open; client never sends
                 pass
         finally:
-            if hub is not None:
-                hub.unregister(ws)
+            if target_hub is not None:
+                target_hub.unregister(ws)
         return ws
 
     async def _handle_ws_lob(request: web.Request) -> web.WebSocketResponse:
@@ -329,6 +330,9 @@ async def _api_server(
     async def _handle_ws_portfolio(request: web.Request) -> web.WebSocketResponse:
         return await _handle_ws(request, portfolio_hub)
 
+    async def _handle_ws_signals(request: web.Request) -> web.WebSocketResponse:
+        return await _handle_ws(request, signal_hub)
+
     app = web.Application()
     app.router.add_get("/api/health", _handle_health)
     app.router.add_get("/api/portfolio", _handle_portfolio)
@@ -336,6 +340,7 @@ async def _api_server(
     app.router.add_post("/api/killswitch", _handle_killswitch)
     app.router.add_get("/ws/lob", _handle_ws_lob)
     app.router.add_get("/ws/portfolio", _handle_ws_portfolio)
+    app.router.add_get("/ws/signals", _handle_ws_signals)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -439,6 +444,7 @@ async def main() -> None:
     # hub reference.
     lob_hub       = RealtimeHub()  # /ws/lob: snapshots + microstructure events
     portfolio_hub = RealtimeHub()  # /ws/portfolio: equity / PnL / positions / risk tier
+    signal_hub    = RealtimeHub()  # /ws/signals: live gate-decision tape
 
     # Components ──────────────────────────────────────────────────────────────
     ws_consumer = BinanceWebSocketConsumer(
@@ -458,7 +464,7 @@ async def main() -> None:
         feature_computer=feature_computer,
         hub=lob_hub,
     )
-    telemetry = SignalTelemetry(telemetry_queue=telemetry_queue)
+    telemetry = SignalTelemetry(telemetry_queue=telemetry_queue, hub=signal_hub)
 
     # Resolve active registered strategy so strategy_id and entry_rules can be
     # passed into StrategyExecutor. Falls back to defaults when no spec is registered.
@@ -584,6 +590,7 @@ async def main() -> None:
                     killswitch, portfolio, shared_state,
                     order_manager, telemetry, settings.DASHBOARD_API_PORT,
                     alert_dispatcher, lob_hub=lob_hub, portfolio_hub=portfolio_hub,
+                    signal_hub=signal_hub,
                 ),
                 name="api_server",
             )

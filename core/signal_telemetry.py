@@ -57,20 +57,43 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _record_to_event_payload(record: SignalRecord) -> dict:
+    """Serialise a SignalRecord for the /ws/signals stream.
+
+    Subset of the full record — only the fields the live tape and funnel need.
+    Kept narrow on purpose (no PII, no feature_json blob) so the WS frame stays small.
+    """
+    return {
+        "type":             "signal_event",
+        "ts":               record.timestamp,
+        "signal_id":        record.signal_id,
+        "micro_signal":     record.micro_signal,
+        "gate_passed":      record.gate_passed,
+        "rejection_reason": record.rejection_reason,
+        "direction":        record.direction,
+        "confidence":       record.confidence,
+    }
+
+
 class SignalTelemetry:
     """
     Drains a telemetry_queue of SignalRecord objects and writes them to
     registry.db in batches.  Flushed on FLUSH_BATCH records OR FLUSH_INTERVAL
     seconds, whichever comes first.
+
+    When ``hub`` is provided, each record is also broadcast on dequeue (before
+    buffering) so dashboards can react to every gate decision in real time.
     """
 
     def __init__(
         self,
         telemetry_queue: asyncio.Queue,
         db_path: str = settings.REGISTRY_DB,
+        hub=None,
     ) -> None:
         self._queue   = telemetry_queue
         self._db_path = db_path
+        self._hub     = hub
         self._conn: Optional[sqlite3.Connection] = None
         self._buf: list[SignalRecord] = []
         self._last_flush: float = time.monotonic()
@@ -107,6 +130,11 @@ class SignalTelemetry:
         while True:
             try:
                 record = await asyncio.wait_for(self._queue.get(), timeout=_FLUSH_INTERVAL)
+                if self._hub is not None:
+                    try:
+                        await self._hub.broadcast(_record_to_event_payload(record))
+                    except Exception:
+                        logger.exception("[Telemetry] hub broadcast failed — continuing")
                 self._buf.append(record)
                 if len(self._buf) >= _FLUSH_BATCH or record.gate_passed == "APPROVED":
                     await self._flush()

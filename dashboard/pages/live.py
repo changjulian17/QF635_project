@@ -11,18 +11,25 @@ from dashboard._db import fetch_portfolio_history, fetch_session_stats, fetch_si
 from dashboard._logic import (
     fire_killswitch as _fire_ks,
     update_portfolio_state,
+    update_signal_tape,
     validate_ks_confirm as _validate_ks,
 )
 from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/", name="Live", redirect_from=["/live"])
 
-_API_BASE = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
-_WS_URL   = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/portfolio"
+_API_BASE       = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
+_WS_URL         = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/portfolio"
+_SIGNALS_WS_URL = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/signals"
 
 # Server-side cache of the latest portfolio snapshot (shared across clients — the
 # engine pushes identical data to everyone, so a single cache is correct).
 _PORTFOLIO: dict = {}
+
+# Server-side rolling tape of recent signal events (newest first). Shared across
+# clients — the engine pushes the same data to everyone.
+_TAPE_MAX = 50
+_TAPE: list[dict] = []
 
 _TIER_COLORS = {
     "ACTIVE": "success",
@@ -31,6 +38,16 @@ _TIER_COLORS = {
     "PASSIVE": "danger",
     "HALTED": "danger",
 }
+
+
+def _gate_color(gate_passed: str) -> str:
+    """Bootstrap color for the live-tape badge — green when approved, red when
+    rejected early, yellow when killed in the middle of the pipeline."""
+    if gate_passed == "APPROVED":
+        return "success"
+    if gate_passed.startswith("GATE_0") or gate_passed.startswith("GATE_1"):
+        return "danger"   # rejected on the cheap gates → noisy / common
+    return "warning"      # rejected mid-pipeline → notable
 
 
 def _metric_card(label: str, value: str, color: str = "light", width: int = 3) -> dbc.Col:
@@ -47,8 +64,10 @@ def _metric_card(label: str, value: str, color: str = "light", width: int = 3) -
 
 layout = html.Div([
     WebSocket(id="live-ws", url=_WS_URL),
-    dcc.Store(id="live-portfolio-tick"),                # bumps on each WS push
-    dcc.Interval(id="live-interval", interval=5000),    # 5s — drives session stats / funnel
+    WebSocket(id="live-signals-ws", url=_SIGNALS_WS_URL),
+    dcc.Store(id="live-portfolio-tick"),                # bumps on each portfolio WS push
+    dcc.Store(id="live-signals-tick"),                  # bumps on each new signal event
+    dcc.Interval(id="live-interval", interval=5000),    # 5s — drives session stats / funnel fallback
 
     # ── Header: connection badge ────────────────────────────────────────────
     html.Div([
@@ -68,6 +87,22 @@ layout = html.Div([
     dbc.Row([
         dbc.Col(dcc.Graph(id="live-equity-chart", style={"height": "220px"}), width=12),
     ], className="mb-4"),
+
+    # ── Live signal tape ───────────────────────────────────────────────────
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.H5("Live Signal Tape", className="mb-0 d-inline-block me-2"),
+                html.Span(id="live-signals-conn-status", className="d-inline-block"),
+            ], className="mb-2"),
+            html.Div(id="live-signal-tape", style={
+                "maxHeight": "240px", "overflowY": "auto",
+                "fontFamily": "monospace", "fontSize": "0.85rem",
+                "backgroundColor": "#1a1d20", "padding": "0.5rem",
+                "borderRadius": "0.25rem", "border": "1px solid #495057",
+            }),
+        ], width=12),
+    ], className="mb-3"),
 
     # ── Signal funnel ──────────────────────────────────────────────────────
     dbc.Row([
@@ -192,6 +227,25 @@ def _build_positions_table(portfolio: dict):
     ], striped=True, bordered=True, hover=True, size="sm")
 
 
+def _build_funnel_table(funnel_result):
+    if isinstance(funnel_result, DBOffline):
+        return dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
+    if not funnel_result:
+        return html.P("No signal data in last 24h.", className="text-muted")
+    total = sum(r["cnt"] for r in funnel_result) or 1
+    return dbc.Table([
+        html.Thead(html.Tr([html.Th("Gate"), html.Th("Count"), html.Th("% of Total")])),
+        html.Tbody([
+            html.Tr([
+                html.Td(r["gate_passed"]),
+                html.Td(r["cnt"]),
+                html.Td(f"{r['cnt'] / total * 100:.1f}%"),
+            ])
+            for r in sorted(funnel_result, key=lambda x: x["gate_passed"])
+        ]),
+    ], striped=True, bordered=True, hover=True, size="sm")
+
+
 # ── WS routing: append portfolio snapshot to the cache ─────────────────────
 
 @callback(
@@ -234,12 +288,11 @@ def render_portfolio_section(_tick):
     )
 
 
-# ── Session stats + equity curve + funnel section (5 s interval; 24 h) ─────
+# ── Session stats + equity curve (5 s interval; 24 h aggregates) ───────────
 
 @callback(
     Output("live-session-row", "children"),
     Output("live-equity-chart", "figure"),
-    Output("live-funnel-table", "children"),
     Input("live-interval", "n_intervals"),
 )
 def update_session_section(_n):
@@ -299,26 +352,76 @@ def update_session_section(_n):
             showlegend=False,
         )
 
-    funnel_result = fetch_signal_funnel(hours=24)
-    if isinstance(funnel_result, DBOffline):
-        funnel_table = dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
-    elif funnel_result:
-        total = sum(r["cnt"] for r in funnel_result) or 1
-        funnel_table = dbc.Table([
-            html.Thead(html.Tr([html.Th("Gate"), html.Th("Count"), html.Th("% of Total")])),
-            html.Tbody([
-                html.Tr([
-                    html.Td(r["gate_passed"]),
-                    html.Td(r["cnt"]),
-                    html.Td(f"{r['cnt'] / total * 100:.1f}%"),
-                ])
-                for r in sorted(funnel_result, key=lambda x: x["gate_passed"])
-            ]),
-        ], striped=True, bordered=True, hover=True, size="sm")
-    else:
-        funnel_table = html.P("No signal data in last 24h.", className="text-muted")
+    return session_row, equity_fig
 
-    return session_row, equity_fig, funnel_table
+
+# ── Signal tape + funnel (push-driven from /ws/signals) ────────────────────
+
+@callback(
+    Output("live-signals-tick", "data"),
+    Input("live-signals-ws", "message"),
+    prevent_initial_call=True,
+)
+def on_signal_ws_message(message):
+    """Append a streamed signal event to the tape; return ts to trigger downstream redraws."""
+    global _TAPE
+    if not message or "data" not in message:
+        return no_update
+    try:
+        msg = json.loads(message["data"])
+    except (TypeError, ValueError):
+        return no_update
+    _TAPE = update_signal_tape(_TAPE, msg, _TAPE_MAX)
+    return msg.get("ts", no_update)
+
+
+@callback(
+    Output("live-signal-tape", "children"),
+    Input("live-signals-tick", "data"),
+)
+def render_signal_tape(_tick):
+    if not _TAPE:
+        return html.Div("Waiting for signal events… (start the engine to populate)",
+                        className="text-muted")
+    rows = []
+    for ev in _TAPE:
+        gate      = ev.get("gate_passed", "?")
+        direction = ev.get("direction") or "—"
+        # ISO timestamp like 2026-06-01T17:10:30.123+00:00 → take HH:MM:SS
+        ts        = ev.get("ts", "")
+        ts_short  = ts[11:19] if len(ts) >= 19 else ts
+        reason    = ev.get("rejection_reason") or ""
+        confidence = ev.get("confidence")
+        conf_str  = f"conf={confidence:.2f} " if isinstance(confidence, (int, float)) and confidence else ""
+        rows.append(html.Div([
+            html.Span(ts_short, className="text-muted me-2"),
+            dbc.Badge(direction, color="info", className="me-2", style={"minWidth": "60px"}),
+            dbc.Badge(gate, color=_gate_color(gate), className="me-2"),
+            html.Span(conf_str + reason, className="text-muted small"),
+        ], className="mb-1"))
+    return rows
+
+
+@callback(
+    Output("live-funnel-table", "children"),
+    Input("live-signals-tick", "data"),       # push: refresh on each new event
+    Input("live-interval", "n_intervals"),     # fallback: 5 s poll if WS is offline
+)
+def refresh_funnel_table(_tick, _n):
+    return _build_funnel_table(fetch_signal_funnel(hours=24))
+
+
+@callback(
+    Output("live-signals-conn-status", "children"),
+    Input("live-signals-ws", "state"),
+)
+def update_signals_conn(state):
+    ready = (state or {}).get("readyState")
+    if ready == 1:
+        return dbc.Badge("● LIVE", color="success")
+    if ready == 0:
+        return dbc.Badge("● Connecting…", color="warning")
+    return dbc.Badge("● Engine offline", color="secondary")
 
 
 # ── Killswitch status (engine-state-driven) ────────────────────────────────

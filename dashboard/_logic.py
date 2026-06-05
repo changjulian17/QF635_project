@@ -43,6 +43,25 @@ def decay_badge_label(rolling_sharpe: float, backtest_sharpe: float) -> str:
     return f"{ratio:.0%} — Decay Alert"
 
 
+def update_signal_tape(buffer: list[dict], msg: dict, max_events: int) -> list[dict]:
+    """Append a streamed signal_event to the rolling tape buffer, trimmed to max_events.
+
+    Pure function (no Dash/browser deps) so the streaming logic is unit-testable.
+
+    Only messages with ``type == "signal_event"`` are accepted; snapshots and
+    malformed payloads pass through unchanged. The buffer is newest-first so the
+    UI can slice the head without reversing.
+    """
+    if not isinstance(msg, dict) or msg.get("type") != "signal_event":
+        return buffer
+    if "ts" not in msg or "gate_passed" not in msg:
+        return buffer
+    new_buffer = [msg] + buffer  # newest first
+    if max_events > 0 and len(new_buffer) > max_events:
+        new_buffer = new_buffer[:max_events]
+    return new_buffer
+
+
 def update_portfolio_state(state: dict, msg: dict) -> dict:
     """Replace the cached portfolio state with the latest WS payload.
 
