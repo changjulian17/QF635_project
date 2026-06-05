@@ -163,14 +163,15 @@ class FeatureVector:
     protection_wall_present: int   = 0
 
     def to_ml_array(self) -> list[float]:
+        # pattern_r2 / protection_wall_present excluded — no live source / constant
+        # at scoring time. Must stay aligned with scorer.FEATURE_ORDER.
         return [
             self.price_vs_vwap, self.obi_zscore, self.cvd_delta,
             self.vol_ratio, self.atr_percentile, self.rsi_value,
-            self.spread_bps, self.pattern_r2,
+            self.spread_bps,
             float(self.vwap_reclaim), float(self.vol_climax),
             float(self.cvd_positive), float(self.wall_detected),
             self.wall_distance_bps, self.absorption_ratio,
-            float(self.protection_wall_present),
         ]
 
 
