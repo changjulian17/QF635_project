@@ -72,6 +72,7 @@ async def lob_snapshot_writer(
 
             if hub is not None:
                 payload = {
+                    "type": "snapshot",
                     "ts": snapshot.timestamp.isoformat(),
                     "mid_price": mid,
                     "spread": spread,

@@ -63,8 +63,8 @@ logging.getLogger("websockets").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-STARTING_EQUITY = 10_000.0
-SYMBOL = "BTCUSDT"
+SYMBOL          = "BTCUSDT"
+STARTING_EQUITY = settings.STARTING_EQUITY
 
 
 # ── Shutdown handler ──────────────────────────────────────────────────────────
@@ -117,8 +117,14 @@ async def _portfolio_mtm_loop(
     risk_engine: RiskEngine,
     strategy_executor: StrategyExecutor,
     alert_dispatcher: AlertDispatcher,
+    hub: RealtimeHub | None = None,
 ) -> None:
-    """Check KS-1 budget breach and sync risk tier every second."""
+    """Check KS-1 budget breach, sync risk tier, and broadcast portfolio state each tick.
+
+    The broadcast (when ``hub`` is provided) carries the same fields as
+    ``/api/portfolio`` plus ``risk_tier`` and ``killswitch_active`` so /live can
+    render entirely from this stream without an extra REST poll.
+    """
     while True:
         await asyncio.sleep(1.0)
         if killswitch.is_active:
@@ -130,15 +136,20 @@ async def _portfolio_mtm_loop(
             return
         new_tier = risk_engine.sync_tier()
         strategy_executor.set_risk_tier(new_tier)
+        if hub is not None:
+            payload = _build_portfolio_payload(
+                portfolio, risk_tier=new_tier,
+                killswitch_active=killswitch.is_active, order_manager=order_manager,
+            )
+            payload["type"] = "portfolio"
+            payload["ts"]   = datetime.now(timezone.utc).isoformat()
+            await hub.broadcast(payload)
 
 
 # ── Midnight reset ────────────────────────────────────────────────────────────
 
-async def midnight_reset_loop(
-    risk_engine: RiskEngine,
-    cvd_calculator: CVDCalculator,
-) -> None:
-    """Sleep until next UTC midnight + 5 s, then reset all daily counters."""
+async def midnight_reset_loop(risk_engine: RiskEngine) -> None:
+    """Sleep until next UTC midnight + 5 s, then reset daily risk counters."""
     while True:
         now = datetime.now(timezone.utc)
         next_midnight = (now + timedelta(days=1)).replace(
@@ -146,7 +157,6 @@ async def midnight_reset_loop(
         )
         await asyncio.sleep((next_midnight - now).total_seconds())
         risk_engine.reset_for_new_session()
-        cvd_calculator.reset_daily()
         logger.info("[Midnight] Session reset complete")
 
 
@@ -195,6 +205,57 @@ async def _feature_candle_loop(
         feature_computer.update_candle(candle)
 
 
+def _build_portfolio_payload(
+    portfolio: PortfolioState,
+    risk_tier: str | None = None,
+    killswitch_active: bool | None = None,
+    order_manager=None,
+) -> dict:
+    """Serialise portfolio + risk state for /api/portfolio and the /ws/portfolio stream.
+
+    Shared by the REST handler and the realtime broadcast so the two never drift.
+    When ``order_manager`` is supplied and it reports an open dry-run position, that
+    position replaces the live position list (DRY_RUN paper-trading view).
+    """
+    positions = [
+        {
+            "symbol":         p.symbol,
+            "side":           p.side.name,
+            "entry_price":    p.entry_price,
+            "quantity":       p.quantity,
+            "stop_loss":      p.stop_loss,
+            "take_profit":    p.take_profit,
+            "unrealised_pnl": p.unrealised_pnl,
+        }
+        for p in portfolio.positions
+    ]
+    if order_manager is not None:
+        dry_pos = order_manager.get_dry_run_position()
+        if dry_pos is not None:
+            positions = [dry_pos]
+    payload: dict = {
+        "equity":             portfolio.equity,
+        "usdt_balance":       portfolio.usdt_balance,
+        "btc_balance":        portfolio.btc_balance,
+        "btc_mtm":            round(portfolio.btc_balance * portfolio.btc_price, 2),
+        "btc_price":          portfolio.btc_price,
+        "daily_pnl":          portfolio.daily_pnl,
+        "drawdown_pct":       portfolio.drawdown_pct,
+        "consecutive_losses": portfolio.consecutive_losses,
+        "num_trades":         portfolio.num_trades,
+        "num_wins":           portfolio.num_wins,
+        "num_fill_samples":   portfolio.num_fill_samples,
+        "avg_slippage_bps":   portfolio.avg_slippage_bps,
+        "budget_loss_pct":    portfolio.budget_loss_pct,
+        "positions":          positions,
+    }
+    if risk_tier is not None:
+        payload["risk_tier"] = risk_tier
+    if killswitch_active is not None:
+        payload["killswitch_active"] = killswitch_active
+    return payload
+
+
 async def _api_server(
     killswitch: GlobalKillswitch,
     portfolio: PortfolioState,
@@ -204,6 +265,7 @@ async def _api_server(
     port: int,
     alert_dispatcher: AlertDispatcher | None = None,
     lob_hub: RealtimeHub | None = None,
+    portfolio_hub: RealtimeHub | None = None,
     signal_hub: RealtimeHub | None = None,
 ) -> None:
     """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
@@ -218,30 +280,9 @@ async def _api_server(
         })
 
     async def _handle_portfolio(request: web.Request) -> web.Response:
-        positions = [
-            {
-                "symbol": p.symbol,
-                "side": p.side.name,
-                "entry_price": p.entry_price,
-                "quantity": p.quantity,
-                "stop_loss": p.stop_loss,
-                "take_profit": p.take_profit,
-                "unrealised_pnl": p.unrealised_pnl,
-            }
-            for p in portfolio.positions
-        ]
-        return web.json_response({
-            "equity": portfolio.equity,
-            "daily_pnl": portfolio.daily_pnl,
-            "drawdown_pct": portfolio.drawdown_pct,
-            "consecutive_losses": portfolio.consecutive_losses,
-            "num_trades": portfolio.num_trades,
-            "num_wins": portfolio.num_wins,
-            "num_fill_samples": portfolio.num_fill_samples,
-            "avg_slippage_bps": portfolio.avg_slippage_bps,
-            "budget_loss_pct": portfolio.budget_loss_pct,
-            "positions": positions,
-        })
+        return web.json_response(
+            _build_portfolio_payload(portfolio, order_manager=order_manager)
+        )
 
     async def _handle_session(request: web.Request) -> web.Response:
         stats = await asyncio.to_thread(fetch_session_stats, 24)
@@ -286,6 +327,9 @@ async def _api_server(
     async def _handle_ws_lob(request: web.Request) -> web.WebSocketResponse:
         return await _handle_ws(request, lob_hub)
 
+    async def _handle_ws_portfolio(request: web.Request) -> web.WebSocketResponse:
+        return await _handle_ws(request, portfolio_hub)
+
     async def _handle_ws_signals(request: web.Request) -> web.WebSocketResponse:
         return await _handle_ws(request, signal_hub)
 
@@ -295,6 +339,7 @@ async def _api_server(
     app.router.add_get("/api/session", _handle_session)
     app.router.add_post("/api/killswitch", _handle_killswitch)
     app.router.add_get("/ws/lob", _handle_ws_lob)
+    app.router.add_get("/ws/portfolio", _handle_ws_portfolio)
     app.router.add_get("/ws/signals", _handle_ws_signals)
 
     runner = web.AppRunner(app)
@@ -338,9 +383,9 @@ async def main() -> None:
     alert_dispatcher = AlertDispatcher(settings.ALERT_WEBHOOK_URL)
 
     portfolio = PortfolioState(
-        equity=STARTING_EQUITY,
-        starting_equity=STARTING_EQUITY,
-        peak_equity=STARTING_EQUITY,
+        equity=settings.STARTING_EQUITY,
+        starting_equity=settings.STARTING_EQUITY,
+        peak_equity=settings.STARTING_EQUITY,
     )
     shared_state = SharedState(
         heartbeat_status="HEALTHY",
@@ -348,8 +393,8 @@ async def main() -> None:
         lob_status="UNINITIALISED",
     )
 
-    killswitch      = GlobalKillswitch(STARTING_EQUITY)
-    budget          = DailyBudget.from_equity(STARTING_EQUITY)
+    killswitch      = GlobalKillswitch(settings.STARTING_EQUITY)
+    budget          = DailyBudget.from_equity(settings.STARTING_EQUITY)
     cvd_calculator  = CVDCalculator()
     lob_engine      = LocalOrderBook(shared_state=shared_state)
     feature_computer = FeatureComputer()
@@ -392,10 +437,14 @@ async def main() -> None:
             alert_dispatcher.notify_tier_change(old_tier, new_tier, budget.loss_pct)
         )
 
-    # Real-time broadcast hubs — one per logical stream so clients receive only
-    # the messages their page renders.
-    realtime_hub = RealtimeHub()  # /ws/lob: snapshots + microstructure events
-    signal_hub   = RealtimeHub()  # /ws/signals: live gate-decision tape
+    # Real-time broadcast hubs — one per logical stream. Keeping them separate so
+    # clients only receive the messages they care about (no client-side filtering,
+    # no bandwidth waste on multi-page dashboards). Created early so producers
+    # (microstructure detector, snapshot writer, alerts) can be constructed with a
+    # hub reference.
+    lob_hub       = RealtimeHub()  # /ws/lob: snapshots + microstructure events
+    portfolio_hub = RealtimeHub()  # /ws/portfolio: equity / PnL / positions / risk tier
+    signal_hub    = RealtimeHub()  # /ws/signals: live gate-decision tape
 
     # Components ──────────────────────────────────────────────────────────────
     ws_consumer = BinanceWebSocketConsumer(
@@ -413,6 +462,7 @@ async def main() -> None:
         signal_queue=micro_signal_queue,
         cvd_calculator=cvd_calculator,
         feature_computer=feature_computer,
+        hub=lob_hub,
     )
     telemetry = SignalTelemetry(telemetry_queue=telemetry_queue, hub=signal_hub)
 
@@ -473,7 +523,7 @@ async def main() -> None:
         client = await AsyncClient.create(
             api_key=settings.BINANCE_API_KEY,
             api_secret=settings.BINANCE_API_SECRET,
-            testnet=True,
+            testnet=settings.BINANCE_TESTNET,
         )
         logger.info("[Main] Connected to Binance testnet")
     except Exception as exc:
@@ -485,6 +535,19 @@ async def main() -> None:
     else:
         logger.info("[Main] Skipping reconciliation — no Binance client")
 
+    # Rebase risk limits to actual Binance account equity
+    actual_equity = portfolio.equity
+    if actual_equity > 0:
+        killswitch.update_dov(actual_equity)
+        budget.rebase(actual_equity)
+        logger.info(
+            "[Main] Risk limits rebased to actual equity=%.2f "
+            "(KS-1 hard_limit=%.2f budget hard_limit=%.2f)",
+            actual_equity,
+            actual_equity * 0.01,
+            actual_equity * 0.01,
+        )
+
     # 4. Register SIGTERM/SIGINT handlers ─────────────────────────────────────
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -493,7 +556,6 @@ async def main() -> None:
 
     # 5. LOB warm-up guard ────────────────────────────────────────────────────
     await asyncio.sleep(0.5)
-
 
     # 6. Start TaskGroup with all coroutines ──────────────────────────────────
     try:
@@ -508,25 +570,27 @@ async def main() -> None:
             tg.create_task(strategy_executor.run(),                                           name="strategy_executor")
             tg.create_task(order_manager.start(),                                             name="order_manager")
             tg.create_task(telemetry.run(),                                                   name="signal_telemetry")
-            tg.create_task(midnight_reset_loop(risk_engine, cvd_calculator),                  name="midnight_reset")
+            tg.create_task(midnight_reset_loop(risk_engine),                                  name="midnight_reset")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
             tg.create_task(_process_fills(fill_queue, portfolio, telemetry),                  name="fill_processor")
             tg.create_task(
                 _portfolio_mtm_loop(
                     killswitch, budget, order_manager, portfolio, telemetry,
                     risk_engine, strategy_executor, alert_dispatcher,
+                    hub=portfolio_hub,
                 ),
                 name="portfolio_mtm_loop",
             )
             tg.create_task(
-                _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer, hub=realtime_hub),
+                _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer, hub=lob_hub),
                 name="lob_snapshot_writer",
             )
             tg.create_task(
                 _api_server(
                     killswitch, portfolio, shared_state,
                     order_manager, telemetry, settings.DASHBOARD_API_PORT,
-                    alert_dispatcher, lob_hub=realtime_hub, signal_hub=signal_hub,
+                    alert_dispatcher, lob_hub=lob_hub, portfolio_hub=portfolio_hub,
+                    signal_hub=signal_hub,
                 ),
                 name="api_server",
             )

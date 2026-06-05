@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -94,12 +95,48 @@ def test_ks_modal_does_not_fire_on_wrong_confirm():
     assert validate_ks_confirm("confirm") is True
 
 
+# ── update_portfolio_state ─────────────────────────────────────────────────
+
+
+def test_portfolio_state_accepts_valid_msg():
+    """Valid {"type": "portfolio", "equity": ...} payload replaces state entirely."""
+    from dashboard._logic import update_portfolio_state
+    msg = {"type": "portfolio", "ts": "t1", "equity": 10_000.0, "daily_pnl": 5.0}
+    assert update_portfolio_state({}, msg) == msg
+
+
+def test_portfolio_state_rejects_non_portfolio_type():
+    """Messages tagged as snapshot/event/anything else leave state unchanged."""
+    from dashboard._logic import update_portfolio_state
+    prev = {"type": "portfolio", "equity": 10_000.0}
+    snap = {"type": "snapshot", "ts": "t2", "mid_price": 73000.0}
+    assert update_portfolio_state(prev, snap) is prev
+
+
+def test_portfolio_state_rejects_malformed():
+    """Non-dict / missing equity rejected — state stays at last known good."""
+    from dashboard._logic import update_portfolio_state
+    prev = {"type": "portfolio", "equity": 10_000.0}
+    assert update_portfolio_state(prev, "not a dict") is prev
+    assert update_portfolio_state(prev, {"type": "portfolio"}) is prev   # no equity
+
+
+def test_portfolio_state_replaces_not_merges():
+    """Snapshot semantics: each push replaces the prior state in full."""
+    from dashboard._logic import update_portfolio_state
+    prev = {"type": "portfolio", "equity": 10_000.0, "positions": [{"side": "LONG"}]}
+    nxt  = {"type": "portfolio", "equity":  9_950.0, "positions": []}
+    result = update_portfolio_state(prev, nxt)
+    assert result == nxt          # full replacement
+    assert result["positions"] == []  # not merged with prior list
+
+
 def test_ks_modal_clears_input_on_post_failure():
     """Input must be cleared to '' even when POST fails — prevents silent re-fire."""
     from unittest.mock import patch
     from dashboard._logic import fire_killswitch, validate_ks_confirm
 
-    with patch("dashboard._logic.requests.post", side_effect=ConnectionError()):
+    with patch("dashboard._logic.requests.post", side_effect=requests.RequestException()):
         result = fire_killswitch("http://127.0.0.1:8080")
 
     assert result is False  # POST failed

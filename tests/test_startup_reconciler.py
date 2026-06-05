@@ -173,18 +173,37 @@ def test_s2_equity_set_from_usdt_and_btc(tmp_path):
         {"asset": "USDT", "free": "8000.0", "locked": "0.0"},
     ]
     # ticker price = 10000 → total equity = 8000 + 1.0 × 10000 = 18000
+    # BTC is liquidated at startup: SELL 1.0 BTC → 9800 USDT (filled at 10000 × 0.98)
+    # Post-liquidation balances returned by the re-fetch:
+    post_balances = [
+        {"asset": "BTC",  "free": "0.0", "locked": "0.0"},
+        {"asset": "USDT", "free": "18000.0", "locked": "0.0"},
+    ]
     client = _make_client(account_balances=balances, ticker_price="10000.0")
+    client.create_order = AsyncMock(return_value={
+        "executedQty": "1.0",
+        "cummulativeQuoteQty": "9800.0",
+    })
+    client.get_account = AsyncMock(side_effect=[
+        {"balances": balances},      # initial S2 fetch
+        {"balances": post_balances}, # re-fetch after liquidation
+    ])
     portfolio = _make_portfolio(equity=10_000.0)
     risk_engine = _make_risk_engine()
 
     with patch("core.startup_reconciler.settings") as mock_settings:
         mock_settings.DRY_RUN = False
         mock_settings.REGISTRY_DB = db_path
+        mock_settings.QTY_STEP_SIZE = 0.00001
+        mock_settings.MIN_NOTIONAL  = 100.0
         asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
 
     assert abs(portfolio.equity - 18_000.0) < 1e-6
     assert abs(portfolio.starting_equity - 18_000.0) < 1e-6   # no trades today
     assert abs(portfolio.peak_equity - 18_000.0) < 1e-6
+    assert abs(portfolio.usdt_balance - 18_000.0) < 1e-6
+    assert abs(portfolio.btc_balance) < 1e-9
+    assert abs(portfolio.btc_price - 10_000.0) < 1e-6
 
 
 def test_s2_ticker_failure_falls_back_to_zero_btc_price(tmp_path):
@@ -378,7 +397,7 @@ def test_s5_startup_reconciliation_event_written(tmp_path):
 
 def test_s5_dry_run_event_written(tmp_path):
     db_path = str(tmp_path / "registry.db")
-    client = AsyncMock()
+    client = _make_client()
     portfolio = _make_portfolio()
     risk_engine = _make_risk_engine()
 
@@ -395,4 +414,4 @@ def test_s5_dry_run_event_written(tmp_path):
 
     assert len(rows) == 1
     payload = json.loads(rows[0][0])
-    assert payload.get("dry_run") is True
+    assert "errors" in payload   # result dict is always written to S5

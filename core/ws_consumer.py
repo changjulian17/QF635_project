@@ -296,7 +296,7 @@ class BinanceWebSocketConsumer:
                 "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
                 last_uid, len(self._bid_book), len(self._ask_book),
             )
-        except Exception as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.error("[WS] LOB REST seed failed (%s) — continuing with buffered diffs.", exc)
         finally:
             self._lob_pending.clear()

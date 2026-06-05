@@ -28,6 +28,11 @@ class DailyBudget:
         total = self.realised_pnl + self.unrealised_pnl
         return abs(min(total, 0.0)) / self.dov if self.dov > 0 else 0.0
 
+    def rebase(self, new_equity: float, hard_limit_pct: float = 0.01) -> None:
+        """Update equity-derived fields without touching PnL (call post-reconcile)."""
+        self.dov        = new_equity
+        self.hard_limit = new_equity * hard_limit_pct
+
     def reset(self, new_equity: float, hard_limit_pct: float = 0.01) -> None:
         self.dov            = new_equity
         self.hard_limit     = new_equity * hard_limit_pct

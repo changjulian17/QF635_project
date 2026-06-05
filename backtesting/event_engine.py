@@ -78,6 +78,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+from config import settings
 from backtesting.costs import TransactionCostModel
 from backtesting.metrics import calculate_metrics, BacktestMetrics
 from backtesting.signals import (
@@ -85,8 +86,6 @@ from backtesting.signals import (
 )
 
 logger = logging.getLogger(__name__)
-
-STARTING_EQUITY = 10_000.0   # Default starting equity (USDT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,7 +134,7 @@ class EventDrivenEngine:
         params:         dict,
         raw_mode:       bool                      = True,
         cost_model:     TransactionCostModel | None = None,
-        starting_equity:float                      = STARTING_EQUITY,
+        starting_equity:float                      = settings.STARTING_EQUITY,
     ) -> None:
         """
         Parameters

@@ -136,7 +136,7 @@ class SignalTelemetry:
                     except Exception:
                         logger.exception("[Telemetry] hub broadcast failed — continuing")
                 self._buf.append(record)
-                if len(self._buf) >= _FLUSH_BATCH:
+                if len(self._buf) >= _FLUSH_BATCH or record.gate_passed == "APPROVED":
                     await self._flush()
             except asyncio.TimeoutError:
                 if self._buf:

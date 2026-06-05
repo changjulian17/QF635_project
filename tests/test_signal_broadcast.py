@@ -97,7 +97,9 @@ async def test_telemetry_no_hub_runs_normally(tmp_path):
     telemetry = SignalTelemetry(queue, db_path=str(tmp_path / "tel.db"), hub=None)
     telemetry._conn = telemetry._open_db()
 
-    await queue.put(SignalRecord(signal_id="t1", gate_passed="APPROVED"))
+    # Non-APPROVED gate: APPROVED records flush to DB immediately (phase-3 behavior),
+    # emptying _buf — here we assert the record lands in the buffer.
+    await queue.put(SignalRecord(signal_id="t1", gate_passed="GATE_2_FAIL"))
 
     task = asyncio.create_task(telemetry._drain_loop())
     await asyncio.sleep(0.15)
@@ -124,7 +126,9 @@ async def test_telemetry_hub_failure_does_not_stop_persistence(tmp_path):
     telemetry = SignalTelemetry(queue, db_path=str(tmp_path / "tel.db"), hub=hub)
     telemetry._conn = telemetry._open_db()
 
-    await queue.put(SignalRecord(signal_id="t1", gate_passed="APPROVED"))
+    # Non-APPROVED gate: APPROVED records flush to DB immediately (phase-3 behavior),
+    # emptying _buf — here we assert the record lands in the buffer.
+    await queue.put(SignalRecord(signal_id="t1", gate_passed="GATE_2_FAIL"))
 
     task = asyncio.create_task(telemetry._drain_loop())
     await asyncio.sleep(0.15)

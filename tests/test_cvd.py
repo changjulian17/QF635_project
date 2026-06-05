@@ -72,6 +72,23 @@ def test_cvd_tick_std_positive_after_trades():
     assert cvd.get_cvd_tick_std() > 0.0
 
 
+def test_get_cvd_excludes_trades_older_than_24h():
+    """Trades with timestamps > 24h ago must not contribute to get_cvd()."""
+    from datetime import timedelta
+    cvd = CVDCalculator()
+    old_trade = AggTrade(
+        timestamp=datetime.now(timezone.utc) - timedelta(hours=25),
+        price=30000.0, qty=5.0, is_buyer_maker=False,  # would be +5 if counted
+    )
+    recent_trade = AggTrade(
+        timestamp=datetime.now(timezone.utc),
+        price=30000.0, qty=1.0, is_buyer_maker=False,  # +1
+    )
+    cvd.update(old_trade)
+    cvd.update(recent_trade)
+    assert cvd.get_cvd() == pytest.approx(1.0)  # old_trade evicted; only recent_trade counts
+
+
 def test_reset_daily_clears_state():
     cvd = CVDCalculator()
     for _ in range(10):

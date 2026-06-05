@@ -1,6 +1,5 @@
 import json
 
-import requests
 import dash
 import plotly.graph_objects as go
 from dash import dcc, html, Input, Output, State, callback, no_update
@@ -8,17 +7,24 @@ import dash_bootstrap_components as dbc
 from dash_extensions import WebSocket
 
 from config import settings
-from dashboard._db import fetch_pnl_by_pattern, fetch_session_stats, fetch_signal_funnel, DBOffline
+from dashboard._db import fetch_portfolio_history, fetch_session_stats, fetch_signal_funnel, DBOffline
 from dashboard._logic import (
     fire_killswitch as _fire_ks,
+    update_portfolio_state,
     update_signal_tape,
     validate_ks_confirm as _validate_ks,
 )
+from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/", name="Live", redirect_from=["/live"])
 
-_API_BASE = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
+_API_BASE       = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
+_WS_URL         = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/portfolio"
 _SIGNALS_WS_URL = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/signals"
+
+# Server-side cache of the latest portfolio snapshot (shared across clients — the
+# engine pushes identical data to everyone, so a single cache is correct).
+_PORTFOLIO: dict = {}
 
 # Server-side rolling tape of recent signal events (newest first). Shared across
 # clients — the engine pushes the same data to everyone.
@@ -44,7 +50,7 @@ def _gate_color(gate_passed: str) -> str:
     return "warning"      # rejected mid-pipeline → notable
 
 
-def _metric_card(label: str, value: str, color: str = "light") -> dbc.Col:
+def _metric_card(label: str, value: str, color: str = "light", width: int = 3) -> dbc.Col:
     return dbc.Col(
         dbc.Card([
             dbc.CardBody([
@@ -52,23 +58,34 @@ def _metric_card(label: str, value: str, color: str = "light") -> dbc.Col:
                 html.H4(value, className=f"text-{color} mb-0"),
             ])
         ], color="dark", outline=True),
-        width=3,
+        width=width,
     )
 
 
 layout = html.Div([
+    WebSocket(id="live-ws", url=_WS_URL),
     WebSocket(id="live-signals-ws", url=_SIGNALS_WS_URL),
-    dcc.Store(id="live-signals-tick"),               # bumps on each new signal event
-    dcc.Interval(id="live-interval", interval=5000),
+    dcc.Store(id="live-portfolio-tick"),                # bumps on each portfolio WS push
+    dcc.Store(id="live-signals-tick"),                  # bumps on each new signal event
+    dcc.Interval(id="live-interval", interval=5000),    # 5s — drives session stats / funnel fallback
+
+    # ── Header: connection badge ────────────────────────────────────────────
+    html.Div([
+        html.Span(id="live-conn-status"),
+    ], className="d-flex justify-content-end align-items-center mb-2"),
 
     # ── Portfolio metrics ──────────────────────────────────────────────────
-    dbc.Row(id="live-metrics-row", className="mb-3 g-3"),
+    dbc.Row(id="live-metrics-row", className="mb-2 g-3"),
+    html.Small("Account Balances (session open)", className="text-muted ms-1"),
+    dbc.Row(id="live-balance-row", className="mb-3 g-3"),
 
     # ── Session stats ──────────────────────────────────────────────────────
     html.H5("Session Stats (last 24h)", className="mb-2 mt-1"),
-    dbc.Row(id="live-session-row", className="mb-2 g-3"),
+    dbc.Row(id="live-session-row", className="mb-3 g-3"),
+
+    # ── Equity curve ──────────────────────────────────────────────────────
     dbc.Row([
-        dbc.Col(dcc.Graph(id="live-pnl-pattern-chart", style={"height": "220px"}), width=12),
+        dbc.Col(dcc.Graph(id="live-equity-chart", style={"height": "220px"}), width=12),
     ], className="mb-4"),
 
     # ── Live signal tape ───────────────────────────────────────────────────
@@ -135,42 +152,26 @@ layout = html.Div([
 ])
 
 
-@callback(
-    Output("live-metrics-row", "children"),
-    Output("live-session-row", "children"),
-    Output("live-pnl-pattern-chart", "figure"),
-    Output("live-positions-table", "children"),
-    Output("live-ks-status", "children"),
-    Output("live-ks-open-modal", "disabled"),
-    Input("live-interval", "n_intervals"),
-    Input("engine-state-store", "data"),
-)
-def update_live_page(n, engine_state):
-    ks_active = engine_state.get("killswitch_active", False) if engine_state else False
-    engine_online = engine_state is not None
+# ── Render helpers ─────────────────────────────────────────────────────────
 
-    # ── Portfolio via REST ─────────────────────────────────────────────────
-    portfolio = None
-    try:
-        resp = requests.get(f"{_API_BASE}/api/portfolio", timeout=2)
-        if resp.ok:
-            portfolio = resp.json()
-    except Exception:
-        pass
+def _placeholder_metrics() -> list:
+    return [_metric_card(label, "—") for label in ("Equity", "Daily PnL", "Drawdown", "Risk Tier")]
 
-    equity   = portfolio.get("equity")    if portfolio else None
-    daily_pnl = portfolio.get("daily_pnl") if portfolio else None
-    drawdown  = portfolio.get("drawdown_pct") if portfolio else None
-    risk_tier = engine_state.get("risk_tier", "—") if engine_state else "—"
+
+def _build_metrics_row(portfolio: dict) -> list:
+    equity    = portfolio.get("equity")
+    daily_pnl = portfolio.get("daily_pnl")
+    drawdown  = portfolio.get("drawdown_pct")
+    risk_tier = portfolio.get("risk_tier") or "—"
     tier_color = _TIER_COLORS.get(risk_tier, "light")
 
-    equity_str = f"${equity:,.2f}"          if isinstance(equity,    (int, float)) else "—"
-    pnl_str    = f"${daily_pnl:+,.2f}"      if isinstance(daily_pnl, (int, float)) else "—"
-    dd_str     = f"{drawdown * 100:.2f}%"   if isinstance(drawdown,  (int, float)) else "—"
+    equity_str = f"${equity:,.2f}"        if isinstance(equity,    (int, float)) else "—"
+    pnl_str    = f"${daily_pnl:+,.2f}"    if isinstance(daily_pnl, (int, float)) else "—"
+    dd_str     = f"{drawdown * 100:.2f}%" if isinstance(drawdown,  (int, float)) else "—"
     pnl_color  = "success" if isinstance(daily_pnl, (int, float)) and daily_pnl >= 0 else "danger"
     dd_color   = "success" if isinstance(drawdown,  (int, float)) and drawdown < 0.02 else "warning"
 
-    metrics_row = [
+    return [
         _metric_card("Equity", equity_str),
         _metric_card("Daily PnL", pnl_str, pnl_color),
         _metric_card("Drawdown", dd_str, dd_color),
@@ -185,11 +186,119 @@ def update_live_page(n, engine_state):
         ),
     ]
 
-    # ── Session stats ──────────────────────────────────────────────────────
+
+def _build_balance_row(portfolio: dict) -> list:
+    usdt_bal  = portfolio.get("usdt_balance")
+    btc_bal   = portfolio.get("btc_balance")
+    btc_mtm   = portfolio.get("btc_mtm")
+    btc_price = portfolio.get("btc_price", 0)
+
+    usdt_str  = f"${usdt_bal:,.2f}"   if isinstance(usdt_bal, (int, float)) else "—"
+    btc_str   = f"{btc_bal:.6f} BTC"  if isinstance(btc_bal,  (int, float)) else "—"
+    mtm_str   = f"${btc_mtm:,.2f}"    if isinstance(btc_mtm,  (int, float)) and btc_price != 0 else "—"
+
+    return [
+        _metric_card("USDT Balance (at open)", usdt_str, width=4),
+        _metric_card("BTC Holdings (at open)", btc_str,  width=4),
+        _metric_card("BTC Value (at open)",    mtm_str,  width=4),
+    ]
+
+
+def _build_positions_table(portfolio: dict):
+    positions = portfolio.get("positions", []) or []
+    if not positions:
+        return html.P("No open positions.", className="text-muted")
+    return dbc.Table([
+        html.Thead(html.Tr([
+            html.Th("Side"), html.Th("Entry"), html.Th("Qty"),
+            html.Th("SL"), html.Th("TP"), html.Th("Unrealised PnL"),
+        ])),
+        html.Tbody([
+            html.Tr([
+                html.Td(p.get("side", "—")),
+                html.Td(f"{p['entry_price']:.2f}" if p.get("entry_price") is not None else "—"),
+                html.Td(f"{p['quantity']:.6f}"    if p.get("quantity")    is not None else "—"),
+                html.Td(f"{p['stop_loss']:.2f}"   if p.get("stop_loss")   is not None else "—"),
+                html.Td(f"{p['take_profit']:.2f}" if p.get("take_profit") is not None else "—"),
+                html.Td(f"{p['unrealised_pnl']:+.4f}" if p.get("unrealised_pnl") is not None else "—"),
+            ])
+            for p in positions
+        ]),
+    ], striped=True, bordered=True, hover=True, size="sm")
+
+
+def _build_funnel_table(funnel_result):
+    if isinstance(funnel_result, DBOffline):
+        return dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
+    if not funnel_result:
+        return html.P("No signal data in last 24h.", className="text-muted")
+    total = sum(r["cnt"] for r in funnel_result) or 1
+    return dbc.Table([
+        html.Thead(html.Tr([html.Th("Gate"), html.Th("Count"), html.Th("% of Total")])),
+        html.Tbody([
+            html.Tr([
+                html.Td(r["gate_passed"]),
+                html.Td(r["cnt"]),
+                html.Td(f"{r['cnt'] / total * 100:.1f}%"),
+            ])
+            for r in sorted(funnel_result, key=lambda x: x["gate_passed"])
+        ]),
+    ], striped=True, bordered=True, hover=True, size="sm")
+
+
+# ── WS routing: append portfolio snapshot to the cache ─────────────────────
+
+@callback(
+    Output("live-portfolio-tick", "data"),
+    Input("live-ws", "message"),
+    prevent_initial_call=True,
+)
+def on_ws_message(message):
+    """Route one pushed portfolio payload to the server-side cache; return ts to trigger redraw."""
+    global _PORTFOLIO
+    if not message or "data" not in message:
+        return no_update
+    try:
+        msg = json.loads(message["data"])
+    except (TypeError, ValueError):
+        return no_update
+    _PORTFOLIO = update_portfolio_state(_PORTFOLIO, msg)
+    return msg.get("ts", no_update)
+
+
+# ── Portfolio section (WS-driven, 1 Hz) ────────────────────────────────────
+
+@callback(
+    Output("live-metrics-row", "children"),
+    Output("live-balance-row", "children"),
+    Output("live-positions-table", "children"),
+    Input("live-portfolio-tick", "data"),
+)
+def render_portfolio_section(_tick):
+    if not _PORTFOLIO:
+        return (
+            _placeholder_metrics(),
+            _build_balance_row({}),
+            html.P("Waiting for engine…", className="text-muted"),
+        )
+    return (
+        _build_metrics_row(_PORTFOLIO),
+        _build_balance_row(_PORTFOLIO),
+        _build_positions_table(_PORTFOLIO),
+    )
+
+
+# ── Session stats + equity curve (5 s interval; 24 h aggregates) ───────────
+
+@callback(
+    Output("live-session-row", "children"),
+    Output("live-equity-chart", "figure"),
+    Input("live-interval", "n_intervals"),
+)
+def update_session_section(_n):
     session_result = fetch_session_stats(hours=24)
     if isinstance(session_result, DBOffline) or not session_result:
         session_row = [dbc.Col(dbc.Alert("No session data yet.", color="secondary"), width=12)]
-        pnl_fig = go.Figure()
     else:
         s = session_result
         total_t = s.get("total_trades") or 0
@@ -212,83 +321,41 @@ def update_live_page(n, engine_state):
             _metric_card("Avg Slippage", f"{avg_slip:.1f} bps" if avg_slip is not None else "—"),
         ]
 
-        pnl_by_pat = fetch_pnl_by_pattern(hours=24)
-        if isinstance(pnl_by_pat, DBOffline) or not pnl_by_pat:
-            pnl_fig = go.Figure()
-        else:
-            labels = list(pnl_by_pat.keys())
-            values = list(pnl_by_pat.values())
-            colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in values]
-            pnl_fig = go.Figure(go.Bar(x=labels, y=values, marker_color=colors))
-            pnl_fig.update_layout(
-                title="P&L by Signal Type (last 24h)",
-                template="plotly_dark",
-                margin=dict(l=40, r=20, t=40, b=30),
-                yaxis_title="P&L (USDT)",
-                showlegend=False,
-            )
-
-    # ── Active positions ───────────────────────────────────────────────────
-    positions = portfolio.get("positions", []) if portfolio else []
-    if positions:
-        pos_table = dbc.Table([
-            html.Thead(html.Tr([
-                html.Th("Side"), html.Th("Entry"), html.Th("Qty"),
-                html.Th("SL"), html.Th("TP"), html.Th("Unrealised PnL"),
-            ])),
-            html.Tbody([
-                html.Tr([
-                    html.Td(p.get("side", "—")),
-                    html.Td(f"{p['entry_price']:.2f}" if p.get("entry_price") is not None else "—"),
-                    html.Td(f"{p['quantity']:.6f}"    if p.get("quantity")    is not None else "—"),
-                    html.Td(f"{p['stop_loss']:.2f}"   if p.get("stop_loss")   is not None else "—"),
-                    html.Td(f"{p['take_profit']:.2f}" if p.get("take_profit") is not None else "—"),
-                    html.Td(f"{p['unrealised_pnl']:+.4f}" if p.get("unrealised_pnl") is not None else "—"),
-                ])
-                for p in positions
-            ]),
-        ], striped=True, bordered=True, hover=True, size="sm")
+    # ── Equity curve ──────────────────────────────────────────────────────
+    history = fetch_portfolio_history(limit=720)
+    if isinstance(history, DBOffline) or not history:
+        equity_fig = _empty_fig("No portfolio history — start main.py to begin recording.")
     else:
-        pos_table = html.P("No open positions.", className="text-muted")
-
-    # ── Kill switch status ─────────────────────────────────────────────────
-    if ks_active:
-        ks_status = dbc.Alert(
-            "KILLSWITCH ACTIVE — engine restart required to resume trading.",
-            color="danger",
+        ts_vals  = [r["ts"] for r in history]
+        eq_vals  = [r["equity"] if r["equity"] is not None else 0.0 for r in history]
+        baseline = eq_vals[0] or 0.0  # guard: equity column is REAL (nullable)
+        equity_fig = go.Figure()
+        equity_fig.add_trace(go.Scatter(
+            x=ts_vals, y=eq_vals, mode="lines",
+            line=dict(color="cyan", width=1.5),
+            fill="tozeroy", fillcolor="rgba(0,200,200,0.15)",
+            hovertemplate="%{x|%H:%M:%S}<br>$%{y:,.2f}<extra></extra>",
+        ))
+        equity_fig.add_hline(
+            y=baseline,
+            line=dict(color="rgba(255,255,255,0.4)", width=0.8, dash="dot"),
+            annotation_text=f"Open  ${baseline:,.0f}",
+            annotation_position="top left",
+            annotation_font=dict(size=10, color="rgba(255,255,255,0.5)"),
         )
-        ks_disabled = True
-    elif not engine_online:
-        ks_status = dbc.Alert("Engine offline — kill switch unavailable.", color="secondary")
-        ks_disabled = True
-    else:
-        ks_status = html.Span()
-        ks_disabled = False
+        equity_fig.update_layout(
+            title=dict(text="Equity Curve", font=dict(size=13)),
+            template="plotly_dark",
+            margin=dict(l=70, r=20, t=35, b=30),
+            yaxis=dict(title="Equity (USDT)", tickformat="$,.0f"),
+            xaxis=dict(title=None),
+            showlegend=False,
+        )
 
-    return metrics_row, session_row, pnl_fig, pos_table, ks_status, ks_disabled
-
-
-# ── Signal funnel + live tape (push-driven from /ws/signals) ──────────────
+    return session_row, equity_fig
 
 
-def _build_funnel_table(funnel_result):
-    if isinstance(funnel_result, DBOffline):
-        return dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
-    if not funnel_result:
-        return html.P("No signal data in last 24h.", className="text-muted")
-    total = sum(r["cnt"] for r in funnel_result) or 1
-    return dbc.Table([
-        html.Thead(html.Tr([html.Th("Gate"), html.Th("Count"), html.Th("% of Total")])),
-        html.Tbody([
-            html.Tr([
-                html.Td(r["gate_passed"]),
-                html.Td(r["cnt"]),
-                html.Td(f"{r['cnt'] / total * 100:.1f}%"),
-            ])
-            for r in sorted(funnel_result, key=lambda x: x["gate_passed"])
-        ]),
-    ], striped=True, bordered=True, hover=True, size="sm")
-
+# ── Signal tape + funnel (push-driven from /ws/signals) ────────────────────
 
 @callback(
     Output("live-signals-tick", "data"),
@@ -355,6 +422,40 @@ def update_signals_conn(state):
     if ready == 0:
         return dbc.Badge("● Connecting…", color="warning")
     return dbc.Badge("● Engine offline", color="secondary")
+
+
+# ── Killswitch status (engine-state-driven) ────────────────────────────────
+
+@callback(
+    Output("live-ks-status", "children"),
+    Output("live-ks-open-modal", "disabled"),
+    Input("engine-state-store", "data"),
+)
+def update_ks_status(engine_state):
+    ks_active     = engine_state.get("killswitch_active", False) if engine_state else False
+    engine_online = engine_state is not None
+    if ks_active:
+        return dbc.Alert(
+            "KILLSWITCH ACTIVE — engine restart required to resume trading.", color="danger",
+        ), True
+    if not engine_online:
+        return dbc.Alert("Engine offline — kill switch unavailable.", color="secondary"), True
+    return html.Span(), False
+
+
+# ── WS connection badge ────────────────────────────────────────────────────
+
+@callback(
+    Output("live-conn-status", "children"),
+    Input("live-ws", "state"),
+)
+def update_conn_status(state):
+    ready = (state or {}).get("readyState")
+    if ready == 1:
+        return dbc.Badge("● LIVE", color="success", className="fs-6")
+    if ready == 0:
+        return dbc.Badge("● Connecting…", color="warning", className="fs-6")
+    return dbc.Badge("● Engine offline", color="secondary", className="fs-6")
 
 
 @callback(

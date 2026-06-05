@@ -68,13 +68,90 @@ def _make_manager(
     return om, sig_q, fill_q, ks
 
 
-def _filled_resp(price: float = 95_015.0, qty: float = 0.001) -> dict:
+def _filled_resp(
+    price: float = 95_015.0,
+    qty: float = 0.001,
+    commission: float = 0.0,
+    commission_asset: str = "BNB",
+) -> dict:
     return {
         "orderId":     "101",
         "status":      "FILLED",
         "executedQty": str(qty),
-        "fills":       [{"price": str(price), "qty": str(qty)}],
+        "fills":       [{
+            "price":           str(price),
+            "qty":             str(qty),
+            "commission":      str(commission),
+            "commissionAsset": commission_asset,
+        }],
     }
+
+
+# ── BTC fee deduction ─────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_btc_fee_deducted_from_oco_and_position_qty():
+    """
+    When Binance deducts the BUY fee in BTC (commissionAsset='BTC'), both
+    _open_position_qty and the OCO quantity must use the net qty (gross - fee).
+    Using gross executedQty triggers -2010 when the full amount is not in the account.
+    """
+    import math as _math
+    gross    = 0.1
+    fee      = 0.0001          # 0.1% in BTC
+    step     = settings.QTY_STEP_SIZE
+    net_raw  = gross - fee     # 0.0999
+    expected = round(_math.floor(net_raw / step) * step, 5)
+
+    om, _, _, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
+    req = _make_req("LONG")
+
+    om._client = AsyncMock()
+    om._client.create_order = AsyncMock(
+        return_value=_filled_resp(qty=gross, commission=fee, commission_asset="BTC")
+    )
+    captured_oco: list[dict] = []
+    async def capture_oco(**kwargs):
+        captured_oco.append(kwargs)
+        return {"orderListId": 55}
+    om._client.create_oco_order = capture_oco
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om._submit(req)
+
+    assert om._open_position_qty == pytest.approx(expected), (
+        f"_open_position_qty {om._open_position_qty} != net qty {expected}"
+    )
+    assert captured_oco, "create_oco_order was not called"
+    assert float(captured_oco[0]["quantity"]) == pytest.approx(expected), (
+        f"OCO quantity {captured_oco[0]['quantity']} != net qty {expected}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_skipped_when_insufficient_btc():
+    """
+    SELL (SHORT) entry is skipped with a warning when the account's free BTC
+    is less than the required qty. Prevents -2010 on Spot accounts funded only
+    with USDT (as happens after the startup reconciler liquidates BTC).
+    """
+    om, _, fill_q, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
+    req = _make_req("SHORT")
+
+    om._client = AsyncMock()
+    om._client.get_account = AsyncMock(return_value={
+        "balances": [
+            {"asset": "BTC",  "free": "0.00001", "locked": "0.0"},
+            {"asset": "USDT", "free": "10000.0", "locked": "0.0"},
+        ]
+    })
+    om._client.create_order = AsyncMock()
+
+    with patch.object(settings, "DRY_RUN", False):
+        result = await om._submit_aggressive_limit(req, "SELL", 95_000.0, 95_010.0)
+
+    assert result is None
+    om._client.create_order.assert_not_called()
 
 
 # ── 1. LONG limit price formula ───────────────────────────────────────────────
@@ -351,9 +428,8 @@ async def test_entry_qty_floor_quantized_to_step():
 
     _make_req uses notional_hint=0.001, equity=10_000, protection wall at 94_000
     for LONG. With best_ask=95_010: raw_bps=106.3 → capped to 25 bps →
-    sl_distance = 95_010 × 0.0025 = 237.525, raw_qty = 10/237.525 = 0.042099...
-    round(..., 5) would give 0.04210 (not a whole number of steps).
-    Floor-quantize must give 0.04209 (4209 steps exactly).
+    sl_distance = 95_010 × 0.0025 = 237.525, raw_qty = 10/237.525 = 0.042100...
+    floor-quantize gives 0.04210 (4210 steps exactly).
     """
     om, _, fill_q, _ = _make_manager()
     req = _make_req("LONG")
@@ -362,8 +438,9 @@ async def test_entry_qty_floor_quantized_to_step():
         await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
 
     fill: FillDetail = fill_q.get_nowait()
-    assert fill.qty == pytest.approx(0.04209)
-    assert fill.qty % settings.QTY_STEP_SIZE == pytest.approx(0.0)
+    assert fill.qty == pytest.approx(0.04210)
+    # verify floor (not round): 10/237.525 = 0.042100... floors to 4210 steps
+    assert int(round(fill.qty / settings.QTY_STEP_SIZE)) == 4210
 
 
 # ── 15. M3: full fill_queue drops record, does not block ─────────────────────
@@ -496,7 +573,7 @@ async def test_s1_deferred_cancel_executed_after_oco_placed():
 
     om._client = AsyncMock()
     om._client.create_oco_order = AsyncMock(return_value={"orderListId": 42})
-    om._client.delete_oco_order = AsyncMock()
+    om._client.v3_delete_order_list = AsyncMock()
 
     emergency_calls: list = []
     async def spy_emergency(qty, entry_side, reason):
@@ -511,7 +588,7 @@ async def test_s1_deferred_cancel_executed_after_oco_placed():
         await om._place_oco(req, fill_price=95_015.0, fill_qty=0.001, entry_side="BUY")
 
     assert emergency_calls == ["WALL_REMOVED_DURING_OCO"]
-    om._client.delete_oco_order.assert_called_once()
+    om._client.v3_delete_order_list.assert_called_once()
     # After deferred close, position state must be fully reset
     assert om._open_position_side         is None
     assert om._open_position_qty          == 0.0
@@ -580,7 +657,7 @@ async def test_watch_oco_win_records_outcome_and_sets_event():
     om._update_outcome_cb = capture_outcome
 
     om._client = AsyncMock()
-    om._client.get_oco_order = AsyncMock(return_value={
+    om._client.v3_get_order_list = AsyncMock(return_value={
         "listStatusType": "ALL_DONE",
         "orders": [{"orderId": 42}],
     })
@@ -627,7 +704,7 @@ async def test_watch_oco_exits_cleanly_on_external_close():
     )
 
     assert not outcomes                          # no outcome recorded
-    om._client.get_oco_order.assert_not_called() # no REST call made
+    om._client.v3_get_order_list.assert_not_called() # no REST call made
 
 
 # ── 23. OCO watcher continues polling while EXECUTING ────────────────────────
@@ -651,7 +728,7 @@ async def test_watch_oco_continues_polling_while_executing():
         return {"listStatusType": "ALL_DONE", "orders": [{"orderId": 1}]}
 
     om._client = AsyncMock()
-    om._client.get_oco_order = AsyncMock(side_effect=oco_side)
+    om._client.v3_get_order_list = AsyncMock(side_effect=oco_side)
     om._client.get_order = AsyncMock(return_value={
         "executedQty": "0.001", "avgPrice": "96000.0"
     })
@@ -711,7 +788,7 @@ async def test_natural_oco_close_clears_active_exposure():
     om._open_position_closed_event = closed_event
 
     om._client = AsyncMock()
-    om._client.get_oco_order = AsyncMock(return_value={
+    om._client.v3_get_order_list = AsyncMock(return_value={
         "listStatusType": "ALL_DONE",
         "orders": [{"orderId": 42}],
     })
@@ -743,7 +820,7 @@ async def test_safety_exit_cancels_oco_and_emergency_closes():
     om._open_entry_price = 95_000.0
     om._open_entry_time = time.monotonic()
     om._client = AsyncMock()
-    om._client.delete_oco_order = AsyncMock()
+    om._client.v3_delete_order_list = AsyncMock()
 
     emergency_reasons = []
     async def confirmed_close(qty, entry_side, reason):
@@ -754,7 +831,167 @@ async def test_safety_exit_cancels_oco_and_emergency_closes():
     with patch.object(settings, "DRY_RUN", False):
         await om.handle_safety_exit("MAX_HOLD")
 
-    om._client.delete_oco_order.assert_called_once()
+    om._client.v3_delete_order_list.assert_called_once()
     assert emergency_reasons == ["SAFETY_MAX_HOLD"]
     assert closed_event.is_set()
     assert not om.has_active_exposure()
+
+
+# ── BPS-cap sl_distance tests ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sl_distance_capped_when_venues_diverge():
+    """When the real-LOB wall is far from the testnet execution price (cross-venue
+    mismatch), sl_distance is capped at PROTECTION_MAX_DISTANCE_BPS × signal_price
+    so qty stays sensible rather than collapsing to near-zero."""
+    om, _, fill_q, _ = _make_manager()
+
+    # Wall from real market at $107k, testnet price at $73k → raw gap ~46k bps
+    wall_price  = 107_000.0
+    best_bid    = 73_000.0
+    best_ask    = 73_010.0
+    signal_price = best_ask  # LONG uses best_ask
+
+    sig = MicroSignal(
+        signal_type     = "SWEEP_WITH_PROTECTION",
+        direction       = "LONG",
+        timestamp_ms    = int(time.time() * 1000),
+        consumed_wall   = _make_wall(73_500.0, side="ask"),
+        protection_wall = _make_wall(wall_price, side="bid"),
+    )
+    req = MicroOrderRequest(
+        micro_signal   = sig,
+        signal_id      = "cross-venue-test-1234",
+        order_type     = "IOC_LIMIT",
+        side           = "BUY",
+        limit_price    = None,
+        ioc_timeout_ms = 200,
+        confidence     = 0.70,
+        notional_hint  = 0.001,
+    )
+
+    with patch.object(settings, "DRY_RUN", True):
+        await om._submit_aggressive_limit(req, "BUY", best_bid, best_ask)
+
+    fill: FillDetail = fill_q.get_nowait()
+    # sl_distance must be capped: signal_price × PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_sl = signal_price * settings.PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_qty_raw = (10_000.0 * 0.001) / expected_sl
+    import math
+    step = settings.QTY_STEP_SIZE
+    expected_qty = round(math.floor(expected_qty_raw / step) * step, 5)
+    assert fill.qty == pytest.approx(expected_qty)
+    # sanity: qty must be far less than what the uncapped formula would give
+    uncapped_sl  = abs(signal_price - wall_price)
+    uncapped_qty = (10_000.0 * 0.001) / uncapped_sl
+    assert fill.qty > uncapped_qty * 10   # capped qty is >> uncapped near-zero qty
+
+
+@pytest.mark.asyncio
+async def test_oco_sl_price_anchored_to_fill_price():
+    """OCO stop-loss price is derived from fill_price ± bps-capped distance,
+    not from the raw protection_wall.price (which may be from a different venue)."""
+    om, _, fill_q, _ = _make_manager()
+    om._client = AsyncMock()
+
+    fill_price  = 73_628.0
+    wall_price  = 107_000.0   # real-market wall — far from testnet fill price
+    fill_qty    = 0.001
+
+    # Build a request whose protection wall is at the real-market price
+    sig = MicroSignal(
+        signal_type     = "SWEEP_WITH_PROTECTION",
+        direction       = "LONG",
+        timestamp_ms    = int(time.time() * 1000),
+        consumed_wall   = _make_wall(74_000.0, side="ask"),
+        protection_wall = _make_wall(wall_price, side="bid"),
+    )
+    req = MicroOrderRequest(
+        micro_signal   = sig,
+        signal_id      = "oco-anchor-test-5678",
+        order_type     = "IOC_LIMIT",
+        side           = "BUY",
+        limit_price    = None,
+        ioc_timeout_ms = 200,
+        confidence     = 0.70,
+        notional_hint  = 0.001,
+    )
+
+    oco_params: dict = {}
+
+    async def capture_oco(**kwargs):
+        oco_params.update(kwargs)
+        return {"orderListId": 99}
+
+    om._client.create_oco_order = capture_oco
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om._place_oco(req, fill_price, fill_qty, "BUY")
+
+    # LONG entry → SELL exit → OCO uses belowStopPrice for sl_price
+    # sl_price must be anchored to fill_price, not wall_price
+    expected_sl_dist  = fill_price * settings.PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_sl_price = round(fill_price - expected_sl_dist, 2)
+    actual_sl = float(oco_params["belowStopPrice"])
+    assert actual_sl == pytest.approx(expected_sl_price, abs=0.01)
+    # sl_price must be below fill_price (LONG stop is below entry)
+    assert actual_sl < fill_price
+    # sl_price must NOT be anywhere near the raw wall price
+    assert abs(actual_sl - wall_price) > 1_000
+
+
+# ── Fix 2: BPS-anchored sl_distance tests ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sl_distance_capped_when_venues_diverge():
+    """When wall is from real market (~$107k) and testnet price is ~$73k, sl_distance
+    is capped to PROTECTION_MAX_DISTANCE_BPS × signal_price rather than the raw gap."""
+    om, _, fill_q, _ = _make_manager()
+
+    wall_price = 107_000.0   # real-LOB wall
+    signal_price = 73_000.0  # testnet best_ask
+    req = _make_req("LONG")
+    req.micro_signal.protection_wall.price = wall_price
+
+    with patch.object(settings, "DRY_RUN", True):
+        await om._submit_aggressive_limit(req, "BUY", signal_price - 5.0, signal_price)
+
+    fill: FillDetail = fill_q.get_nowait()
+    # sl_distance must be capped: signal_price × PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_sl_dist = signal_price * settings.PROTECTION_MAX_DISTANCE_BPS / 10_000
+    expected_qty_raw = (10_000.0 * req.notional_hint) / expected_sl_dist
+    step = settings.QTY_STEP_SIZE
+    import math as _math
+    expected_qty = round(_math.floor(expected_qty_raw / step) * step, 5)
+    assert fill.qty == pytest.approx(expected_qty)
+    # cross-venue gap would have been ~$34k; capped sl_distance must be << $1000
+    assert expected_sl_dist < 1_000.0
+
+
+@pytest.mark.asyncio
+async def test_oco_sl_price_anchored_to_fill_price():
+    """OCO stop-loss must be within PROTECTION_MAX_DISTANCE_BPS of fill_price,
+    not at the raw real-market wall price."""
+    om, _, _, _ = _make_manager()
+    req = _make_req("LONG")
+    req.micro_signal.protection_wall.price = 107_000.0   # real-LOB wall
+
+    fill_price = 73_628.0
+    captured: list[dict] = []
+
+    om._client = AsyncMock()
+    async def capture_oco(**kwargs):
+        captured.append(kwargs)
+        return {"orderListId": 1}
+    om._client.create_oco_order = capture_oco
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om._place_oco(req, fill_price=fill_price, fill_qty=0.001, entry_side="BUY")
+
+    assert captured, "create_oco_order was not called"
+    # LONG entry → SELL exit → OCO uses belowStopPrice for the stop trigger
+    actual_sl = float(captured[0]["belowStopPrice"])
+    expected_sl = round(fill_price * (1 - settings.PROTECTION_MAX_DISTANCE_BPS / 10_000), 2)
+    assert abs(actual_sl - expected_sl) < 1.0, (
+        f"sl_price {actual_sl} not within 25bps of fill_price {fill_price}"
+    )
