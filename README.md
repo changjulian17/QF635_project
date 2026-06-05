@@ -704,10 +704,15 @@ These rules are invariants. Any code that violates them is incorrect.
 - [ ] need to test the live dashboard works
 - [ ] Consider placing a minimum-quantity resting order behind/after a significant liquidity wall — a fill on that order signals the wall has been consumed, providing a cleaner consumption trigger than depth-diff heuristics. Quantity must be as small as possible (min tick size on Binance Spot Testnet).
 - [ ] run through start_test.sh and make sure the trade execution with injector is working. trades work now. make sure its tracked in live dashboard
-- [ ] review all code and test scripts to ensure no unused classes or functions
 - [ ] troubleshoot and refine strategy
 - [ ] troubleshoot and refine model
 - [ ] troubleshoot and refine algorithm
+#### check there is controls in all critical processes 
+- [ ] check there is controls in Market Data Gateway. no 0.0 or infty values or extreme or non-numeric values
+- [ ] check there is controls in all aggregator. for example, make sure bid < ask and other exchange assumptions need to be validated
+- [ ] check there is controls in all order management. authorisation, is the correct person sending the order? make sure the right module sends the order.
+- [ ] check there is controls in all order gateway. ensure rate limit if there is something is wrong with model executions
+
 
 ### Lead-quant backlog
 
