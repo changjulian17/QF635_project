@@ -54,7 +54,7 @@ def gate_1_microstructure(signal: MicroSignal, absorption_armed: bool) -> tuple[
     if signal.protection_wall is None:
         return False, "no protection wall"
     if not absorption_armed:
-        return False, "protection wall has no prior absorption"
+        return False, "consumed wall has no prior absorption"
     return True, ""
 
 
@@ -384,7 +384,7 @@ class StrategyExecutor:
             self._reject(rec, "GATE_0_FAIL", reason)
             return
 
-        # Gate 1 — microstructure (prior absorption on protection wall required)
+        # Gate 1 — microstructure (prior absorption on consumed wall required)
         ok, reason = gate_1_microstructure(signal, signal.prior_absorption)
         logger.info(
             "[Gate1] %s type=%s consumed=%s protection=%s absorption=%s%s",

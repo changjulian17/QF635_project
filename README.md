@@ -698,8 +698,12 @@ These rules are invariants. Any code that violates them is incorrect.
 - [x] Write up strategy documentation — entry logic, gate rationale, Wall/Absorption/Sweep signal design (`documentation/strategy.md`)
 - [x] Write up model documentation — FeatureComputer inputs, XGBoost scorer architecture, training pipeline including component interaction diagram (`documentation/model.md`)
 - [x] Write up trading algorithm documentation — end-to-end flow from LOB tick to order submission (`documentation/algorithm.md`)
+- [x] Fix gate 3 issue; risk management is not using live position data. need to ensure BTC, USDT data is being passed through
+- [ ] Fix one test case. make sure it uses the correct notional
+- [ ] check market bubbles in dashboard. make sure it is top 1 percentile volume for the whole heatmap window. otherwise might be better to have even higher threshhold up to 99.5 percentile contrast
+- [ ] need to test the live dashboard works
 - [ ] Consider placing a minimum-quantity resting order behind/after a significant liquidity wall — a fill on that order signals the wall has been consumed, providing a cleaner consumption trigger than depth-diff heuristics. Quantity must be as small as possible (min tick size on Binance Spot Testnet).
-- [ ] run through start_test.sh and make sure the trade execution with injector is working
+- [ ] run through start_test.sh and make sure the trade execution with injector is working. trades work now. make sure its tracked in live dashboard
 - [ ] review all code and test scripts to ensure no unused classes or functions
 - [ ] troubleshoot and refine strategy
 - [ ] troubleshoot and refine model

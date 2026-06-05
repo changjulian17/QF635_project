@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 
 from config import settings
-from .lob_engine import LocalOrderBook
+from core.lob_engine import LocalOrderBook
 from models import AggTrade, LOBLevel, LOBSnapshot, MicrostructureBar
 
 logger = logging.getLogger(__name__)

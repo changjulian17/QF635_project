@@ -181,7 +181,7 @@ class ScorerFactory:
                     path, auc, scorer.calibration_error(), age_days,
                 )
                 return scorer
-            except Exception as exc:
+            except (OSError, EOFError, KeyError, ValueError, RuntimeError) as exc:
                 logger.warning(
                     "[ScorerFactory] Failed to load %s: %s — falling back to RuleBasedScorer",
                     path, exc,

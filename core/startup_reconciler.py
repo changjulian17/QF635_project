@@ -7,6 +7,7 @@ Every step is wrapped in try/except so a single exchange error never blocks star
 import asyncio
 import json
 import logging
+import math
 import sqlite3
 from datetime import date, datetime, timezone
 from typing import Any
@@ -81,9 +82,51 @@ async def reconcile_on_startup(
             logger.warning("[Reconcile] Could not fetch ticker: %s", exc)
             btc_price = 0.0
 
+        # S2b — liquidate any BTC holdings to start clean in USDT
+        try:
+            _min_btc = settings.QTY_STEP_SIZE
+            if not settings.DRY_RUN and btc_price > 0 and btc_free > _min_btc:
+                step = settings.QTY_STEP_SIZE
+                qty  = round(math.floor(btc_free / step) * step, 5)
+                limit_price = round(btc_price * 0.98, 2)  # 2% below last price, crosses bid on testnet
+                if qty * btc_price < settings.MIN_NOTIONAL:
+                    logger.warning(
+                        "[Reconcile] BTC dust too small to liquidate "
+                        "(%.5f BTC ≈ %.2f USDT < MIN_NOTIONAL %.2f) — skipping",
+                        qty, qty * btc_price, settings.MIN_NOTIONAL,
+                    )
+                else:
+                    resp = await asyncio.wait_for(
+                        client.create_order(
+                            symbol=symbol,
+                            side="SELL",
+                            type="LIMIT",
+                            timeInForce="IOC",
+                            quantity=qty,
+                            price=str(limit_price),
+                        ),
+                        timeout=15.0,
+                    )
+                    filled_qty  = float(resp.get("executedQty", 0))
+                    filled_usdt = float(resp.get("cummulativeQuoteQty", 0))
+                    logger.info(
+                        "[Reconcile] BTC liquidated at startup: SELL %.5f BTC → %.2f USDT",
+                        filled_qty, filled_usdt,
+                    )
+                    account2 = await asyncio.wait_for(client.get_account(), timeout=15.0)
+                    for bal in account2.get("balances", []):
+                        if bal["asset"] == "USDT":
+                            usdt_free = float(bal["free"])
+                        if bal["asset"] == "BTC":
+                            btc_free = float(bal["free"]) + float(bal["locked"])
+        except Exception as exc:
+            result["errors"].append(f"btc_liquidation: {exc}")
+            logger.warning("[Reconcile] Could not liquidate BTC at startup: %s", exc)
+
         result["btc_balance"]   = btc_free        # keep existing key for backwards compat
         result["usdt_free"]     = usdt_free
         result["btc_free"]      = btc_free
+        result["btc_price"]     = btc_price
         result["actual_equity"] = usdt_free + btc_free * btc_price
         logger.info("[Reconcile] BTC balance: %.8f", btc_free)
     except Exception as exc:
@@ -119,6 +162,9 @@ async def reconcile_on_startup(
         portfolio.equity          = actual_equity
         portfolio.starting_equity = actual_equity - result["restored_pnl"]
         portfolio.peak_equity     = max(actual_equity, portfolio.starting_equity)
+        portfolio.usdt_balance    = result["usdt_free"]
+        portfolio.btc_balance     = result["btc_free"]
+        portfolio.btc_price       = result.get("btc_price", 0.0)
         logger.info(
             "[Reconcile] Equity set from exchange: USDT=%.2f BTC=%.6f total=%.2f",
             result["usdt_free"], result["btc_free"], actual_equity,

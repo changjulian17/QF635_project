@@ -2,7 +2,6 @@ import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
-from typing import Optional
 
 class Direction(Enum):
     LONG = "BUY"
@@ -48,6 +47,9 @@ class PortfolioState:
     num_fill_samples: int = 0
     avg_slippage_bps: float = 0.0
     budget_loss_pct: float = 0.0
+    usdt_balance: float = 0.0   # USDT cash at last reconcile
+    btc_balance:  float = 0.0   # BTC quantity at last reconcile
+    btc_price:    float = 0.0   # BTC/USDT price used for MTM at last reconcile
 
     @property
     def drawdown_pct(self) -> float:
@@ -178,8 +180,8 @@ class MicroSignal:
     signal_type:       str             # "SWEEP_WITH_PROTECTION"
     direction:         str             # "LONG" | "SHORT"
     timestamp_ms:      int
-    consumed_wall:     Optional[WallState] = None
-    protection_wall:   Optional[WallState] = None
+    consumed_wall:     WallState | None = None
+    protection_wall:   WallState | None = None
     prior_absorption:  bool  = False   # Wall absorbed aggression before sweep
     cvd_std:           float = 0.0     # CVD spike in std multiples
     price_move_pct:    float = 0.0
@@ -194,7 +196,7 @@ class MicroOrderRequest:
     signal_id:      str          # links back to SignalRecord for telemetry outcome updates
     order_type:     str          # "IOC_LIMIT"
     side:           str          # "BUY" | "SELL"
-    limit_price:    Optional[float]  # None = taker (execution layer resolves via LOB); float = explicit IOC limit
+    limit_price:    float | None  # None = taker (execution layer resolves via LOB); float = explicit IOC limit
     ioc_timeout_ms: int
     confidence:     float
     notional_hint:  float        # risk fraction of equity = RISK_PCT × KELLY × confidence;
