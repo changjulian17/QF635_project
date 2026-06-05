@@ -32,7 +32,7 @@ Absorption occurs when aggressive trades hit a persistent wall but price does no
 - A bid wall absorbs seller aggression when sell pressure hits the bid but the level holds.
 - An ask wall absorbs buyer aggression when buy pressure lifts the ask but the level holds.
 - The wall must remain persistent and retain or reload a substantial portion of its original quantity.
-- Price movement must remain below the adaptive movement threshold.
+- Price movement must remain below the price-move floor threshold (configurable via `MICRO_PRICE_MOVE_FLOOR_BPS`, default 0.03%). Note: the adaptive rolling-percentile threshold is used only for sweep detection, not for absorption.
 
 Absorption does not trigger an entry. It arms the system by marking the wall as an important level where aggressive flow has already tested resting liquidity.
 

@@ -34,7 +34,7 @@ flowchart LR
     OM --> TESTNET[Binance Spot Testnet]
 ```
 
-`RiskEngine` is still instantiated for budget/tier state and tier synchronization, but the legacy pattern-signal queue runner is not started in live startup. It is not between the microstructure `StrategyExecutor` and `OrderManager`; for the micro path, budget, exposure, and risk-tier checks happen inside `StrategyExecutor`.
+`RiskEngine` is instantiated for budget/tier state and tier synchronization; it is not between the microstructure `StrategyExecutor` and `OrderManager` — budget, exposure, and risk-tier checks happen inside `StrategyExecutor`. The legacy `MicrostructureEngine` (`engine/microstructure_engine.py`) is not started in the live `TaskGroup`.
 
 ## FeatureComputer Inputs
 
