@@ -11,6 +11,7 @@ WebSocket simply stays closed and the badge reflects that — the page still sho
 whatever history the DB holds.
 """
 import json
+import time
 from datetime import datetime, timezone, timedelta
 
 import dash
@@ -45,6 +46,30 @@ _BUFFER: list[dict] = []
 # a single 60-min window could see hundreds of events.
 _MAX_EVENTS = 2000
 _EVENTS: list[dict] = []
+
+# ── Bubble baseline cache ──────────────────────────────────────────────────
+# Percentile threshold is derived from 24h of bin-aggregated volumes, not the
+# current window, so the slider value is stable across window sizes.
+_BUCKET_SIZE: float = settings.LOB_HEATMAP_BUCKET
+_BASELINE_BIN_QTYS: np.ndarray = np.array([])
+_BASELINE_TS: float = 0.0
+_BASELINE_TTL: float = 60.0
+
+
+def _refresh_baseline_if_stale() -> None:
+    """Recompute the 24h bin-aggregated volume distribution (at most every TTL seconds)."""
+    global _BASELINE_BIN_QTYS, _BASELINE_TS
+    if time.time() - _BASELINE_TS < _BASELINE_TTL:
+        return
+    since_24h = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
+    raw = fetch_agg_trades(since_24h, limit=800_000)
+    if raw and not isinstance(raw, DBOffline):
+        bdf = pd.DataFrame(raw)
+        bdf["price_bkt"] = (bdf["price"] / _BUCKET_SIZE).round() * _BUCKET_SIZE
+        bdf["ts_sec"]    = bdf["ts_event"] // 1000
+        agg = bdf.groupby(["ts_sec", "price_bkt", "is_buyer_maker"])["qty"].sum()
+        _BASELINE_BIN_QTYS = agg.values.astype(np.float64)
+        _BASELINE_TS = time.time()
 
 
 layout = html.Div([
@@ -92,7 +117,7 @@ layout = html.Div([
                        marks={80: "80", 90: "90", 95: "95", 99: "99"}),
         ], width=3),
         dbc.Col([
-            dbc.Label("Trade size (pctile)"),
+            dbc.Label("Bin volume (pctile)"),
             dcc.Slider(id="lob-trade-pctile", min=70, max=99, step=1, value=80,
                        marks={70: "70", 80: "80", 90: "90", 99: "99"}),
         ], width=3),
@@ -242,52 +267,66 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         for row in (2, 3, 4):
             fig.add_trace(go.Scatter(x=[], y=[], showlegend=False), row=row, col=1)
 
-    # ── Row 1 overlay: market order bubbles (from DB agg_trades) ───────────
+    # ── Row 1 overlay: market order bubbles ───────────────────────────────
     if not hm_df.empty and ts_labels:
+        _refresh_baseline_if_stale()
+        threshold = (
+            float(np.percentile(_BASELINE_BIN_QTYS, trade_pctile or 80))
+            if len(_BASELINE_BIN_QTYS) else 0.0
+        )
+
         snap_ms   = np.array([int(t.timestamp() * 1000) for t in hm_ts_snap], dtype=np.int64)
         win_start = int(snap_ms[0])
         win_end   = int(snap_ms[-1])
 
-        trades = fetch_agg_trades(win_start, until_ts_ms=win_end, limit=None)
+        trades = fetch_agg_trades(win_start, until_ts_ms=win_end, limit=10_000)
         buy_x,  buy_y,  buy_sz,  buy_txt  = [], [], [], []
         sell_x, sell_y, sell_sz, sell_txt = [], [], [], []
 
         if trades and not isinstance(trades, DBOffline):
             tdf = pd.DataFrame(trades)
-            tdf = tdf[(tdf["ts_event"] >= win_start) & (tdf["ts_event"] <= win_end)].copy()
             if not tdf.empty:
-                threshold = tdf["qty"].quantile((trade_pctile or 80) / 100)
-                tdf = tdf[tdf["qty"] >= threshold].copy()
-            if not tdf.empty:
-                snapped_x = [
+                tdf["snapped_x"] = [
                     ts_labels[int(np.argmin(np.abs(snap_ms - t)))]
                     for t in tdf["ts_event"].values
                 ]
-                sizes = np.clip(np.log1p(tdf["qty"].values) * 6, 5, 24)
-                buy_mask  = tdf["is_buyer_maker"].values == 0
-                sell_mask = ~buy_mask
-                buy_x   = [snapped_x[i] for i, ok in enumerate(buy_mask)  if ok]
-                buy_y   = tdf["price"].values[buy_mask].tolist()
-                buy_sz  = sizes[buy_mask].tolist()
-                buy_txt = tdf["qty"].values[buy_mask].round(4).astype(str).tolist()
-                sell_x   = [snapped_x[i] for i, ok in enumerate(sell_mask) if ok]
-                sell_y   = tdf["price"].values[sell_mask].tolist()
-                sell_sz  = sizes[sell_mask].tolist()
-                sell_txt = tdf["qty"].values[sell_mask].round(4).astype(str).tolist()
+                tdf["price_bkt"] = (tdf["price"] / bucket_size).round() * bucket_size
+                tdf["ts_sec"]    = tdf["ts_event"] // 1000
+
+                agg = (
+                    tdf.groupby(["snapped_x", "price_bkt", "is_buyer_maker"], as_index=False)
+                       .agg(qty=("qty", "sum"), n=("qty", "count"))
+                )
+                agg = agg[agg["qty"] >= threshold].copy()
+
+                if not agg.empty:
+                    sizes     = np.clip(np.log1p(agg["qty"].values) * 6, 5, 24)
+                    buy_mask  = agg["is_buyer_maker"].values == 0
+                    sell_mask = ~buy_mask
+                    buy_x    = agg["snapped_x"].values[buy_mask].tolist()
+                    buy_y    = agg["price_bkt"].values[buy_mask].tolist()
+                    buy_sz   = sizes[buy_mask].tolist()
+                    buy_txt  = [f"qty={q:.4f} n={n}" for q, n in zip(
+                                    agg["qty"].values[buy_mask], agg["n"].values[buy_mask])]
+                    sell_x   = agg["snapped_x"].values[sell_mask].tolist()
+                    sell_y   = agg["price_bkt"].values[sell_mask].tolist()
+                    sell_sz  = sizes[sell_mask].tolist()
+                    sell_txt = [f"qty={q:.4f} n={n}" for q, n in zip(
+                                    agg["qty"].values[sell_mask], agg["n"].values[sell_mask])]
 
         fig.add_trace(go.Scatter(
             x=buy_x, y=buy_y, mode="markers",
             marker=dict(size=buy_sz or 8, color="rgba(0,220,100,0.8)",
                         line=dict(width=0.5, color="white")),
             name="Buy MO", text=buy_txt,
-            hovertemplate="qty: %{text}<extra></extra>",
+            hovertemplate="%{text}<extra></extra>",
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
             x=sell_x, y=sell_y, mode="markers",
             marker=dict(size=sell_sz or 8, color="rgba(220,60,60,0.8)",
                         line=dict(width=0.5, color="white")),
             name="Sell MO", text=sell_txt,
-            hovertemplate="qty: %{text}<extra></extra>",
+            hovertemplate="%{text}<extra></extra>",
         ), row=1, col=1)
     else:
         for label in ("Buy MO", "Sell MO"):
