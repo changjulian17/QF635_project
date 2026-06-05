@@ -98,7 +98,7 @@ class DBWriter:
             candle: Candle = await self._candle_queue.get()
             try:
                 await asyncio.to_thread(self._write_candle, candle)
-            except Exception as e:
+            except sqlite3.Error as e:
                 logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _ms_bar_loop(self) -> None:
@@ -106,7 +106,7 @@ class DBWriter:
             bar: MicrostructureBar = await self._ms_bar_queue.get()
             try:
                 await asyncio.to_thread(self._write_ms_bar, bar)
-            except Exception as e:
+            except sqlite3.Error as e:
                 logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _portfolio_loop(self) -> None:
@@ -114,7 +114,7 @@ class DBWriter:
             await asyncio.sleep(self.PORTFOLIO_INTERVAL)
             try:
                 await asyncio.to_thread(self._write_portfolio, self._portfolio)
-            except Exception as e:
+            except sqlite3.Error as e:
                 logger.warning("[DB] Write error (%s) — continuing", e)
 
     async def _cleanup_loop(self) -> None:
@@ -122,7 +122,7 @@ class DBWriter:
             await asyncio.sleep(self.CLEANUP_INTERVAL)
             try:
                 await asyncio.to_thread(self._purge_old_records)
-            except Exception as e:
+            except sqlite3.Error as e:
                 logger.warning("[DB] Write error (%s) — continuing", e)
 
     def _purge_old_records(self) -> None:

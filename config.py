@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     MIN_CONFIDENCE: float = 0.58   # Gate 2 confidence threshold
 
     # Risk
-    STARTING_EQUITY: float = 10_000.0
+    STARTING_EQUITY: float = 1_000_000.0  # design account size (1M USDT testnet); overwritten by reconciler
     MAX_DRAWDOWN_PCT: float = 0.05
     DAILY_LOSS_LIMIT_PCT: float = 0.02
     # 5-tier DOV loss thresholds (§5 risk_management_plan)
@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     TIER_PASSIVE_PCT: float = 0.0090   # ≥ 0.90% DOV loss → PASSIVE (no new entries)
     TIER_HALTED_PCT:  float = 0.0100   # ≥ 1.00% DOV loss → HALTED
     MAX_CONSECUTIVE_LOSSES: int = 3
-    RISK_PER_TRADE_PCT: float = 0.01
+    RISK_PER_TRADE_PCT: float = 0.001  # 0.1% — sized for ~10 bps microstructure stops
     KELLY_FRACTION: float = 0.25
     ATR_MULTIPLIER_SL: float = 1.5   # legacy/backtest default; microstructure path uses wall-based SL
     ATR_MULTIPLIER_TP: float = 3.0

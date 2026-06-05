@@ -7,12 +7,13 @@ import dash_bootstrap_components as dbc
 from dash_extensions import WebSocket
 
 from config import settings
-from dashboard._db import fetch_pnl_by_pattern, fetch_session_stats, fetch_signal_funnel, DBOffline
+from dashboard._db import fetch_portfolio_history, fetch_session_stats, fetch_signal_funnel, DBOffline
 from dashboard._logic import (
     fire_killswitch as _fire_ks,
     update_portfolio_state,
     validate_ks_confirm as _validate_ks,
 )
+from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/", name="Live", redirect_from=["/live"])
 
@@ -32,7 +33,7 @@ _TIER_COLORS = {
 }
 
 
-def _metric_card(label: str, value: str, color: str = "light") -> dbc.Col:
+def _metric_card(label: str, value: str, color: str = "light", width: int = 3) -> dbc.Col:
     return dbc.Col(
         dbc.Card([
             dbc.CardBody([
@@ -40,7 +41,7 @@ def _metric_card(label: str, value: str, color: str = "light") -> dbc.Col:
                 html.H4(value, className=f"text-{color} mb-0"),
             ])
         ], color="dark", outline=True),
-        width=3,
+        width=width,
     )
 
 
@@ -55,13 +56,17 @@ layout = html.Div([
     ], className="d-flex justify-content-end align-items-center mb-2"),
 
     # ── Portfolio metrics ──────────────────────────────────────────────────
-    dbc.Row(id="live-metrics-row", className="mb-3 g-3"),
+    dbc.Row(id="live-metrics-row", className="mb-2 g-3"),
+    html.Small("Account Balances (session open)", className="text-muted ms-1"),
+    dbc.Row(id="live-balance-row", className="mb-3 g-3"),
 
     # ── Session stats ──────────────────────────────────────────────────────
     html.H5("Session Stats (last 24h)", className="mb-2 mt-1"),
-    dbc.Row(id="live-session-row", className="mb-2 g-3"),
+    dbc.Row(id="live-session-row", className="mb-3 g-3"),
+
+    # ── Equity curve ──────────────────────────────────────────────────────
     dbc.Row([
-        dbc.Col(dcc.Graph(id="live-pnl-pattern-chart", style={"height": "220px"}), width=12),
+        dbc.Col(dcc.Graph(id="live-equity-chart", style={"height": "220px"}), width=12),
     ], className="mb-4"),
 
     # ── Signal funnel ──────────────────────────────────────────────────────
@@ -147,6 +152,23 @@ def _build_metrics_row(portfolio: dict) -> list:
     ]
 
 
+def _build_balance_row(portfolio: dict) -> list:
+    usdt_bal  = portfolio.get("usdt_balance")
+    btc_bal   = portfolio.get("btc_balance")
+    btc_mtm   = portfolio.get("btc_mtm")
+    btc_price = portfolio.get("btc_price", 0)
+
+    usdt_str  = f"${usdt_bal:,.2f}"   if isinstance(usdt_bal, (int, float)) else "—"
+    btc_str   = f"{btc_bal:.6f} BTC"  if isinstance(btc_bal,  (int, float)) else "—"
+    mtm_str   = f"${btc_mtm:,.2f}"    if isinstance(btc_mtm,  (int, float)) and btc_price != 0 else "—"
+
+    return [
+        _metric_card("USDT Balance (at open)", usdt_str, width=4),
+        _metric_card("BTC Holdings (at open)", btc_str,  width=4),
+        _metric_card("BTC Value (at open)",    mtm_str,  width=4),
+    ]
+
+
 def _build_positions_table(portfolio: dict):
     positions = portfolio.get("positions", []) or []
     if not positions:
@@ -194,20 +216,29 @@ def on_ws_message(message):
 
 @callback(
     Output("live-metrics-row", "children"),
+    Output("live-balance-row", "children"),
     Output("live-positions-table", "children"),
     Input("live-portfolio-tick", "data"),
 )
 def render_portfolio_section(_tick):
     if not _PORTFOLIO:
-        return _placeholder_metrics(), html.P("Waiting for engine…", className="text-muted")
-    return _build_metrics_row(_PORTFOLIO), _build_positions_table(_PORTFOLIO)
+        return (
+            _placeholder_metrics(),
+            _build_balance_row({}),
+            html.P("Waiting for engine…", className="text-muted"),
+        )
+    return (
+        _build_metrics_row(_PORTFOLIO),
+        _build_balance_row(_PORTFOLIO),
+        _build_positions_table(_PORTFOLIO),
+    )
 
 
-# ── Session stats + funnel section (5 s interval; 24 h aggregates) ─────────
+# ── Session stats + equity curve + funnel section (5 s interval; 24 h) ─────
 
 @callback(
     Output("live-session-row", "children"),
-    Output("live-pnl-pattern-chart", "figure"),
+    Output("live-equity-chart", "figure"),
     Output("live-funnel-table", "children"),
     Input("live-interval", "n_intervals"),
 )
@@ -215,7 +246,6 @@ def update_session_section(_n):
     session_result = fetch_session_stats(hours=24)
     if isinstance(session_result, DBOffline) or not session_result:
         session_row = [dbc.Col(dbc.Alert("No session data yet.", color="secondary"), width=12)]
-        pnl_fig = go.Figure()
     else:
         s = session_result
         total_t = s.get("total_trades") or 0
@@ -238,21 +268,36 @@ def update_session_section(_n):
             _metric_card("Avg Slippage", f"{avg_slip:.1f} bps" if avg_slip is not None else "—"),
         ]
 
-        pnl_by_pat = fetch_pnl_by_pattern(hours=24)
-        if isinstance(pnl_by_pat, DBOffline) or not pnl_by_pat:
-            pnl_fig = go.Figure()
-        else:
-            labels = list(pnl_by_pat.keys())
-            values = list(pnl_by_pat.values())
-            colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in values]
-            pnl_fig = go.Figure(go.Bar(x=labels, y=values, marker_color=colors))
-            pnl_fig.update_layout(
-                title="P&L by Signal Type (last 24h)",
-                template="plotly_dark",
-                margin=dict(l=40, r=20, t=40, b=30),
-                yaxis_title="P&L (USDT)",
-                showlegend=False,
-            )
+    # ── Equity curve ──────────────────────────────────────────────────────
+    history = fetch_portfolio_history(limit=720)
+    if isinstance(history, DBOffline) or not history:
+        equity_fig = _empty_fig("No portfolio history — start main.py to begin recording.")
+    else:
+        ts_vals  = [r["ts"] for r in history]
+        eq_vals  = [r["equity"] if r["equity"] is not None else 0.0 for r in history]
+        baseline = eq_vals[0] or 0.0  # guard: equity column is REAL (nullable)
+        equity_fig = go.Figure()
+        equity_fig.add_trace(go.Scatter(
+            x=ts_vals, y=eq_vals, mode="lines",
+            line=dict(color="cyan", width=1.5),
+            fill="tozeroy", fillcolor="rgba(0,200,200,0.15)",
+            hovertemplate="%{x|%H:%M:%S}<br>$%{y:,.2f}<extra></extra>",
+        ))
+        equity_fig.add_hline(
+            y=baseline,
+            line=dict(color="rgba(255,255,255,0.4)", width=0.8, dash="dot"),
+            annotation_text=f"Open  ${baseline:,.0f}",
+            annotation_position="top left",
+            annotation_font=dict(size=10, color="rgba(255,255,255,0.5)"),
+        )
+        equity_fig.update_layout(
+            title=dict(text="Equity Curve", font=dict(size=13)),
+            template="plotly_dark",
+            margin=dict(l=70, r=20, t=35, b=30),
+            yaxis=dict(title="Equity (USDT)", tickformat="$,.0f"),
+            xaxis=dict(title=None),
+            showlegend=False,
+        )
 
     funnel_result = fetch_signal_funnel(hours=24)
     if isinstance(funnel_result, DBOffline):
@@ -273,7 +318,7 @@ def update_session_section(_n):
     else:
         funnel_table = html.P("No signal data in last 24h.", className="text-muted")
 
-    return session_row, pnl_fig, funnel_table
+    return session_row, equity_fig, funnel_table
 
 
 # ── Killswitch status (engine-state-driven) ────────────────────────────────

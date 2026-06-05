@@ -66,6 +66,30 @@ def _weighted_avg_fill(resp: dict) -> float:
     return sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
 
 
+def _net_fill_qty(resp: dict, side: str, base_asset: str) -> float:
+    """Net base-asset qty available after fees.
+
+    On Binance Spot, BUY fees may be deducted in the base asset (e.g. BTC on
+    BTCUSDT). Placing an OCO or IOC close for the gross executedQty triggers
+    -2010 when the fee was taken in BTC and the full gross amount is not held.
+    SHORT fees are deducted in the quote asset, so no adjustment is needed.
+    """
+    gross = float(resp.get("executedQty", 0))
+    if side != "BUY":
+        return gross
+    fills = resp.get("fills", [])
+    if not fills:
+        return gross
+    net = 0.0
+    for f in fills:
+        qty = float(f["qty"])
+        if f.get("commissionAsset", "").upper() == base_asset.upper():
+            net += qty - float(f.get("commission", 0))
+        else:
+            net += qty
+    return max(net, 0.0)
+
+
 class OrderManager:
     """
     Consumes MicroOrderRequests from signal_queue, executes them as IOC
@@ -211,6 +235,20 @@ class OrderManager:
         """Return True when a microstructure entry/position/close is active."""
         return self._has_active_exposure_locked()
 
+    def get_dry_run_position(self) -> dict | None:
+        """Return in-memory open position for DRY_RUN display. None if no open position."""
+        if not settings.DRY_RUN or self._open_position_side is None:
+            return None
+        return {
+            "symbol":         settings.SYMBOL,
+            "side":           self._open_position_side,
+            "entry_price":    self._open_entry_price,
+            "quantity":       self._open_position_qty,
+            "stop_loss":      self._open_sl_price,
+            "take_profit":    None,
+            "unrealised_pnl": None,
+        }
+
     async def _submit(self, req: MicroOrderRequest) -> None:
         async with self._position_lock:
             if self._has_active_exposure_locked():
@@ -233,8 +271,14 @@ class OrderManager:
                 return
 
             fill_price = _weighted_avg_fill(resp)
-            fill_qty   = float(resp.get("executedQty", 0))
-            await self._place_oco(req, fill_price, fill_qty, req.side)
+            step       = settings.QTY_STEP_SIZE
+            oco_qty    = round(
+                math.floor(
+                    _net_fill_qty(resp, req.side, settings.SYMBOL.removesuffix("USDT")) / step
+                ) * step,
+                5,
+            )
+            await self._place_oco(req, fill_price, oco_qty, req.side)
         finally:
             async with self._position_lock:
                 self._entry_in_flight = False
@@ -336,6 +380,25 @@ class OrderManager:
             )
             return None
 
+        # Pre-flight: SHORT (SELL) entries require BTC on-account.
+        # The startup reconciler liquidates BTC to USDT, so a fresh session has 0 BTC.
+        if side == "SELL" and not settings.DRY_RUN and self._client is not None:
+            try:
+                account  = await self._client.get_account()
+                btc_free = next(
+                    (float(b["free"]) for b in account.get("balances", []) if b["asset"] == "BTC"),
+                    0.0,
+                )
+                if btc_free < qty:
+                    logger.warning(
+                        "[Exec] Insufficient BTC for SHORT entry "
+                        "(have=%.5f need=%.5f) — skipped %s",
+                        btc_free, qty, req.signal_id[:8],
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning("[Exec] BTC balance pre-check failed (%s) — proceeding", exc)
+
         entry_order = IOCLimitOrder(
             symbol   = settings.SYMBOL,
             side     = side,
@@ -382,6 +445,13 @@ class OrderManager:
             else (signal_price - fill_price) / signal_price * 10_000
         )
         fill_qty = float(resp["executedQty"])
+        step     = settings.QTY_STEP_SIZE
+        net_qty  = round(
+            math.floor(
+                _net_fill_qty(resp, side, settings.SYMBOL.removesuffix("USDT")) / step
+            ) * step,
+            5,
+        )
 
         # Acquire lock; all open-position writes are atomic with fill_queue put.
         async with self._position_lock:
@@ -403,7 +473,7 @@ class OrderManager:
             req.fill_event.set()
             self._entry_in_flight            = False
             self._open_position_side         = side
-            self._open_position_qty          = fill_qty
+            self._open_position_qty          = net_qty
             self._open_position_closed_event = req.position_closed_event
             self._open_signal_id             = req.signal_id
             self._open_entry_price           = fill_price
@@ -490,7 +560,7 @@ class OrderManager:
                 )
                 if self._open_oco_list_id is not None:
                     try:
-                        await self._client.delete_oco_order(
+                        await self._client.v3_delete_order_list(
                             symbol      = settings.SYMBOL,
                             orderListId = self._open_oco_list_id,
                         )
@@ -577,7 +647,7 @@ class OrderManager:
                 return
 
             try:
-                resp = await self._client.get_oco_order(orderListId=oco_list_id)
+                resp = await self._client.v3_get_order_list(orderListId=oco_list_id)
             except Exception as exc:
                 logger.warning("[Exec] OCO poll failed (id=%d): %s", oco_list_id, exc)
                 continue
@@ -767,7 +837,7 @@ class OrderManager:
 
         if oco_id is not None and self._client:
             try:
-                await self._client.delete_oco_order(
+                await self._client.v3_delete_order_list(
                     symbol      = settings.SYMBOL,
                     orderListId = oco_id,
                 )
@@ -869,7 +939,7 @@ class OrderManager:
 
         if oco_id is not None and self._client:
             try:
-                await self._client.delete_oco_order(
+                await self._client.v3_delete_order_list(
                     symbol=settings.SYMBOL,
                     orderListId=oco_id,
                 )

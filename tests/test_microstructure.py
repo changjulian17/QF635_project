@@ -301,7 +301,140 @@ def test_absorption_batch_deduplicates_same_wall():
     assert len(detector._absorption_batch) == 1
 
 
-def _make_detector(feature_computer=None):
+# ── Hub event emission ────────────────────────────────────────────────────
+
+
+def test_absorption_emits_hub_event_on_first_arm():
+    """Absorption transition (not-armed → armed) broadcasts one typed event payload."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    hub = MagicMock()
+    hub.broadcast = AsyncMock()
+    detector = _make_detector(hub=hub)
+    detector._cvd.get_cvd_delta = MagicMock(return_value=-1.0)  # sellers aggressing → bid wall absorbs
+
+    now = int(time.time() * 1000)
+    wall = WallState(
+        price=30000.0, qty_initial=50.0, qty_current=50.0,
+        first_seen_ts=now - 600, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    detector._wall_states[30000.0] = wall
+    detector._prev_mid = 0.0  # → price_move_pct = 0.0, within floor
+
+    snapshot = {
+        "bids": [["30000.0", "50.0"], ["29990.0", "0.1"]],
+        "asks": [["30010.0", "0.1"]],
+    }
+    asyncio.run(detector._process_snapshot(snapshot))
+
+    assert hub.broadcast.call_count == 1
+    payload = hub.broadcast.call_args[0][0]
+    assert payload["type"]  == "event"
+    assert payload["event"] == "absorption"
+    assert payload["price"] == pytest.approx(30000.0)
+    assert payload["side"]  == "bid"
+    assert "ts" in payload
+    assert payload["reload_ratio"] == pytest.approx(1.0)
+
+
+def test_absorption_does_not_re_emit_on_subsequent_tick():
+    """Once a wall is armed, repeated detections must not broadcast again."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    hub = MagicMock()
+    hub.broadcast = AsyncMock()
+    detector = _make_detector(hub=hub)
+    detector._cvd.get_cvd_delta = MagicMock(return_value=-1.0)
+
+    now = int(time.time() * 1000)
+    wall = WallState(
+        price=30000.0, qty_initial=50.0, qty_current=50.0,
+        first_seen_ts=now - 600, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    detector._wall_states[30000.0] = wall
+    detector._absorption_armed[30000.0] = True  # already armed from a prior tick
+
+    snapshot = {
+        "bids": [["30000.0", "50.0"], ["29990.0", "0.1"]],
+        "asks": [["30010.0", "0.1"]],
+    }
+    asyncio.run(detector._process_snapshot(snapshot))
+    assert hub.broadcast.call_count == 0
+
+
+def test_sweep_emits_hub_event_alongside_signal_queue():
+    """Sweep+protection firing broadcasts a typed sweep payload to the hub."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    hub = MagicMock()
+    hub.broadcast = AsyncMock()
+    detector = _make_detector(hub=hub)
+    detector._cvd.get_cvd_delta = MagicMock(return_value=2.0)
+    detector._cvd.get_cvd_tick_std = MagicMock(return_value=0.5)
+    detector._cvd.is_warmed_up = True
+
+    now = int(time.time() * 1000)
+    # Consumed ask wall (reload_ratio = 0.1 < 0.15) → LONG sweep
+    detector._wall_states[30050.0] = WallState(
+        price=30050.0, qty_initial=20.0, qty_current=2.0,
+        first_seen_ts=now - 5_000, last_seen_ts=now,
+        side="ask", sigma=3.0,
+    )
+    # Fresh bid wall behind (first_seen within LOB_FRESH_WALL_MS)
+    detector._wall_states[29950.0] = WallState(
+        price=29950.0, qty_initial=10.0, qty_current=10.0,
+        first_seen_ts=now - 100, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    detector._prev_mid = 29950.0  # mid jumps to ~30000 → +16.7 bps move (above 3 bps floor)
+
+    snapshot = {
+        "bids": [["29950.0", "10.0"], ["29940.0", "0.1"]],
+        "asks": [["30050.0", "2.0"], ["30060.0", "0.1"]],
+    }
+    asyncio.run(detector._process_snapshot(snapshot))
+
+    # Sweep should have fired: signal on queue + hub event broadcast
+    assert not detector._signal_queue.empty()
+    sweep_calls = [c for c in hub.broadcast.call_args_list
+                   if c.args[0].get("event") == "sweep"]
+    assert len(sweep_calls) == 1
+    payload = sweep_calls[0].args[0]
+    assert payload["type"]      == "event"
+    assert payload["side"]      == "ask"
+    assert payload["direction"] == "LONG"
+    assert payload["price"]     == pytest.approx(30050.0)
+    assert payload["price_move_pct"] > 0
+
+
+def test_no_hub_no_emission_no_crash():
+    """Detector must run normally when hub is None (the default)."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    detector = _make_detector(hub=None)
+    detector._cvd.get_cvd_delta = MagicMock(return_value=-1.0)
+
+    now = int(time.time() * 1000)
+    detector._wall_states[30000.0] = WallState(
+        price=30000.0, qty_initial=50.0, qty_current=50.0,
+        first_seen_ts=now - 600, last_seen_ts=now,
+        side="bid", sigma=3.0,
+    )
+    snapshot = {
+        "bids": [["30000.0", "50.0"], ["29990.0", "0.1"]],
+        "asks": [["30010.0", "0.1"]],
+    }
+    # Just confirm it doesn't raise — no hub means no broadcast attempt
+    asyncio.run(detector._process_snapshot(snapshot))
+
+
+def _make_detector(feature_computer=None, hub=None):
     import asyncio
     from strategy.microstructure import MicrostructureDetector
     from unittest.mock import MagicMock
@@ -317,4 +450,5 @@ def _make_detector(feature_computer=None):
         signal_queue=asyncio.Queue(),
         cvd_calculator=cvd,
         feature_computer=feature_computer,
+        hub=hub,
     )

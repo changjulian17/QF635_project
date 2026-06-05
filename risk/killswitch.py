@@ -28,6 +28,12 @@ class GlobalKillswitch:
         self._slippage_buf: deque[float] = deque(maxlen=_SLIPPAGE_WINDOW)
         self._consec_critical: int = 0
 
+    def update_dov(self, new_equity: float, hard_limit_pct: float = 0.01) -> None:
+        """Rebase KS-1 hard loss limit to actual opening equity (call post-reconcile)."""
+        if new_equity <= 0:
+            return
+        self._hard_limit = new_equity * hard_limit_pct
+
     # ── Public checks ─────────────────────────────────────────────────────────
 
     def check_budget(self, realised_pnl: float, unrealised_pnl: float) -> bool:

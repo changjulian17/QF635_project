@@ -75,6 +75,7 @@ class CVDCalculator:
         self._cvd: float = 0.0
         self._history: deque[float] = deque(maxlen=history_len)
         self._delta_stats = WelfordOnline()
+        self._rolling_bins: deque[tuple[int, float]] = deque()  # (minute_start_ms, delta_sum)
 
     def update(self, trade: AggTrade) -> None:
         """Process one aggTrade and update CVD."""
@@ -82,10 +83,19 @@ class CVDCalculator:
         self._cvd += signed_qty
         self._history.append(self._cvd)
         self._delta_stats.update(signed_qty)
+        # Maintain 24h rolling window in minute buckets
+        bucket = (int(trade.timestamp.timestamp() * 1000) // 60_000) * 60_000
+        cutoff = bucket - 24 * 3600 * 1000
+        while self._rolling_bins and self._rolling_bins[0][0] < cutoff:
+            self._rolling_bins.popleft()
+        if self._rolling_bins and self._rolling_bins[-1][0] == bucket:
+            self._rolling_bins[-1] = (bucket, self._rolling_bins[-1][1] + signed_qty)
+        else:
+            self._rolling_bins.append((bucket, signed_qty))
 
     def get_cvd(self) -> float:
-        """Current cumulative volume delta."""
-        return self._cvd
+        """Net signed volume over the trailing 24 hours (minute-binned)."""
+        return sum(delta for _, delta in self._rolling_bins)
 
     def get_cvd_delta(self, ticks: int = 5) -> float:
         """CVD change over the last `ticks` ticks. Returns 0.0 if insufficient history."""
@@ -103,7 +113,8 @@ class CVDCalculator:
         return self._delta_stats.n >= 10
 
     def reset_daily(self) -> None:
-        """Reset CVD at UTC midnight. History and stats are also cleared."""
+        """Reset CVD state. Rolling bins, history, and stats are all cleared."""
         self._cvd = 0.0
         self._history.clear()
         self._delta_stats = WelfordOnline()
+        self._rolling_bins.clear()

@@ -62,15 +62,58 @@ def lob_tick_db() -> Generator[sqlite3.Connection, None, None]:
         conn.close()
 
 
-def fetch_agg_trades(since_ts_ms: int, limit: int = 20000) -> Union[list[dict], DBOffline]:
+def fetch_agg_trades(
+    since_ts_ms: int,
+    until_ts_ms: int | None = None,
+    limit: int | None = 20000,
+) -> Union[list[dict], DBOffline]:
+    if not os.path.exists(LOB_TICK_DB):
+        return []
+    with lob_tick_db() as conn:
+        try:
+            if until_ts_ms is not None and limit is None:
+                # Both time bounds provided — let the WHERE clause cap the set; no LIMIT needed.
+                rows = conn.execute(
+                    "SELECT ts_event, price, qty, is_buyer_maker FROM agg_trades "
+                    "WHERE ts_event >= ? AND ts_event <= ? ORDER BY ts_event ASC",
+                    (since_ts_ms, until_ts_ms),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            elif until_ts_ms is not None:
+                rows = conn.execute(
+                    "SELECT ts_event, price, qty, is_buyer_maker FROM agg_trades "
+                    "WHERE ts_event >= ? AND ts_event <= ? ORDER BY ts_event DESC LIMIT ?",
+                    (since_ts_ms, until_ts_ms, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ts_event, price, qty, is_buyer_maker FROM agg_trades "
+                    "WHERE ts_event >= ? ORDER BY ts_event DESC LIMIT ?",
+                    (since_ts_ms, limit if limit is not None else 20000),
+                ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] lob_tick offline: %s", e)
+            return DBOffline(str(e))
+    return [dict(r) for r in reversed(rows)]
+
+
+def fetch_cvd_series_24h(since_ms: int) -> Union[list[dict], DBOffline]:
+    """Per-second CVD delta from agg_trades, aggregated from since_ms to now."""
     if not os.path.exists(LOB_TICK_DB):
         return []
     with lob_tick_db() as conn:
         try:
             rows = conn.execute(
-                "SELECT ts_event, price, qty, is_buyer_maker FROM agg_trades "
-                "WHERE ts_event >= ? ORDER BY ts_event ASC LIMIT ?",
-                (since_ts_ms, limit),
+                """
+                SELECT
+                    (ts_event / 1000) * 1000  AS ts_sec_ms,
+                    SUM(CASE WHEN is_buyer_maker = 0 THEN qty ELSE -qty END) AS delta
+                FROM agg_trades
+                WHERE ts_event >= ?
+                GROUP BY ts_sec_ms
+                ORDER BY ts_sec_ms ASC
+                """,
+                (since_ms,),
             ).fetchall()
         except sqlite3.OperationalError as e:
             logger.warning("[DB] lob_tick offline: %s", e)

@@ -108,7 +108,7 @@ class SignalTelemetry:
             try:
                 record = await asyncio.wait_for(self._queue.get(), timeout=_FLUSH_INTERVAL)
                 self._buf.append(record)
-                if len(self._buf) >= _FLUSH_BATCH:
+                if len(self._buf) >= _FLUSH_BATCH or record.gate_passed == "APPROVED":
                     await self._flush()
             except asyncio.TimeoutError:
                 if self._buf:
