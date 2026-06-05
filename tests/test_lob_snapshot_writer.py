@@ -218,8 +218,9 @@ async def test_lob_snapshot_writer_broadcasts_when_hub_given():
     hub.broadcast.assert_awaited_once()
     payload = hub.broadcast.await_args[0][0]
     assert set(payload) == {
-        "ts", "mid_price", "spread", "obi", "cvd_delta", "bid_levels", "ask_levels"
+        "type", "ts", "mid_price", "spread", "obi", "cvd_delta", "bid_levels", "ask_levels"
     }
+    assert payload["type"]      == "snapshot"
     assert payload["cvd_delta"] == 2.5
     assert payload["bid_levels"][0] == [snapshot.bids[0].price, snapshot.bids[0].qty]
 

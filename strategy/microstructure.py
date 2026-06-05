@@ -237,6 +237,7 @@ class MicrostructureDetector:
         sigma_threshold: float = 2.5,
         window: int = 5,
         feature_computer=None,
+        hub=None,
     ) -> None:
         self._depth_queue  = depth_queue
         self._trade_queue  = trade_queue
@@ -245,6 +246,7 @@ class MicrostructureDetector:
         self._sigma        = sigma_threshold
         self._window       = window
         self._feature_computer = feature_computer
+        self._hub          = hub
 
         self._wall_states: dict[float, WallState] = {}
         self._absorption_armed: dict[float, bool] = {}  # keyed by wall price
@@ -340,8 +342,19 @@ class MicrostructureDetector:
         cvd_delta_3t     = self._cvd.get_cvd_delta(3)
         for ws in self._wall_states.values():
             if detect_absorption(ws, cvd_delta_3t, price_move_pct, ws.reload_ratio):
+                was_armed = self._absorption_armed.get(ws.price, False)
                 self._absorption_armed[ws.price] = True
                 self._absorption_batch[ws.price] = ws
+                if not was_armed and self._hub is not None:
+                    await self._hub.broadcast({
+                        "type":         "event",
+                        "event":        "absorption",
+                        "ts":           datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat(),
+                        "price":        ws.price,
+                        "side":         ws.side,
+                        "qty":          ws.qty_current,
+                        "reload_ratio": ws.reload_ratio,
+                    })
 
         if self._absorption_batch and now_ms - self._absorption_last_log_ms >= 1_000:
             batch      = list(self._absorption_batch.values())
@@ -395,6 +408,17 @@ class MicrostructureDetector:
                     mid_price        = mid,
                 )
                 await self._signal_queue.put(signal)
+                if self._hub is not None:
+                    await self._hub.broadcast({
+                        "type":           "event",
+                        "event":          "sweep",
+                        "ts":             datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat(),
+                        "price":          ws.price,
+                        "side":           ws.side,
+                        "direction":      info["direction"],
+                        "price_move_pct": price_move_pct,
+                        "cvd_spike_std":  cvd_spike_std,
+                    })
                 logger.info(
                     "[MS] Sweep+Protection %s mid=%.2f | consumed=%s@%.2f(%.3f) protection=%s@%.2f(%.3f) cvd=%.1fstd move=%+.3f%%",
                     info["direction"], mid,

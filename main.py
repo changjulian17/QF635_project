@@ -386,6 +386,11 @@ async def main() -> None:
             alert_dispatcher.notify_tier_change(old_tier, new_tier, budget.loss_pct)
         )
 
+    # Real-time broadcast hub — streams LOB snapshots and microstructure events
+    # to dashboard WS clients. Created early so producers (detector, snapshot
+    # writer, alerts) can be constructed with a hub reference.
+    realtime_hub = RealtimeHub()
+
     # Components ──────────────────────────────────────────────────────────────
     ws_consumer = BinanceWebSocketConsumer(
         candle_queue=candle_queue,
@@ -402,6 +407,7 @@ async def main() -> None:
         signal_queue=micro_signal_queue,
         cvd_calculator=cvd_calculator,
         feature_computer=feature_computer,
+        hub=realtime_hub,
     )
     telemetry = SignalTelemetry(telemetry_queue=telemetry_queue)
 
@@ -495,9 +501,6 @@ async def main() -> None:
 
     # 5. LOB warm-up guard ────────────────────────────────────────────────────
     await asyncio.sleep(0.5)
-
-    # Real-time broadcast hub — streams LOB snapshots to dashboard WS clients
-    realtime_hub = RealtimeHub()
 
     # 6. Start TaskGroup with all coroutines ──────────────────────────────────
     try:

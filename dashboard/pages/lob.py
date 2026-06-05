@@ -24,7 +24,7 @@ from plotly.subplots import make_subplots
 
 from config import settings
 from dashboard._db import fetch_lob_snapshots, fetch_agg_trades, fetch_cvd_series_24h, DBOffline
-from dashboard._logic import update_lob_buffer
+from dashboard._logic import add_event_markers, update_event_buffer, update_lob_buffer
 from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/lob", name="LOB")
@@ -39,6 +39,12 @@ _WS_URL = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/lob"
 # selectable window (60 min × 60 s) so the slider can widen without losing history.
 _MAX_BUFFER = 3600
 _BUFFER: list[dict] = []
+
+# Parallel buffer of microstructure events (absorption / sweep) — rendered as markers
+# on the heatmap row. Cap is independent of snapshot count: in heavy market activity
+# a single 60-min window could see hundreds of events.
+_MAX_EVENTS = 2000
+_EVENTS: list[dict] = []
 
 
 layout = html.Div([
@@ -105,11 +111,14 @@ layout = html.Div([
 ])
 
 
-def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pctile):
+def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pctile, events=None):
     """Build the 4-row LOB figure from a list of snapshot dicts (ascending by ts).
 
     Each snapshot: {ts, mid_price, spread, obi, cvd_delta, bid_levels, ask_levels}
     where *_levels are [[price, qty], ...] lists.
+
+    ``events``: optional list of {ts, event: "absorption"|"sweep", price, side, ...}.
+    Events whose ts falls inside the heatmap window are rendered as markers on row 1.
     """
     rows_needed = hm_minutes * 60
     df = pd.DataFrame(snaps)
@@ -285,6 +294,9 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
             fig.add_trace(go.Scatter(x=[], y=[], mode="markers",
                                      name=label, showlegend=False), row=1, col=1)
 
+    # ── Row 1 overlay: microstructure event markers ────────────────────────
+    add_event_markers(fig, events, ts_labels, hm_ts_snap if not hm_df.empty else None)
+
     fig.update_layout(
         height=860, template="plotly_dark",
         uirevision="lob-chart",
@@ -359,15 +371,19 @@ def refresh_buffer(_n_clicks):
     prevent_initial_call=True,
 )
 def on_ws_message(message):
-    """Append one pushed snapshot to the buffer; return its ts to trigger a redraw."""
-    global _BUFFER
+    """Route one pushed WS message to either snapshot or event buffer; return its ts."""
+    global _BUFFER, _EVENTS
     if not message or "data" not in message:
         return no_update
     try:
         msg = json.loads(message["data"])
     except (TypeError, ValueError):
         return no_update
-    _BUFFER = update_lob_buffer(_BUFFER, msg, _MAX_BUFFER)
+    msg_type = msg.get("type", "snapshot")
+    if msg_type == "event":
+        _EVENTS = update_event_buffer(_EVENTS, msg, _MAX_EVENTS)
+    else:
+        _BUFFER = update_lob_buffer(_BUFFER, msg, _MAX_BUFFER)
     return msg.get("ts", no_update)
 
 
@@ -382,7 +398,10 @@ def on_ws_message(message):
 def render_lob_chart(_tick, hm_minutes, half_range, contrast_pctile, trade_pctile):
     if not _BUFFER:
         return _empty_fig("Waiting for LOB data… (start the engine for the live stream)")
-    return _build_lob_figure(list(_BUFFER), hm_minutes, half_range, contrast_pctile, trade_pctile)
+    return _build_lob_figure(
+        list(_BUFFER), hm_minutes, half_range, contrast_pctile, trade_pctile,
+        events=list(_EVENTS),
+    )
 
 
 @callback(
