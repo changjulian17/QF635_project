@@ -1,14 +1,11 @@
-import asyncio
+from datetime import datetime, timezone
+
 import pytest
 
-from models import (
-    CircuitBreakerStatus,
-    Direction,
-    PatternSignal,
-    PatternType,
-    PortfolioState,
-)
-from engine.risk_engine import RiskEngine
+from models import CircuitBreakerStatus, PortfolioState
+from risk.budget import DailyBudget
+from risk.engine import RiskEngine
+from risk.killswitch import GlobalKillswitch
 
 
 def make_portfolio(**kwargs) -> PortfolioState:
@@ -16,117 +13,143 @@ def make_portfolio(**kwargs) -> PortfolioState:
     return PortfolioState(**{**defaults, **kwargs})
 
 
-def make_signal(confidence=0.8, entry=30_000.0, sl=29_700.0, tp=30_900.0) -> PatternSignal:
-    return PatternSignal(
-        pattern=PatternType.RESISTANCE_BREAKOUT,
-        direction=Direction.LONG,
-        confidence=confidence,
-        entry_price=entry,
-        stop_loss=sl,
-        take_profit=tp,
+def make_engine(
+    portfolio: PortfolioState | None = None,
+    budget: DailyBudget | None = None,
+    killswitch: GlobalKillswitch | None = None,
+    tier_change_cb=None,
+) -> RiskEngine:
+    pf = portfolio or make_portfolio()
+    return RiskEngine(
+        portfolio=pf,
+        budget=budget or DailyBudget.from_equity(pf.starting_equity),
+        killswitch=killswitch or GlobalKillswitch(pf.starting_equity),
+        tier_change_cb=tier_change_cb,
     )
 
 
-def make_engine(portfolio: PortfolioState) -> RiskEngine:
-    return RiskEngine(asyncio.Queue(), asyncio.Queue(), portfolio)
+def test_sync_tier_full_by_default():
+    engine = make_engine()
+
+    assert engine.sync_tier() == "FULL"
+    assert engine.portfolio.circuit_breaker == CircuitBreakerStatus.ACTIVE
 
 
-# --- Circuit breakers ---
-
-def test_circuit_breaker_active_by_default():
-    engine = make_engine(make_portfolio())
-    assert engine._check_circuit_breakers() == CircuitBreakerStatus.ACTIVE
-
-
-def test_circuit_breaker_halts_on_max_drawdown():
-    pf = make_portfolio(equity=9_000.0, peak_equity=10_000.0)  # 10% drawdown
-    engine = make_engine(pf)
-    assert engine._check_circuit_breakers() == CircuitBreakerStatus.HALTED
-
-
-def test_circuit_breaker_halts_on_daily_loss():
-    pf = make_portfolio(daily_pnl=-250.0)  # 2.5% daily loss > 2% limit
-    engine = make_engine(pf)
-    assert engine._check_circuit_breakers() == CircuitBreakerStatus.HALTED
-
-
-def test_circuit_breaker_pauses_on_consecutive_losses():
-    pf = make_portfolio(consecutive_losses=3)
-    engine = make_engine(pf)
-    assert engine._check_circuit_breakers() == CircuitBreakerStatus.PAUSED
-
-
-# --- Signal evaluation ---
-
-def test_evaluate_approves_valid_signal():
-    engine = make_engine(make_portfolio())
-    req = engine._evaluate(make_signal())
-    assert req.approved is True
-    assert req.quantity > 0
-
-
-def test_evaluate_rejects_low_confidence():
-    engine = make_engine(make_portfolio())
-    req = engine._evaluate(make_signal(confidence=0.3))
-    assert req.approved is False
-    assert "confidence" in req.rejection_reason.lower()
-
-
-def test_evaluate_rejects_when_max_positions_reached():
-    from models import Position
+def test_sync_tier_transitions_on_budget_loss():
     pf = make_portfolio()
-    pf.positions.append(
-        Position(symbol="BTCUSDT", side=Direction.LONG,
-                 entry_price=30_000.0, quantity=0.01,
-                 stop_loss=29_700.0, take_profit=30_900.0)
-    )
+    budget = DailyBudget.from_equity(pf.starting_equity)
+    budget.realised_pnl = -80.0
+    engine = make_engine(pf, budget)
+
+    assert engine.sync_tier() == "MINIMAL"
+    assert pf.circuit_breaker == CircuitBreakerStatus.ACTIVE
+
+
+def test_sync_tier_halts_on_budget_breach():
+    pf = make_portfolio()
+    budget = DailyBudget.from_equity(pf.starting_equity)
+    budget.realised_pnl = -120.0
+    engine = make_engine(pf, budget)
+
+    assert engine.sync_tier() == "HALTED"
+    assert pf.circuit_breaker == CircuitBreakerStatus.HALTED
+
+
+def test_sync_tier_invokes_transition_callback():
+    seen: list[tuple[str, str]] = []
+    pf = make_portfolio()
+    budget = DailyBudget.from_equity(pf.starting_equity)
+    engine = make_engine(pf, budget, tier_change_cb=lambda old, new: seen.append((old, new)))
+
+    budget.realised_pnl = -60.0
+    assert engine.sync_tier() == "REDUCED"
+    assert seen == [("FULL", "REDUCED")]
+
+
+def test_record_trade_result_updates_portfolio_and_budget():
+    pf = make_portfolio()
     engine = make_engine(pf)
-    req = engine._evaluate(make_signal())
-    assert req.approved is False
+
+    engine.record_trade_result(-100.0)
+
+    assert pf.equity == 9_900.0
+    assert pf.daily_pnl == -100.0
+    assert pf.consecutive_losses == 1
+    assert pf.num_trades == 1
+    assert abs(engine._budget.realised_pnl + 100.0) < 1e-9
 
 
-def test_evaluate_rejects_when_circuit_breaker_halted():
-    pf = make_portfolio(equity=9_000.0, peak_equity=10_000.0)
-    engine = make_engine(pf)
-    req = engine._evaluate(make_signal())
-    assert req.approved is False
-    assert "circuit breaker" in req.rejection_reason.lower()
-
-
-# --- Position sizing ---
-
-def test_position_sizing_normal():
-    engine = make_engine(make_portfolio())
-    sig = make_signal(entry=30_000.0, sl=29_700.0)  # $300 risk distance
-    qty = engine._size_position_vol_target(sig)
-    # risk_amount = 10000 * 0.01 = 100; raw_qty = 100/300 ≈ 0.333; kelly = 0.25 * 0.8 = 0.2; qty ≈ 0.0667
-    assert qty > 0
-
-
-def test_position_sizing_zero_sl_distance():
-    engine = make_engine(make_portfolio())
-    sig = make_signal(entry=30_000.0, sl=30_000.0)
-    assert engine._size_position_vol_target(sig) == 0.0
-
-
-# --- Trade result recording ---
-
-def test_record_win_resets_consecutive_losses():
+def test_record_trade_result_resets_consecutive_losses_on_win():
     pf = make_portfolio(consecutive_losses=2)
     engine = make_engine(pf)
-    engine.record_trade_result(200.0)
+
+    engine.record_trade_result(50.0)
+
+    assert pf.equity == 10_050.0
     assert pf.consecutive_losses == 0
+    assert pf.num_wins == 1
+    assert pf.num_trades == 1
 
 
-def test_record_loss_increments_consecutive_losses():
+def test_mark_unrealised_updates_budget_loss_pct():
     pf = make_portfolio()
     engine = make_engine(pf)
-    engine.record_trade_result(-100.0)
-    assert pf.consecutive_losses == 1
+
+    engine.mark_unrealised(-80.0)
+
+    assert abs(pf.budget_loss_pct - 0.008) < 1e-9
 
 
-def test_record_win_updates_peak_equity():
-    pf = make_portfolio(equity=10_000.0, peak_equity=10_000.0)
+def test_reset_for_new_session_clears_daily_state():
+    pf = make_portfolio(
+        daily_pnl=-100.0,
+        consecutive_losses=3,
+        num_trades=5,
+        num_wins=2,
+        num_fill_samples=4,
+        avg_slippage_bps=1.2,
+        budget_loss_pct=0.01,
+    )
     engine = make_engine(pf)
-    engine.record_trade_result(500.0)
-    assert pf.peak_equity == 10_500.0
+    engine._budget.realised_pnl = -100.0
+    engine._cooldown_until = datetime.now(timezone.utc)
+
+    engine.reset_for_new_session()
+
+    assert pf.daily_pnl == 0.0
+    assert pf.consecutive_losses == 0
+    assert pf.num_trades == 0
+    assert pf.num_wins == 0
+    assert pf.num_fill_samples == 0
+    assert pf.avg_slippage_bps == 0.0
+    assert pf.budget_loss_pct == 0.0
+    assert pf.circuit_breaker == CircuitBreakerStatus.ACTIVE
+    assert engine.tier == "FULL"
+    assert engine._budget.realised_pnl == 0.0
+
+
+
+# ── GlobalKillswitch.update_dov ───────────────────────────────────────────────
+
+def test_killswitch_update_dov_changes_hard_limit():
+    ks = GlobalKillswitch(dov=10_000.0)        # _hard_limit = 100.0
+    ks.update_dov(1_000_000.0)                 # _hard_limit = 10_000.0
+    assert ks._hard_limit == pytest.approx(10_000.0)
+
+
+def test_killswitch_update_dov_ignores_nonpositive():
+    ks = GlobalKillswitch(dov=10_000.0)
+    original = ks._hard_limit
+    ks.update_dov(0.0)
+    assert ks._hard_limit == pytest.approx(original)
+
+
+# ── DailyBudget.rebase ────────────────────────────────────────────────────────
+
+def test_budget_rebase_updates_equity_preserves_pnl():
+    b = DailyBudget.from_equity(10_000.0)
+    b.realised_pnl = -50.0                     # simulate a loss already recorded
+    b.rebase(1_000_000.0)
+    assert b.dov          == pytest.approx(1_000_000.0)
+    assert b.hard_limit   == pytest.approx(10_000.0)
+    assert b.realised_pnl == pytest.approx(-50.0)  # PnL must survive rebase

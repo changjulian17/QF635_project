@@ -7,8 +7,7 @@ import pytest
 import engine.db_writer as db_mod
 from engine.db_writer import DBWriter
 from models import (
-    Candle, CircuitBreakerStatus, Direction, LOBLevel, MicrostructureBar,
-    PatternSignal, PatternType, PortfolioState,
+    Candle, MicrostructureBar, PortfolioState,
 )
 
 
@@ -50,25 +49,13 @@ def make_ms_bar(**kw) -> MicrostructureBar:
     return MicrostructureBar(**{**defaults, **kw})
 
 
-def make_signal(**kw) -> PatternSignal:
-    defaults = dict(
-        pattern=PatternType.RESISTANCE_BREAKOUT,
-        direction=Direction.LONG,
-        confidence=0.75,
-        entry_price=80050.0,
-        stop_loss=79700.0,
-        take_profit=80950.0,
-    )
-    return PatternSignal(**{**defaults, **kw})
-
-
 # ── init_db ───────────────────────────────────────────────────────────────────
 
 def test_init_db_creates_all_tables(temp_db):
     conn = sqlite3.connect(temp_db)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     conn.close()
-    assert {"candles", "signals", "portfolio"} <= tables
+    assert {"candles", "portfolio", "microstructure_bars", "lob_snapshots"} <= tables
 
 
 def test_init_db_is_idempotent(temp_db):
@@ -100,27 +87,6 @@ def test_write_candle_upserts_on_duplicate_time(temp_db):
     assert close == 81000.0
 
 
-# ── _write_signal ─────────────────────────────────────────────────────────────
-
-def test_write_signal_persists(temp_db):
-    DBWriter._write_signal(make_signal())
-    conn = sqlite3.connect(temp_db)
-    row = conn.execute(
-        "SELECT pattern, direction, confidence, entry_price FROM signals"
-    ).fetchone()
-    conn.close()
-    assert row == ("RESISTANCE_BREAKOUT", "LONG", 0.75, 80050.0)
-
-
-def test_write_multiple_signals(temp_db):
-    DBWriter._write_signal(make_signal())
-    DBWriter._write_signal(make_signal(pattern=PatternType.SUPPORT_BREAKOUT, direction=Direction.SHORT))
-    conn = sqlite3.connect(temp_db)
-    count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-    conn.close()
-    assert count == 2
-
-
 # ── _write_portfolio ──────────────────────────────────────────────────────────
 
 def test_write_portfolio_persists(temp_db):
@@ -137,7 +103,7 @@ def test_write_portfolio_persists(temp_db):
 # ── _purge_old_records ────────────────────────────────────────────────────────
 
 def test_purge_removes_old_candles(temp_db, monkeypatch):
-    writer = DBWriter(None, None, make_portfolio(), None)
+    writer = DBWriter(None, make_portfolio(), None)
     monkeypatch.setattr(writer, "RETENTION_DAYS", 7)
 
     old_time = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
@@ -156,19 +122,6 @@ def test_purge_removes_old_candles(temp_db, monkeypatch):
     conn.close()
     assert len(rows) == 1
     assert recent_time in rows[0][0]
-
-
-def test_purge_keeps_recent_signals(temp_db, monkeypatch):
-    writer = DBWriter(None, None, make_portfolio(), None)
-    monkeypatch.setattr(writer, "RETENTION_DAYS", 7)
-
-    DBWriter._write_signal(make_signal())
-    writer._purge_old_records()
-
-    conn = sqlite3.connect(temp_db)
-    count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-    conn.close()
-    assert count == 1
 
 
 # ── _write_ms_bar ─────────────────────────────────────────────────────────────

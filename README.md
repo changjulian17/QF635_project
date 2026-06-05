@@ -36,9 +36,9 @@ SECONDARY FILTER — OBI Sentiment Alignment
   Strong OBI disagreement → reject (deceptive sweep)
            │
            ▼
-OPTIONAL BOOST — Chart Pattern Context (OHLCV)
-  Pattern present at Wall level → +0.10–0.15 to XGBoost score
-  Pattern absent → signal still valid
+OPTIONAL BOOST — Chart Pattern Context (OHLCV) [not active in live path]
+  pattern_r2 defaults to 0.0 — core/pattern_detector.py is not in the live codebase
+  Pattern absent → signal still valid without boost
            │
            ▼
 FILTER — Confidence Scorer
@@ -57,80 +57,127 @@ FILTER — Confidence Scorer
 CryptoSentinel/
 │
 ├── main.py                    # Async orchestrator — all coroutines
-├── backtest.py                # CLI backtest runner (both paths)
+├── backtest.py                # CLI backtest runner — VectorBT + Optuna two-phase pipeline
 ├── config.py                  # Pydantic V2 settings from .env
 ├── models.py                  # Shared dataclasses and enums
 ├── requirements.txt
-├── .env.example
 │
 ├── core/                      # Real-time data processing
 │   ├── ws_consumer.py         # WebSocket consumer + HeartbeatMonitor
 │   ├── lob_recorder.py        # Always-on LOB data collector (real Binance public stream)
 │   ├── lob_engine.py          # Local Order Book + full state machine
 │   ├── cvd.py                 # Standalone CVD calculator
-│   ├── pattern_detector.py    # OHLCV chart pattern detection (context/boost)
 │   ├── signal_telemetry.py    # Signal record writer (all gates, pass + fail)
-│   └── startup_reconciler.py  # Exchange state reconciliation on startup
+│   ├── startup_reconciler.py  # Exchange state reconciliation on startup + midnight reset
+│   └── alerting.py            # AlertDispatcher — optional webhook notifications
 │
 ├── strategy/                  # Alpha generation and execution
 │   ├── features.py            # FeatureComputer + WelfordOnline (single source of truth)
 │   ├── microstructure.py      # Wall Identification / Absorption / Sweep + Fresh Wall
-│   └── executor.py            # StrategyExecutor — 7-Gate pipeline + confidence scorer
+│   ├── executor.py            # StrategyExecutor — 7-Gate pipeline + confidence scorer
+│   ├── spec.py                # StrategySpec — immutable YAML-backed strategy descriptor
+│   ├── scorer.py              # XGBoostScorer + ScorerFactory (ML confidence gate, Gate 2)
+│   ├── registry.py            # StrategyRegistry — dual-store lifecycle (YAML + SQLite)
+│   └── builder.py             # StrategyBuilder — 3-stage pipeline: validate → register
 │
 ├── risk/                      # Risk management
 │   ├── engine.py              # RiskEngine — 5-tier throttling, DOV, circuit breakers
-│   ├── budget.py              # DailyBudget — shared pool for all pyramid legs
-│   ├── pyramid.py             # PyramidController — 3-leg scaling
+│   ├── budget.py              # DailyBudget — shared pool for all open positions
 │   └── killswitch.py          # GlobalKillswitch — Budget / Heartbeat / Slippage triggers
 │
 ├── execution/                 # Order management
-│   └── order_manager.py       # IOC aggressive limit orders + OCO brackets
+│   ├── order_manager.py       # IOC aggressive limit orders + OCO brackets
+│   └── orders.py              # Order domain classes and enums
 │
-├── backtesting/               # Offline strategy research (Phase 2)
-│   ├── tick_backtester.py     # Path A: replay lob_tick.db
-│   ├── walk_forward.py        # Path B: OHLCV walk-forward
-│   └── metrics.py             # Sharpe, Sortino, Calmar, MDD, PF, WR
+├── backtesting/               # Offline strategy research
+│   ├── tick_replay.py         # Path A: event-driven replay of lob_tick.db through live stack
+│   ├── event_engine.py        # Path A: tick-level event replay engine
+│   ├── signals.py             # Signal generation for backtesting
+│   ├── walk_forward.py        # Path B: OHLCV walk-forward (VectorBT + Optuna)
+│   ├── vectorbt_runner.py     # VectorBT execution wrapper
+│   ├── metrics.py             # Sharpe, Sortino, Calmar, MDD, PF, WR
+│   └── costs.py               # Transaction cost model
 │
-├── data/                      # Data acquisition (Phase 2)
+├── data/                      # Data acquisition and storage
 │   ├── fetcher.py             # OHLCVFetcher (CCXT + SQLite cache)
-│   └── validator.py           # 9-check data quality validator
+│   ├── validator.py           # 9-check data quality validator
+│   ├── lob_tick.db            # LOB Recorder output (real Binance data — live-writing)
+│   ├── ohlcv_cache.db         # OHLCV SQLite cache (generated — pending Paper Trading step 2)
+│   └── backtest_results.db    # Walk-forward results storage (generated — pending Paper Trading step 3)
 │
-├── dashboard/                 # Dash application — all pages (Phase 3)
-│   ├── app.py                 # Main Dash app + routing
+├── dashboard/                 # Dash multi-page application (Phase 3)
+│   ├── app.py                 # Entry point — dark theme, nav, engine status badge
+│   ├── _db.py                 # WAL-mode SQLite helpers shared by all pages
+│   ├── _logic.py              # Shared business logic for dashboard pages
+│   ├── _utils.py              # Shared Plotly utilities (empty_fig)
 │   └── pages/
-│       ├── live.py            # /live — Trading monitor + kill switch
-│       ├── lob.py             # /lob  — LOB heatmap + CVD + OBI gauge
-│       ├── backtest.py        # /backtest — Research + leaderboard
-│       ├── registry.py        # /registry — Strategy lifecycle
-│       └── config.py          # /config — System settings + emergency stop
+│       ├── live.py            # /live     — Portfolio metrics, signal funnel, kill switch
+│       ├── lob.py             # /lob      — LOB heatmap + CVD + OBI + spread subplots
+│       ├── walls.py           # /walls    — 1s candlestick + rolling VWAP + liquidity wall heatmap
+│       ├── backtest.py        # /backtest — Strategy leaderboard from backtest results
+│       ├── registry.py        # /registry — Strategy lifecycle, decay monitoring, LIVE promotion
+│       └── config.py          # /config   — Settings reference, emergency stop, event log
 │
 ├── strategies/                # Strategy artifacts
 │   ├── registry.db            # SQLite: signal_records + system events
-│   └── configs/               # Frozen YAML strategy specs
+│   └── {name}_v{version}.yaml # Frozen YAML strategy specs (written directly to strategies/ by StrategyRegistry)
 │
-├── data/
-│   ├── lob_tick.db            # LOB Recorder output (real Binance data)
-│   ├── ohlcv_cache.db         # OHLCV SQLite cache (CCXT)
-│   └── backtest_results.db    # Backtest results storage
+├── engine/                    # Legacy shim directory + real-time hub
+│   ├── db_writer.py           # SQLite persistence + rolling cleanup + lob_snapshots table
+│   ├── lob_snapshot_writer.py # LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
+│   ├── realtime_hub.py        # RealtimeHub — fan-out JSON pushes to /ws/lob WebSocket clients
+│   ├── microstructure_engine.py # Legacy MicrostructureEngine (NOT started in live path; used by backtesting tests only)
+│   ├── websocket_consumer.py  # Shim re-exporting core.ws_consumer
+│   ├── lob_engine.py          # Shim re-exporting core.lob_engine
+│   ├── risk_engine.py         # Shim re-exporting risk.engine
+│   └── order_manager.py       # Shim re-exporting execution.order_manager
 │
 ├── scripts/
 │   ├── test_connection.py     # Connectivity + auth check
-│   └── test_orders.py         # BUY + SELL round-trip test
+│   ├── test_orders.py         # BUY + SELL round-trip test
+│   ├── run_backtest.py        # CLI for tick-level walk-forward backtest (writes to backtest_results.db)
+│   └── signal_injector.py     # Synthetic signal injection — dev/testnet only (start_test.sh)
 │
-├── tests/                     # pytest unit + integration tests
+├── tests/                     # pytest unit + integration tests (451 total)
+│   │                          # Phase 1 — live trading engine
 │   ├── test_models.py
 │   ├── test_lob_engine.py
+│   ├── test_lob_recorder.py
+│   ├── test_ws_consumer.py
 │   ├── test_microstructure.py
+│   ├── test_microstructure_engine.py
 │   ├── test_features.py
 │   ├── test_executor.py
 │   ├── test_cvd.py
 │   ├── test_signal_telemetry.py
 │   ├── test_db_writer.py
-│   ├── test_pattern_detector.py
+│   ├── test_order_manager.py
+│   ├── test_orders.py
 │   ├── test_risk_engine.py
-│   └── test_integration.py
+│   ├── test_startup_reconciler.py
+│   ├── test_integration.py
+│   │                          # Phase 2 — backtesting + strategy lifecycle
+│   ├── test_bt_costs.py
+│   ├── test_bt_event_engine.py
+│   ├── test_bt_metrics.py
+│   ├── test_bt_signals.py
+│   ├── test_bt_tick_replay.py
+│   ├── test_bt_vectorbt.py
+│   ├── test_bt_walk_forward.py
+│   ├── test_fetcher.py
+│   ├── test_registry.py
+│   ├── test_scorer.py
+│   ├── test_validator.py
+│   │                          # Phase 3 — dashboard + REST API + LOB snapshot writer
+│   ├── test_alerting.py
+│   ├── test_dashboard_live.py
+│   ├── test_dashboard_lob.py
+│   ├── test_dashboard_registry.py
+│   ├── test_dashboard_walls.py
+│   ├── test_lob_snapshot_writer.py
+│   ├── test_realtime_hub.py
+│   └── test_rest_api.py
 │
-└── dashboard.py               # Streamlit dashboard (legacy — active during Phase 1)
 ```
 
 ---
@@ -139,26 +186,31 @@ CryptoSentinel/
 
 ### Stream Selection
 
+The LOB Recorder subscribes to `btcusdt@depth@100ms` — the **incremental diff-depth stream** — and maintains a full local order book seeded from a REST `depth?limit=1000` snapshot on each connect. Buffered diffs received during the REST fetch are merged in sequence-ID order before the book is declared SYNCED. The top 100 levels per side are retained (`_DEPTH_LEVELS = 100`) and aggregated into $25 USD price buckets (`_BUCKET_WIDTH = 25.0`) before writing to `lob_tick.db`. At BTC prices (~$77k), 100 levels span ~$50–200 from mid — sufficient range to detect deep-book institutional walls above the transaction cost floor (~$115 at 30bps round-trip).
+
 | Stream | Purpose | Update Rate |
 |--------|---------|-------------|
 | `btcusdt@aggTrade` | CVD · aggressive volume | Per taker sweep |
-| `btcusdt@depth20@100ms` | Wall detection · OBI · spread | 100ms |
-| `btcusdt@bookTicker` | Best bid/ask for spread calc | Real-time |
-| `btcusdt@kline_5m` | OHLCV candles for patterns | On close (5m) |
+| `btcusdt@depth@100ms` | Wall detection · OBI · spread — incremental diff, 100 levels; LOB Recorder aggregates to $25 buckets before writing to `lob_tick.db` (live engine processes raw levels) | 100ms |
+| `btcusdt@bookTicker` | Heartbeat tracking only; raw dict routed to `trade_queue` but discarded by `MicrostructureDetector._collect_trades()` — spread is computed from the reconstructed depth snapshot | Real-time |
+| `btcusdt@kline_5m` | OHLCV candles for FeatureComputer (VWAP, ATR, RSI, volume) | On close (5m) |
 
 ### Async Queue Architecture
 
 ```
-Queue               Producer                   Consumer              maxsize
-──────────────────────────────────────────────────────────────────────────
-raw_tick_queue      WS Consumer (testnet)      CVD Calculator        2,000
-depth_queue         WS Consumer (testnet)      LOB Engine            500
-candle_queue        WS Consumer (testnet)      PatternDetector       200
-micro_signal_queue  MicrostructureDetector     StrategyExecutor      100
-signal_queue        StrategyExecutor           Risk Engine           100
-order_queue         Risk Engine                Order Manager         50
-fill_queue          Order Manager              Portfolio State       200
-telemetry_queue     StrategyExecutor           SignalTelemetry       500
+Queue               Producer                   Consumer                   maxsize
+──────────────────────────────────────────────────────────────────────────────────
+trade_queue         WS Consumer (testnet)      MicrostructureDetector     5,000
+raw_depth_queue     WS Consumer (testnet)      _depth_fanout              5,000
+lob_depth_queue     _depth_fanout              LocalOrderBook             5,000
+ms_depth_queue      _depth_fanout              MicrostructureDetector     5,000
+candle_queue        WS Consumer (testnet)      FeatureComputer            200
+candle_db_queue     WS Consumer (testnet)      DBWriter                   200
+micro_signal_queue  MicrostructureDetector     StrategyExecutor           100
+om_queue            StrategyExecutor           OrderManager               50
+fill_queue          OrderManager               fill_processor             200
+telemetry_queue     StrategyExecutor           SignalTelemetry            500
+ms_bar_queue        [no active producer]       DBWriter (loop blocks; no data)  5,000   ← no producer in live path; DBWriter consumer registered but never receives
 ```
 
 ---
@@ -169,12 +221,12 @@ Every potential trade passes through seven sequential gates. Failure at any gate
 
 | Gate | Name | Pass Condition | Rejection Code |
 |------|------|----------------|----------------|
-| **Gate 0** | Data Fidelity | `lob_status == SYNCED` AND `heartbeat != CRITICAL` | `GATE_0_FAIL: LOB_STALE` or `GATE_0_FAIL: HEARTBEAT_CRITICAL` |
+| **Gate 0** | Data Fidelity | `lob_status == SYNCED` AND `heartbeat` not in `(CRITICAL, SUSTAINED_DEGRADED)` | `GATE_0_FAIL: LOB_STALE` or `GATE_0_FAIL: HEARTBEAT_CRITICAL` or `GATE_0_FAIL: HEARTBEAT_SUSTAINED_DEGRADED` |
 | **Gate 1** | Microstructure Trigger | Sweep + Fresh Wall confirmed | `GATE_1_FAIL: NO_SWEEP_SIGNAL` |
 | **Gate 2** | Confidence Score | `confidence >= 0.58` | `GATE_2_FAIL: LOW_CONFIDENCE 0.47 < 0.58` |
-| **Gate 3** | Capital Gate | `remaining_budget > 0` AND `tier != HALTED` | `GATE_3_FAIL: BUDGET_EXHAUSTED` |
-| **Gate 4** | Order Selection | `spread_bps <= spread_p95 × 2` | `GATE_4_FAIL: SPREAD_TOO_WIDE` |
-| **Gate 5** | Execution Sync | `signal_age < 200ms` AND `last_delta < 200ms` | `GATE_5_FAIL: SIGNAL_STALE` |
+| **Gate 3** | Capital Gate | `remaining_budget > 0` AND `tier not in (HALTED, PASSIVE)` AND `no active exposure` | `GATE_3_FAIL: BUDGET_EXHAUSTED` or `GATE_3_FAIL: RISK_TIER_{tier}` or `GATE_3_FAIL: ACTIVE_EXPOSURE` |
+| **Gate 4** | Order Selection | `spread_bps <= EntryRules.spread_max_bps` (8.0 bps hard cap) AND `spread_bps <= spread_p95 × 2` | `GATE_4_FAIL: SPREAD_TOO_WIDE` |
+| **Gate 5** | Execution Sync | `signal_age < 200ms` AND `last_delta < HEARTBEAT_CRITICAL_MS` (500ms) | `GATE_5_FAIL: SIGNAL_STALE` |
 | **Gate 6** | Persistence Monitor | Protection Wall still present (post-entry) | `GATE_6_ALERT: PROTECTION_WALL_REMOVED` |
 
 Gate 6 is the only post-entry gate. It runs as an async task after fill confirmation and triggers early exit if the protection wall is cancelled.
@@ -186,17 +238,19 @@ Gate 6 is the only post-entry gate. It runs as an async task after fill confirma
 ### LOB Engine — State Machine (`core/lob_engine.py`)
 
 ```
-UNINITIALISED → SNAPSHOT_PENDING → BUFFERING → SYNCED
-                                                  │
-                                            GAP_DETECTED → REINITIALISING → SNAPSHOT_PENDING
+UNINITIALISED → SYNCED
+                  │
+            GAP_DETECTED → SYNCED (after re-seed)
+                  │
+            DISCONNECTED (set externally by HeartbeatMonitor on KS-2)
 ```
 
-Gap severity tiering:
-| Gap Duration | Action |
+Gap severity tiering (keyed on update ID regression count, not time):
+| Update ID Gap | Action |
 |---|---|
-| < 500ms | CONTINUE — attempt re-sync |
-| 500ms – 5s | HALT_ENTRIES — no new entries, keep open positions |
-| > 5s | CLOSE_REVIEW — log warning, consider closing |
+| < 500 | CONTINUE — minor drift, keep running |
+| 500 – 4,999 | HALT_ENTRIES — pause new entries, keep open positions |
+| ≥ 5,000 | CLOSE_REVIEW — evaluate open positions, consider closing |
 
 ### LOB Recorder (`core/lob_recorder.py`)
 
@@ -204,13 +258,14 @@ Connects to `wss://stream.binance.com` (real Binance public stream — no API ke
 
 ### HeartbeatMonitor (`core/ws_consumer.py`)
 
-Tracks `(local_time − Binance event time E)` on every WebSocket message:
+Tracks `(local_time − Binance event time E)` on every WebSocket message. Status is computed over a rolling 10-message window (rate-based), not per-packet:
 
-| Status | Delta | Action |
-|--------|-------|--------|
-| HEALTHY | < 200ms | Normal trading |
-| DEGRADED | 200–500ms | Log warning (normal on testnet) |
-| CRITICAL | > 500ms × 3 consecutive | Killswitch condition — CLOSE_ALL |
+| Status | Condition | Action |
+|--------|-----------|--------|
+| HEALTHY | < 30% of 10-msg window exceeds WARN_MS | Normal trading |
+| DEGRADED | ≥ 50% of 10-msg window exceeds WARN_MS | Log warning (one log on entry) |
+| SUSTAINED_DEGRADED | DEGRADED for ≥ HEARTBEAT_SUSTAINED_MS (10 s) at ≥ 50% rate | Log sustained warning |
+| CRITICAL | CONSEC_LIMIT (3) consecutive packets > CRITICAL_MS (500ms) | Killswitch condition — CLOSE_ALL |
 
 ### FeatureComputer (`strategy/features.py`)
 
@@ -242,7 +297,7 @@ Single class used identically in live trading and backtesting. Uses Welford onli
 
 **Absorption:** Wall persistent ≥500ms, aggressive flow hitting it, price held (<0.03% move), Wall reloaded to ≥70% of original qty → arms the system, no trade.
 
-**Sweep + Fresh Wall:** Wall consumed (<15% original qty), price moved >0.03%, CVD spike >1.5σ, fresh Wall appeared on far side within 3s → fires the trade.
+**Sweep + Fresh Wall:** Wall consumed (<15% original qty), price moved beyond adaptive threshold (floor: 0.03%), fresh Wall appeared on far side within 3s → fires the trade. CVD spike is measured and recorded in signal telemetry (`cvd_std` field) but is not a hard gate condition in `detect_sweep_with_protection()`.
 
 ### Risk Engine (`risk/engine.py`)
 
@@ -260,16 +315,17 @@ Single class used identically in live trading and backtesting. Uses Welford onli
 
 **Position Sizing:**
 ```
-risk_amount  = min(equity × 1%, remaining_budget × 60%, DOV × 0.4%)
-base_qty     = risk_amount / sl_distance
-final_qty    = base_qty × (KELLY_FRACTION × confidence) × tier_scalar
+notional_hint = confidence × KELLY_FRACTION × RISK_PER_TRADE_PCT × tier_scalar
+sl_distance   = signal_price × min(protection_wall_bps, PROTECTION_MAX_DISTANCE_BPS) / 10,000
+qty           = floor((equity × notional_hint / sl_distance) / QTY_STEP_SIZE) × QTY_STEP_SIZE
 ```
+`notional_hint` is computed in `StrategyExecutor` (Gate 2). Final qty is computed in `OrderManager._place_entry`.
 
 **Circuit Breakers:**
 ```
 Trigger 1: daily_loss ≥ 1% of DOV          → HALTED
 Trigger 2: drawdown ≥ 5% from peak          → HALTED
-Trigger 3: 3 consecutive losses              → PAUSED (15 min cooldown)
+Trigger 3: 3 consecutive losses              → PAUSED (5 min cooldown)
 Trigger 4: daily_loss ≥ 0.5%                → Tier REDUCED
 Trigger 5: daily_loss ≥ 0.75%               → Tier MINIMAL
 ```
@@ -282,7 +338,7 @@ Hard override that bypasses all other logic. Once fired, requires system restart
 |---------|-----------|
 | **KS-1 Budget Breach** | `(realised_pnl + unrealised_pnl) < −(DOV × 1%)` |
 | **KS-2 Heartbeat Loss** | `heartbeat_status == CRITICAL` (>500ms × 3 packets) |
-| **KS-3 Slippage Decay** | Rolling 5-trade avg slippage > `research_bps × 1.5` |
+| **KS-3 Slippage Decay** | Rolling 20-trade avg slippage > `research_bps × 1.5` |
 
 ### Order Manager (`execution/order_manager.py`)
 
@@ -305,6 +361,8 @@ Every signal evaluation — whether it passes all gates or is rejected at Gate 0
 
 ## Quick Start
 
+Requires **Python 3.13+**.
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -316,20 +374,69 @@ BINANCE_API_KEY=your_testnet_key
 BINANCE_API_SECRET=your_testnet_secret
 ```
 
+### Starting the system
+
+```bash
+./start.sh
+```
+
+`start.sh` runs three pre-flight checks before launching:
+
+1. `.env` file present
+2. `.venv` activated
+3. Connectivity test (`scripts/test_connection.py`) passes
+
+If all checks pass, it opens three separate Terminal windows — one for each component:
+
+| Window | Command | Notes |
+|--------|---------|-------|
+| LOB Recorder | `python -m core.lob_recorder` | Real Binance public stream, no API key needed |
+| Trading Engine | `python main.py` | Requires testnet credentials in `.env` |
+| Dash Dashboard | `python dashboard/app.py` | UI at http://127.0.0.1:8050 |
+
+### Stopping the system
+
+```bash
+./stop.sh
+```
+
+Sends SIGTERM to each process, waits up to 5 seconds, then SIGKILL if still running. Closes the three Terminal windows afterwards.
+
+### Testnet execution test (signal injection)
+
+To validate the full execution pipeline with synthetic signals against the Binance testnet:
+
+```bash
+./start_test.sh
+```
+
+Sets `DRY_RUN=false`, `MIN_CONFIDENCE=0.1`, `TEST_SIGNAL_INJECT=true`. After ~45 s LOB warmup, synthetic LONG/SHORT `SWEEP_WITH_PROTECTION` signals are injected every 30 s. Monitor:
+
+```bash
+tail -f logs/cryptosentinel.log | grep -E '\[Injector\]|\[Gate[0-6]\]|\[Executor\]'
+```
+
+> Not for paper trading, backtesting, or production — testnet orders only.
+
+### Manual startup (alternative)
+
 ```bash
 # Verify connectivity and auth
 python scripts/test_connection.py
 
-# Start LOB Recorder (terminal 1 — collects real Binance tick data)
+# Terminal 1 — LOB Recorder
 python -m core.lob_recorder
 
-# Start trading engine (terminal 2)
+# Terminal 2 — Trading engine
 python main.py
 
-# Start Streamlit dashboard (terminal 3 — active during Phase 1)
-streamlit run dashboard.py        # → http://localhost:8501
+# Terminal 3 — Dash dashboard
+python dashboard/app.py           # → http://127.0.0.1:8050
+```
 
-# Run tests
+### Run tests
+
+```bash
 python -m pytest tests/ -v
 ```
 
@@ -351,11 +458,11 @@ All settings live in `config.py` and can be overridden via `.env`.
 ### Strategy
 | Setting | Default | Description |
 |---|---|---|
-| `TIMEFRAME` | `5m` | Kline interval for patterns |
-| `PATTERN_LOOKBACK` | `50` | Candle history for pattern detection |
-| `SWING_WINDOW` | `5` | Bars each side for swing pivots |
-| `MIN_R2` | `0.80` | Minimum trendline R² |
-| `BREAKOUT_VOL_MULT` | `1.5` | Volume × average for breakout |
+| `TIMEFRAME` | `5m` | Kline interval for candle stream |
+| `PATTERN_LOOKBACK` | `50` | Candle history for pattern detection — **not used by active code** (`core/pattern_detector.py` absent) |
+| `SWING_WINDOW` | `5` | Bars each side for swing pivots — **not used by active code** |
+| `MIN_R2` | `0.80` | Minimum trendline R² — **not used by active code** |
+| `BREAKOUT_VOL_MULT` | `1.5` | Volume × average for breakout — **not used by active code** |
 | `MIN_CONFIDENCE` | `0.58` | Gate 2 confidence threshold |
 
 ### LOB / Microstructure
@@ -363,22 +470,50 @@ All settings live in `config.py` and can be overridden via `.env`.
 |---|---|---|
 | `LOB_WALL_SIGMA` | `2.5` | σ threshold for Wall identification |
 | `LOB_WALL_WINDOW` | `5` | Ticks each side for Wall median/std |
-| `LOB_DEPTH` | `20` | Order book levels fetched |
+| `LOB_DEPTH` | `1000` | Levels used in `get_snapshot()` depth reads (lob_snapshot_writer, legacy engine). `BinanceWebSocketConsumer` hard-codes `_DEPTH_LEVELS = 100`; `LOBRecorder` hard-codes `_DEPTH_LEVELS = 100`. Only relevant when calling `lob_engine.get_snapshot(depth=settings.LOB_DEPTH)`. |
+| `LOB_OBI_DEPTH` | `20` | Levels used for OBI calculation |
 | `LOB_HISTORY` | `18000` | In-memory bars retained (~5h) |
+| `LOB_HEATMAP_BUCKET` | `5.0` | USD bucket width for dashboard heatmap |
+| `RELOAD_SIGMA` | `3.0` | σ threshold for iceberg reload detection — **legacy-engine-only; see TODO** |
+| `ICEBERG_WINDOW_MS` | `500` | Lookback window for iceberg replenishment — **legacy-engine-only; see TODO** |
+| `ICEBERG_MIN_REPLENISH` | `0.80` | Min reload fraction to confirm iceberg — **legacy-engine-only; see TODO** |
+| `ICEBERG_MIN_QTY` | `0.5` | Min absolute qty to qualify as iceberg — **legacy-engine-only; see TODO** |
+| `SWEEP_LEVELS` | `5` | Top-N levels checked for sweep volume — **legacy-engine-only; see TODO** |
+| `SWEEP_THRESHOLD` | `0.80` | Buy/sell vol fraction threshold — **legacy-engine-only; see TODO** |
+| `BREAK_PROTECT_WINDOW_MS` | `2000` | Break+protect window (ms) — **legacy-engine-only; see TODO** |
+| `OBI_BREAK_THRESH` | `0.40` | OBI reference level — used by dashboard `/lob` page as a visual reference line only (not a trading gate) |
+| `MICRO_MAX_HOLD_MS` | `60_000` | Max hold before forced exit (Gate 6) |
+| `MICRO_EXIT_SPREAD_HARD_CAP_BPS` | `12.0` | Spread hard cap for Gate 6 post-entry exit trigger (not Gate 4; Gate 4 uses `EntryRules.spread_max_bps` = 8.0) |
+| `LOB_FRESH_WALL_MS` | `3_000` | Protection wall must appear within this window |
+| `LOB_STALE_WALL_MS` | `30_000` | Prune wall states not seen for this long |
+| `PROTECTION_MAX_DISTANCE_BPS` | `25.0` | Max protection wall distance from mid |
+| `PRICE_PRUNE_INTERVAL` | `100` | Prune stale price keys every N bars — **legacy-engine-only; see TODO** |
+| `PRICE_PRUNE_BAND` | `0.02` | Keep prices within ±2% of current mid — **legacy-engine-only; see TODO** |
+| `MICRO_PRICE_MOVE_FLOOR_BPS` | `3.0` | Minimum price move to confirm sweep |
+| `MICRO_PRICE_MOVE_WINDOW` | `300` | Rolling window for dynamic price-move threshold |
+| `MICRO_PRICE_MOVE_PERCENTILE` | `0.90` | Percentile rank for dynamic threshold |
+| `MICRO_PRICE_MOVE_MIN_SAMPLES` | `50` | Min samples before dynamic threshold activates |
 
 ### Heartbeat
 | Setting | Default | Description |
 |---|---|---|
-| `HEARTBEAT_WARN_MS` | `200` | Log warning above this delta |
-| `HEARTBEAT_CRITICAL_MS` | `500` | Killswitch threshold |
-| `HEARTBEAT_CONSEC_LIMIT` | `3` | Consecutive critical packets to fire KS |
+| `HEARTBEAT_WARN_MS` | `200` | Per-packet delta threshold for "degraded" classification |
+| `HEARTBEAT_CRITICAL_MS` | `500` | Per-packet delta threshold for "critical" classification |
+| `HEARTBEAT_CONSEC_LIMIT` | `3` | Consecutive critical packets required to fire KS-2 |
+| `HEARTBEAT_DEGRADED_RATE_THRESH` | `0.5` | ≥50% of 10-msg window → DEGRADED |
+| `HEARTBEAT_DEGRADED_RECOVERY_THRESH` | `0.3` | <30% of 10-msg window → recover to HEALTHY (hysteresis) |
+| `HEARTBEAT_SUSTAINED_MS` | `10_000` | Duration at DEGRADED rate before SUSTAINED_DEGRADED |
 
 ### Risk Engine
 | Setting | Default | Description |
 |---|---|---|
-| `MAX_DRAWDOWN_PCT` | `0.05` | 5% drawdown → HALTED |
-| `DAILY_LOSS_LIMIT_PCT` | `0.01` | 1% daily loss → HALTED |
-| `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 15-min cooldown |
+| `MAX_DRAWDOWN_PCT` | `0.05` | 5% drawdown from peak → HALTED |
+| `DAILY_LOSS_LIMIT_PCT` | `0.02` | Legacy portfolio daily-loss hard stop (belt-and-suspenders) |
+| `TIER_REDUCED_PCT` | `0.005` | ≥ 0.5% DOV loss → REDUCED (50% size, min conf 0.65) |
+| `TIER_MINIMAL_PCT` | `0.0075` | ≥ 0.75% DOV loss → MINIMAL (25% size, min conf 0.80) |
+| `TIER_PASSIVE_PCT` | `0.009` | ≥ 0.9% DOV loss → PASSIVE (no new entries) |
+| `TIER_HALTED_PCT` | `0.01` | ≥ 1.0% DOV loss → HALTED |
+| `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 5-min cooldown |
 | `RISK_PER_TRADE_PCT` | `0.01` | Equity risked per trade (1%) |
 | `KELLY_FRACTION` | `0.25` | Fractional Kelly applied to sizing |
 | `ATR_MULTIPLIER_SL` | `1.5` | Stop-loss distance in ATR units |
@@ -391,32 +526,110 @@ All settings live in `config.py` and can be overridden via `.env`.
 |---|---|---|
 | `DRY_RUN` | `True` | Skip live order submission |
 | `IOC_TIMEOUT_MS` | `200` | IOC order expiry — do not retry |
+| `MAX_ORDER_NOTIONAL_PCT` | `0.90` | Gate 3 rejects if estimated notional exceeds 90% of equity |
+| `QTY_STEP_SIZE` | `0.00001` | BTCUSDT LOT_SIZE `stepSize`; all quantities are floored to this grid |
+| `MIN_NOTIONAL` | `100.0` | BTCUSDT minimum order notional (USD); orders below this are rejected pre-submission |
+
+### Logging
+| Setting | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Root log level — set `DEBUG` in `.env` for full gate-input trace |
+| `LOG_FILE` | `logs/cryptosentinel.log` | Rotating log file path |
+| `LOG_MAX_BYTES` | `5_000_000` | Max bytes per log file before rotation (5 MB) |
+| `LOG_BACKUP_COUNT` | `5` | Rotated files retained (~25 MB total) |
+
+### Speed Bumps
+| Setting | Default | Description |
+|---|---|---|
+| `MIN_SIGNAL_INTERVAL_MS` | `0` | Min ms between signal approvals (0 = disabled) |
+
+### Test Harness
+| Setting | Default | Description |
+|---|---|---|
+| `TEST_SIGNAL_INJECT` | `False` | Enable synthetic signal injection — only active via `start_test.sh` |
+| `TEST_INJECT_INTERVAL_MS` | `30_000` | ms between injected synthetic signals |
 
 ### Persistence
 | Setting | Default | Description |
 |---|---|---|
 | `REGISTRY_DB` | `strategies/registry.db` | Strategy registry + signal telemetry |
 | `LOB_TICK_DB` | `data/lob_tick.db` | LOB Recorder tick data |
+| `BACKTEST_RESULTS_DB` | `data/backtest_results.db` | Walk-forward backtest results storage |
+
+### Dashboard
+| Setting | Default | Description |
+|---|---|---|
+| `DASHBOARD_API_PORT` | `8080` | Port for aiohttp REST API (`/api/health`, `/api/portfolio`, `/api/killswitch`) |
+
+### Alerting
+| Setting | Default | Description |
+|---|---|---|
+| `ALERT_WEBHOOK_URL` | `""` | Optional webhook URL for kill-switch alerts (empty = disabled) |
 
 ---
 
 ## Tests
 
 ```
-tests/test_models.py              6 tests  — PortfolioState, WallState, FeatureVector
-tests/test_lob_engine.py         16 tests  — state machine, gap detection, wall scan
-tests/test_microstructure.py      7 tests  — wall identification, absorption, sweep
-tests/test_features.py            4 tests  — Welford, no-lookahead, VWAP reset
-tests/test_executor.py            7 tests  — all 7 gates, telemetry emission
-tests/test_cvd.py                 3 tests  — buy/sell CVD, 5-bar delta
-tests/test_signal_telemetry.py    4 tests  — flush, batch, outcome update
-tests/test_db_writer.py           9 tests  — SQLite write, upsert, purge
-tests/test_pattern_detector.py    8 tests  — ATR, swing detection, S/R breakout
-tests/test_risk_engine.py        20 tests  — 5-tier, killswitch, pyramid, circuit breakers
-tests/test_integration.py         2 tests  — gate funnel, killswitch blocking
-─────────────────────────────────────────────────────────────────────────────
-Total                            ~90 tests (Phase 1 target)
+Phase 1 — Live trading engine
+tests/test_risk_engine.py            8 tests  — sync_tier transitions, tier callback, record_trade_result, mark_unrealised, session reset
+tests/test_microstructure_engine.py 30 tests  — legacy microstructure engine
+tests/test_executor.py              40 tests  — all 7 gates, telemetry emission
+tests/test_order_manager.py         30 tests  — IOC entry, OCO bracket, fill handling
+tests/test_lob_engine.py            22 tests  — state machine, gap detection, wall scan
+tests/test_startup_reconciler.py    17 tests  — reconciliation, midnight reset
+tests/test_microstructure.py        22 tests  — wall identification, absorption, sweep
+tests/test_lob_recorder.py          27 tests  — recorder flush, reconnect, stats
+tests/test_features.py              14 tests  — Welford, no-lookahead, VWAP reset
+tests/test_cvd.py                   14 tests  — buy/sell CVD, 5-bar delta, std
+tests/test_db_writer.py              9 tests  — SQLite write, upsert, purge
+tests/test_signal_telemetry.py      10 tests  — flush, batch, timeout, outcome update
+tests/test_orders.py                11 tests  — order domain classes and enums
+tests/test_ws_consumer.py           12 tests  — heartbeat states, rate thresholds, hysteresis
+tests/test_models.py                 6 tests  — PortfolioState, WallState, FeatureVector
+tests/test_integration.py            2 tests  — end-to-end signal → execution pipeline
+
+Phase 3 — REST API + LOB snapshot writer + Dash dashboard
+tests/test_rest_api.py              11 tests  — /api/health, /api/portfolio, /api/killswitch
+tests/test_lob_snapshot_writer.py    9 tests  — snapshot writer, rolling cap, WAL mode
+tests/test_realtime_hub.py           6 tests  — RealtimeHub fan-out, connection drop, /ws/lob endpoint
+tests/test_dashboard_live.py         6 tests  — /live page callback, engine badge, kill switch
+tests/test_dashboard_lob.py          6 tests  — /lob buffer helpers, CVD accumulation, dedup
+tests/test_dashboard_registry.py     4 tests  — /registry page, strategy lifecycle display
+tests/test_dashboard_walls.py        6 tests  — /walls page callback, trace structure, invalid-JSON guard
+tests/test_alerting.py               3 tests  — AlertDispatcher webhook, empty-URL guard
+
+Phase 2 — Backtesting + strategy lifecycle
+tests/test_bt_event_engine.py       24 tests  — event-driven engine: tiers, exits, full run
+tests/test_registry.py              29 tests  — lifecycle gates, YAML roundtrip, promotion
+tests/test_bt_tick_replay.py        16 tests  — tick replay fidelity, streaming, CVD reset
+tests/test_bt_walk_forward.py        9 tests  — window splits, OOS isolation, leaderboard
+tests/test_bt_metrics.py            10 tests  — Sharpe, MDD, PF, composite score
+tests/test_validator.py              7 tests  — null repair, duplicate removal, gap detection
+tests/test_scorer.py                 7 tests  — XGBoost train, AUC, save/load, fallback
+tests/test_fetcher.py                6 tests  — OHLCV fetch, cache, resample
+tests/test_bt_signals.py             7 tests  — signal arrays, no-lookahead, SL/TP NaN
+tests/test_bt_vectorbt.py            6 tests  — Optuna optimisation, sensitivity
+tests/test_bt_costs.py               5 tests  — round-trip cost, maker/taker, zero qty
+──────────────────────────────────────────────────────────────────────────────
+Total                              451 tests
 ```
+
+---
+
+## Path to Paper Trading
+
+The trading engine is fully operational on the Binance Spot Testnet. The remaining work before enabling live paper trading (`DRY_RUN=False`) is data accumulation and strategy validation:
+
+| Step | Action | Status |
+|------|--------|--------|
+| **1. Accumulate LOB data** | LOB Recorder is collecting at `btcusdt@depth@100ms` (incremental diff, 100 levels, $25-bucket aggregation). Keep `lob_recorder` running continuously. Target ≥30 days for statistically robust walk-forward splits. | ✅ Done (recorder operational) |
+| **2. Fetch OHLCV history** | Run `data/fetcher.py` to populate `ohlcv_cache.db` for Path B backtesting | 🔜 Pending |
+| **3. Run backtests** | Path A: `backtesting/event_engine.py` replay of `lob_tick.db`. Path B: `backtesting/walk_forward.py` OHLCV walk-forward via VectorBT + Optuna | 🔜 Pending |
+| **4. Tune strategy config** | Optimise wall sigma (`LOB_WALL_SIGMA`), confidence threshold (`MIN_CONFIDENCE`), ATR multipliers via Optuna. Evaluate Sharpe, Sortino, MDD, PF across out-of-sample windows. | 🔜 Pending |
+| **5. Train XGBoost scorer** | `strategy/scorer.py` — `XGBoostScorer.train_from_registry()` trains on APPROVED `signal_records`; `ScorerFactory` auto-loads at startup, falls back to `RuleBasedScorer` if no pkl exists. AUC gate ≥ 0.62, ECE logged, staleness warning after 30 days. | ✅ Done |
+| **6. Freeze StrategySpec** | `strategy/spec.py` + `strategy/registry.py` + `strategy/builder.py` — `StrategyBuilder` produces BACKTEST-status specs; `StrategyRegistry` dual-stores to YAML + SQLite with 4-gate PAPER promotion (≥50 OOS trades, Sharpe ≥ 1.0, MDD ≤ 15%, PF ≥ 1.3) and 3-gate LIVE promotion. | ✅ Done |
+| **7. Promote to paper trading** | Set `DRY_RUN=False` in `.env`. Monitor Gate funnel and PnL via the Dash dashboard (`dashboard/app.py`). | 🔜 Pending |
 
 ---
 
@@ -424,23 +637,21 @@ Total                            ~90 tests (Phase 1 target)
 
 | Layer | Technology | Version | Purpose |
 |-------|-----------|---------|---------|
-| Runtime | Python | 3.11+ | Async, type hints |
+| Runtime | Python | 3.13+ | Async, type hints |
 | Async | asyncio | stdlib | Event loop |
-| LOB Recorder WS | websockets | 12.0 | Real Binance public stream |
-| Exchange WS/REST | python-binance | 1.0.19 | Testnet execution |
-| Historical data | ccxt | 4.3.x | OHLCV fetch (no key) |
-| Data | pandas + numpy | 2.2 + 1.26 | DataFrames + arrays |
-| Indicators | pandas-ta | 0.3.14b | ATR, RSI |
-| Stats | scipy | 1.13.0 | linregress, statistics |
-| ML scorer | xgboost | 2.0.x | Confidence scoring (Phase 2) |
-| Backtest fast | vectorbt | 0.26.x | OHLCV Path B (Phase 2) |
-| Optimiser | optuna | 3.6.x | Bayesian param search (Phase 2) |
+| LOB Recorder WS | websockets | 10.4 | Real Binance public stream |
+| Exchange WS/REST | python-binance | 1.0.36 | Testnet execution |
+| Historical data | ccxt | 4.3+ | OHLCV fetch (no key) |
+| Data | pandas + numpy | 3.0.3 + 2.4.4 | DataFrames + arrays |
+| Stats | scipy | 1.14+ | linregress, statistics |
+| ML scorer | xgboost | 2.1+ | Confidence scoring (Phase 2) |
+| Backtest fast | vectorbt | 0.25+ | OHLCV Path B (Phase 2) |
+| Optimiser | optuna | 3.6+ | Bayesian param search (Phase 2) |
 | Config | pydantic-settings | 2.3.x | .env management |
 | Dashboard | Dash + dash-bootstrap | 2.17 + 1.6 | All UI pages (Phase 3) |
-| Dashboard (current) | Streamlit | 1.35.0 | Active during Phase 1 |
 | Charts | plotly | 5.22.x | All visualisations |
 | Persistence | SQLite | stdlib | All databases |
-| Logging | loguru | 0.7.x | Structured logs |
+| Logging | Python stdlib logging | 3.13+ | RotatingFileHandler, INFO/DEBUG configurable via `LOG_LEVEL` |
 | Serialisation | PyYAML | 6.0.1 | StrategySpec configs |
 
 ---
@@ -463,13 +674,59 @@ These rules are invariants. Any code that violates them is incorrect.
 | **Rule 10** | No market orders for microstructure entries. All entries use aggressive IOC limit orders (`best_ask + spread × 0.5`). |
 | **Rule 11** | HeartbeatMonitor runs on every WebSocket message — not sampled, not batched. `heartbeat_status` must be available to Gate 0 and GlobalKillswitch without additional async calls. |
 | **Rule 12** | GlobalKillswitch cannot be bypassed. Once `is_active == True`, no new orders may be placed. Manual override requires system restart — not a config flag. |
+| **Rule 13** | LOB data used for strategy validation must be collected at depth@100 or deeper, with price-bucket aggregation for storage efficiency. depth@20 data spans only $2–4 from mid at BTC prices; all walls are within the transaction cost floor and no signal can be net profitable. depth@20 data is valid only for infrastructure smoke tests. |
 
 ---
 
 ## Phased Delivery
 
-| Phase | Weeks | Goal |
-|-------|-------|------|
-| **Phase 1** | 1–3 | Foundation: LOB Recorder, HeartbeatMonitor, LOB state machine, FeatureComputer, Wall/Absorption/Sweep signals, 7-Gate executor, GlobalKillswitch, IOC limit orders, signal telemetry, startup reconciler |
-| **Phase 2** | 4–8 | Backtesting: OHLCV Path B (VectorBT + Optuna), Tick Path A (replay `lob_tick.db`), XGBoost scorer, Strategy Builder + Registry |
-| **Phase 3** | 9–12 | Dashboard: Dash migration (5 pages: /live, /lob, /backtest, /registry, /config), decay monitoring, LIVE promotion pipeline |
+| Phase | Weeks | Goal | Status |
+|-------|-------|------|--------|
+| **Phase 1A–1K** | 1–3 | Foundation: LOB Recorder, HeartbeatMonitor, LOB state machine, FeatureComputer, Wall/Absorption/Sweep signals, 7-Gate executor, 5-tier Risk Engine, DailyBudget, PyramidController, GlobalKillswitch, signal telemetry | ✅ Done |
+| **Phase 1L–1N** | 3 | Foundation: IOC limit orders (1L), startup reconciler + midnight reset (1M), integration test + killswitch wire-up (1N) | ✅ Done |
+| **Phase 2A–2F** | 4–6 | Backtesting infrastructure: data layer, costs, metrics, signal generator, VectorBT+Optuna, walk-forward orchestrator (OHLCV Path B complete) | ✅ Done |
+| **Phase 2G** | 6 | Tick Replay Engine: `backtesting/tick_replay.py` — event-driven replay of `lob_tick.db` through live feature/signal stack; fidelity test passes | ✅ Done |
+| **Phase 2H** | 6 | XGBoost Confidence Scorer: `strategy/scorer.py` — trains on APPROVED `signal_records`, AUC ≥ 0.62 gate, ECE calibration, staleness detection, wired into Gate 2 via `ScorerFactory` | ✅ Done |
+| **Phase 2I** | 7 | Strategy Registry: `strategy/spec.py`, `registry.py`, `builder.py` — full lifecycle RESEARCH→BACKTEST→PAPER→LIVE with dual-store (YAML+SQLite), 4-gate PAPER promotion, 3-gate LIVE promotion | ✅ Done |
+| **Phase 2J** | 7–8 | Strategy config tuning: accumulate ≥30 days of `depth@100` LOB data, run walk-forward backtests, tune params, run tick replay validation, promote first spec to PAPER | 🔜 Next |
+| **Phase 3** | 9–12 | Dashboard: Dash multi-page app (6 pages: /live, /lob, /walls, /backtest, /registry, /config), REST API, LOB snapshot writer, decay monitoring, LIVE promotion pipeline | ✅ Done |
+
+---
+
+## TODO
+
+- [x] Write up strategy documentation — entry logic, gate rationale, Wall/Absorption/Sweep signal design (`documentation/strategy.md`)
+- [x] Write up model documentation — FeatureComputer inputs, XGBoost scorer architecture, training pipeline including component interaction diagram (`documentation/model.md`)
+- [x] Write up trading algorithm documentation — end-to-end flow from LOB tick to order submission (`documentation/algorithm.md`)
+- [x] Fix gate 3 issue; risk management is not using live position data. need to ensure BTC, USDT data is being passed through
+- [ ] Fix one test case. make sure it uses the correct notional
+- [ ] check market bubbles in dashboard. make sure it is top 1 percentile volume for the whole heatmap window. otherwise might be better to have even higher threshhold up to 99.5 percentile contrast
+- [ ] need to test the live dashboard works
+- [ ] Consider placing a minimum-quantity resting order behind/after a significant liquidity wall — a fill on that order signals the wall has been consumed, providing a cleaner consumption trigger than depth-diff heuristics. Quantity must be as small as possible (min tick size on Binance Spot Testnet).
+- [ ] run through start_test.sh and make sure the trade execution with injector is working. trades work now. make sure its tracked in live dashboard
+- [ ] review all code and test scripts to ensure no unused classes or functions
+- [ ] troubleshoot and refine strategy
+- [ ] troubleshoot and refine model
+- [ ] troubleshoot and refine algorithm
+
+### Lead-quant backlog
+
+- [ ] **Dead code — MicrostructureEngine**: `engine/microstructure_engine.py` (~410 lines) is not started in `main.py`'s TaskGroup and has no live producer. `ms_bar_queue` is orphaned. Either wire it into the live path or delete it — currently it creates confusion about the actual signal source.
+- [ ] **Dead code — engine shims**: `engine/lob_engine.py`, `engine/risk_engine.py`, `engine/websocket_consumer.py`, `engine/order_manager.py` are one-line re-export shims. No external code should depend on them; remove the shims and update any remaining importers.
+- [ ] **Redundant config — pattern settings**: `PATTERN_LOOKBACK`, `SWING_WINDOW`, `BREAKOUT_VOL_MULT`, `MIN_R2` in `config.py` have no consumer in the live codebase. Remove or annotate clearly as reserved for a future pattern module.
+- [ ] **Unused FeatureVector fields**: `pattern_r2` and `protection_wall_present` are always 0 in the live path — `executor.py` never passes them into `FeatureComputer.compute()`. XGBoost trains on these zero-variance columns. Either wire the inputs or drop the features from `FEATURE_ORDER` and retrain.
+- [ ] **Gate 4 spread check is duplicated**: `gate_4_order_selection()` checks both `EntryRules.spread_max_bps` (8.0) and `spread_p95 × 2`. The hard cap and the adaptive cap serve the same purpose; consolidate into a single threshold derived from session p95 data with a sensible floor.
+- [ ] **Position sizing ignores remaining_budget**: `notional_hint` is computed from `confidence × KELLY × RISK_PCT × tier_scalar` without consulting `DailyBudget.remaining`. A run of near-threshold trades could drain the budget silently — add a budget-fraction cap to `notional_hint` in `gate_3_position_size`.
+- [ ] **Test coverage gap — StrategyExecutor + RiskEngine integration**: Gate 3 capital gate and tier-elevated confidence are tested in isolation but no test exercises the full `StrategyExecutor → OrderManager → fill_processor` path under a non-FULL risk tier. Add at least one integration scenario for REDUCED/MINIMAL tier flow.
+- [x] **Test coverage gap — HeartbeatMonitor SUSTAINED_DEGRADED**: `test_ws_consumer.py` now includes `test_heartbeat_sustained_degraded` and `test_heartbeat_recovery_from_sustained` covering the 10 s transition and hysteresis band recovery (12 tests total).
+- [ ] **Test coverage gap — RiskEngine throttle and circuit breakers**: `test_risk_engine.py` has only 8 tests (sync_tier transitions and basic record_trade_result). The 5-tier drawdown circuit breaker, consecutive-loss cooldown timer, budget-loss tier thresholds, and all `_check_circuit_breakers()` branches are untested. This is a liability for a risk-critical module — expand to at least 25 tests covering the full tier ladder and each circuit breaker trigger.
+- [ ] **Dead config — CANDLE_INTERVAL**: `config.py` defines `CANDLE_INTERVAL: str = "1s"` with the comment "legacy — ws_consumer uses this", but `ws_consumer.py` never imports or reads this setting (it uses `TIMEFRAME` for klines). Remove the setting or delete it before more code takes a dependency on it.
+- [ ] **Dead config — legacy-engine-only settings**: `SWEEP_THRESHOLD`, `SWEEP_LEVELS`, `BREAK_PROTECT_WINDOW_MS`, `ICEBERG_PRICE_TOL`, `BOOK_FLIP_SIGMA`, `BOOK_FLIP_MIN_CONSUMED`, `BOOK_FLIP_AGG_RATIO`, `BREAK_MIN_VOL`, `RELOAD_SIGMA`, `ICEBERG_WINDOW_MS`, `ICEBERG_MIN_REPLENISH`, `ICEBERG_MIN_QTY`, `PRICE_PRUNE_INTERVAL`, `PRICE_PRUNE_BAND` are defined in `config.py` but consumed exclusively by `engine/microstructure_engine.py` (the legacy engine that is not started in the live path). Note: `OBI_BREAK_THRESH` remains in the list above but IS used — it drives a reference line in `dashboard/pages/lob.py` (visual only, not a trading gate). Removing the legacy engine removes all consumers for the other settings listed; delete them at that point.
+- [ ] **STARTING_EQUITY duplication**: `main.py` defines `STARTING_EQUITY = 10_000.0` as a module-level constant instead of reading `settings.STARTING_EQUITY`. If someone sets `STARTING_EQUITY` in `.env`, the main orchestrator ignores it — only `backtesting/event_engine.py` picks it up. Consolidate: replace the `main.py` constant with `settings.STARTING_EQUITY` so the value is controlled from a single source.
+- [ ] **Absorption prerequisite adds false negatives**: `gate_1_microstructure()` hard-gates on `prior_absorption == True`. A wall that appears and is immediately consumed (e.g. within the first 500ms of its first_seen_ts) will always be rejected — absorption can never arm a wall that is gone before it persists. At the 100ms tick rate this blocks genuine fast institutional sweeps of newly-posted deep liquidity. Evaluate demoting Absorption from a Gate 1 hard prerequisite to a Gate 2 scoring bonus (e.g. `absorption_ratio > 0 → +0.10` in `RuleBasedScorer`) to recover these signals without opening a false-positive flood.
+- [ ] **Dual-store registry is over-engineered for a single-strategy system**: `strategy/registry.py` writes every spec to both a YAML file and a SQLite `strategies` table. For the current single-strategy deployment, a single SQLite store would suffice; the YAML mirror adds sync risk (YAML written first, then DB — a crash between the two leaves them inconsistent). Consolidate into SQLite-only in `strategy/registry.py` and `strategy/builder.py`, retaining YAML export as an explicit `export()` method for human review.
+- [ ] **Low-signal features in FEATURE_ORDER**: `strategy/scorer.py` trains XGBoost on all 15 features including `pattern_r2` (always 0.0 in live path — `strategy/executor.py` never passes it to `FeatureComputer.compute()`), `vwap_reclaim` (binary flag, rarely 1 on a per-tick basis), and `rsi_value` (14-bar candle momentum on a 5m timeframe — coarse relative to 100ms microstructure signals). After first XGBoost training run, call `scorer.feature_importances()` and prune any feature with importance < 0.01 from `FEATURE_ORDER`; retrain and compare AUC.
+- [ ] **Parallel depth consumers double memory pressure**: `main.py` line 492 fans out each reconstructed depth snapshot to both `lob_depth_queue` (consumed by `_run_lob_engine`) and `ms_depth_queue` (consumed by `MicrostructureDetector`). Both consumers parse the same `{"bids": [...], "asks": [...]}` dict independently. Evaluate whether `MicrostructureDetector` could subscribe to `LocalOrderBook`'s processed output instead of the raw diff queue, halving snapshot copies in memory at the cost of adding a processing dependency.
+- [ ] **Test coverage gap — strategy/builder.py and strategy/spec.py**: Neither `tests/test_builder.py` nor `tests/test_spec.py` exists. `StrategyBuilder.walk_forward_metrics()` and `StrategyBuilder.build()` (which drive the BACKTEST→PAPER promotion path) are untested. `StrategySpec.to_dict()` / `StrategySpec.from_dict()` roundtrip is exercised only indirectly via `test_registry.py`. Add dedicated test files for both modules.
+- [ ] **Gate 3 capital gate has a belt-and-suspenders budget check**: `gate_3_capital()` (`strategy/executor.py` lines 75–79) checks both `tier in ("HALTED", "PASSIVE")` and `budget.remaining <= 0`. These are not independent — when DOV loss reaches `TIER_HALTED_PCT`, `RiskEngine._check_circuit_breakers()` (`risk/engine.py` lines 82–86) sets `tier = HALTED`, so the tier check would already reject. The `budget.remaining <= 0` path only fires during the ~1-second gap before the next MTM loop tier sync. Evaluate whether increasing the MTM loop frequency or making the tier sync synchronous on budget update would allow the `budget.remaining` check to be removed.
+- [ ] **Test coverage gap — risk/budget.py and risk/killswitch.py**: Neither `tests/test_budget.py` nor `tests/test_killswitch.py` exists. `DailyBudget.remaining`, `DailyBudget.loss_pct`, reset on midnight boundary, and `GlobalKillswitch` trigger conditions (KS-1 budget breach, KS-2 heartbeat, KS-3 slippage) are only tested indirectly through `test_risk_engine.py` fixtures. These are risk-critical code paths — add dedicated unit tests for each module (`risk/budget.py` and `risk/killswitch.py`).

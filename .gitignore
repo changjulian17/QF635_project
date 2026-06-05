@@ -61,5 +61,21 @@ htmlcov/
 local/
 tmp/
 temp/
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/*.md
 .gitignore
+
+# XGBoost / ML model artefacts
+*.pkl
+strategies/models/
+
+# Strategy registry data (YAML specs and SQLite DB are runtime artefacts)
+strategies/*.yaml
+strategies/registry.db
+strategies/registry.db-shm
+strategies/registry.db-wal
+
+# Notes
+research/
