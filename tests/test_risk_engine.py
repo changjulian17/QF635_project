@@ -240,3 +240,35 @@ def test_record_trade_result_as_budget_update_cb_updates_budget():
 
     assert budget.realised_pnl == pytest.approx(-200.0)
     assert pf.budget_loss_pct  == pytest.approx(budget.loss_pct)
+
+
+# ── Circuit breakers: drawdown + consecutive-loss cooldown ──────────────────
+
+def test_drawdown_circuit_breaker_halts():
+    pf = make_portfolio(equity=9_400.0, peak_equity=10_000.0)   # 6% drawdown >= 5%
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.HALTED
+
+
+def test_drawdown_below_threshold_does_not_halt():
+    pf = make_portfolio(equity=9_600.0, peak_equity=10_000.0)   # 4% drawdown < 5%
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is not CircuitBreakerStatus.HALTED
+
+
+def test_consecutive_loss_cooldown_pauses():
+    pf = make_portfolio(consecutive_losses=3)                   # >= MAX_CONSECUTIVE_LOSSES
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED
+
+
+def test_cooldown_persists_after_losses_cleared():
+    pf = make_portfolio(consecutive_losses=3)
+    eng = make_engine(pf)
+    eng.sync_tier()                                             # arms 300s cooldown
+    pf.consecutive_losses = 0                                   # losses reset, but window still open
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED
