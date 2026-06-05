@@ -15,7 +15,7 @@ def fire_killswitch(api_base: str) -> bool:
     try:
         resp = requests.post(f"{api_base}/api/killswitch", timeout=3)
         return resp.ok
-    except Exception:
+    except requests.RequestException:
         return False
 
 

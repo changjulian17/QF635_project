@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from models import CircuitBreakerStatus, PortfolioState
 from risk.budget import DailyBudget
 from risk.engine import RiskEngine
@@ -125,3 +127,29 @@ def test_reset_for_new_session_clears_daily_state():
     assert engine.tier == "FULL"
     assert engine._budget.realised_pnl == 0.0
 
+
+
+# ── GlobalKillswitch.update_dov ───────────────────────────────────────────────
+
+def test_killswitch_update_dov_changes_hard_limit():
+    ks = GlobalKillswitch(dov=10_000.0)        # _hard_limit = 100.0
+    ks.update_dov(1_000_000.0)                 # _hard_limit = 10_000.0
+    assert ks._hard_limit == pytest.approx(10_000.0)
+
+
+def test_killswitch_update_dov_ignores_nonpositive():
+    ks = GlobalKillswitch(dov=10_000.0)
+    original = ks._hard_limit
+    ks.update_dov(0.0)
+    assert ks._hard_limit == pytest.approx(original)
+
+
+# ── DailyBudget.rebase ────────────────────────────────────────────────────────
+
+def test_budget_rebase_updates_equity_preserves_pnl():
+    b = DailyBudget.from_equity(10_000.0)
+    b.realised_pnl = -50.0                     # simulate a loss already recorded
+    b.rebase(1_000_000.0)
+    assert b.dov          == pytest.approx(1_000_000.0)
+    assert b.hard_limit   == pytest.approx(10_000.0)
+    assert b.realised_pnl == pytest.approx(-50.0)  # PnL must survive rebase

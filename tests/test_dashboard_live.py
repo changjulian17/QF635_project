@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -99,7 +100,7 @@ def test_ks_modal_clears_input_on_post_failure():
     from unittest.mock import patch
     from dashboard._logic import fire_killswitch, validate_ks_confirm
 
-    with patch("dashboard._logic.requests.post", side_effect=ConnectionError()):
+    with patch("dashboard._logic.requests.post", side_effect=requests.RequestException()):
         result = fire_killswitch("http://127.0.0.1:8080")
 
     assert result is False  # POST failed

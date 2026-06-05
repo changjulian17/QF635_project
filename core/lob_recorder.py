@@ -181,7 +181,7 @@ class LOBRecorder:
                 "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
                 last_uid, len(self._bid_book), len(self._ask_book),
             )
-        except Exception as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.error("[LOBRec] Snapshot sync failed (%s); continuing unsynced.", exc)
             self._pending_diffs.clear()
             self._synced = True  # allow data to flow even if REST call failed

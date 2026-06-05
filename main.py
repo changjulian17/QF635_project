@@ -63,8 +63,8 @@ logging.getLogger("websockets").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-STARTING_EQUITY = 10_000.0
-SYMBOL = "BTCUSDT"
+SYMBOL          = "BTCUSDT"
+STARTING_EQUITY = settings.STARTING_EQUITY
 
 
 # ── Shutdown handler ──────────────────────────────────────────────────────────
@@ -134,11 +134,8 @@ async def _portfolio_mtm_loop(
 
 # ── Midnight reset ────────────────────────────────────────────────────────────
 
-async def midnight_reset_loop(
-    risk_engine: RiskEngine,
-    cvd_calculator: CVDCalculator,
-) -> None:
-    """Sleep until next UTC midnight + 5 s, then reset all daily counters."""
+async def midnight_reset_loop(risk_engine: RiskEngine) -> None:
+    """Sleep until next UTC midnight + 5 s, then reset daily risk counters."""
     while True:
         now = datetime.now(timezone.utc)
         next_midnight = (now + timedelta(days=1)).replace(
@@ -146,7 +143,6 @@ async def midnight_reset_loop(
         )
         await asyncio.sleep((next_midnight - now).total_seconds())
         risk_engine.reset_for_new_session()
-        cvd_calculator.reset_daily()
         logger.info("[Midnight] Session reset complete")
 
 
@@ -229,8 +225,15 @@ async def _api_server(
             }
             for p in portfolio.positions
         ]
+        dry_pos = order_manager.get_dry_run_position()
+        if dry_pos is not None:
+            positions = [dry_pos]
         return web.json_response({
             "equity": portfolio.equity,
+            "usdt_balance": portfolio.usdt_balance,
+            "btc_balance":  portfolio.btc_balance,
+            "btc_mtm":      round(portfolio.btc_balance * portfolio.btc_price, 2),
+            "btc_price":    portfolio.btc_price,
             "daily_pnl": portfolio.daily_pnl,
             "drawdown_pct": portfolio.drawdown_pct,
             "consecutive_losses": portfolio.consecutive_losses,
@@ -329,9 +332,9 @@ async def main() -> None:
     alert_dispatcher = AlertDispatcher(settings.ALERT_WEBHOOK_URL)
 
     portfolio = PortfolioState(
-        equity=STARTING_EQUITY,
-        starting_equity=STARTING_EQUITY,
-        peak_equity=STARTING_EQUITY,
+        equity=settings.STARTING_EQUITY,
+        starting_equity=settings.STARTING_EQUITY,
+        peak_equity=settings.STARTING_EQUITY,
     )
     shared_state = SharedState(
         heartbeat_status="HEALTHY",
@@ -339,8 +342,8 @@ async def main() -> None:
         lob_status="UNINITIALISED",
     )
 
-    killswitch      = GlobalKillswitch(STARTING_EQUITY)
-    budget          = DailyBudget.from_equity(STARTING_EQUITY)
+    killswitch      = GlobalKillswitch(settings.STARTING_EQUITY)
+    budget          = DailyBudget.from_equity(settings.STARTING_EQUITY)
     cvd_calculator  = CVDCalculator()
     lob_engine      = LocalOrderBook(shared_state=shared_state)
     feature_computer = FeatureComputer()
@@ -465,7 +468,7 @@ async def main() -> None:
         client = await AsyncClient.create(
             api_key=settings.BINANCE_API_KEY,
             api_secret=settings.BINANCE_API_SECRET,
-            testnet=True,
+            testnet=settings.BINANCE_TESTNET,
         )
         logger.info("[Main] Connected to Binance testnet")
     except Exception as exc:
@@ -476,6 +479,19 @@ async def main() -> None:
         await reconcile_on_startup(client, portfolio, risk_engine, symbol=SYMBOL)
     else:
         logger.info("[Main] Skipping reconciliation — no Binance client")
+
+    # Rebase risk limits to actual Binance account equity
+    actual_equity = portfolio.equity
+    if actual_equity > 0:
+        killswitch.update_dov(actual_equity)
+        budget.rebase(actual_equity)
+        logger.info(
+            "[Main] Risk limits rebased to actual equity=%.2f "
+            "(KS-1 hard_limit=%.2f budget hard_limit=%.2f)",
+            actual_equity,
+            actual_equity * 0.01,
+            actual_equity * 0.01,
+        )
 
     # 4. Register SIGTERM/SIGINT handlers ─────────────────────────────────────
     shutdown_event = asyncio.Event()
@@ -499,7 +515,7 @@ async def main() -> None:
             tg.create_task(strategy_executor.run(),                                           name="strategy_executor")
             tg.create_task(order_manager.start(),                                             name="order_manager")
             tg.create_task(telemetry.run(),                                                   name="signal_telemetry")
-            tg.create_task(midnight_reset_loop(risk_engine, cvd_calculator),                  name="midnight_reset")
+            tg.create_task(midnight_reset_loop(risk_engine),                                  name="midnight_reset")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
             tg.create_task(_process_fills(fill_queue, portfolio, telemetry),                  name="fill_processor")
             tg.create_task(
