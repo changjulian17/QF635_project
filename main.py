@@ -205,6 +205,38 @@ async def _feature_candle_loop(
         feature_computer.update_candle(candle)
 
 
+async def _backfill_feature_candles(
+    client: AsyncClient,
+    feature_computer: FeatureComputer,
+    limit: int = 30,
+) -> None:
+    """Pre-feed recent CLOSED klines so the FeatureComputer is warm at startup.
+
+    Without this, the feature vector needs ~rsi_period closed candles of the
+    configured TIMEFRAME to accumulate live (≈70 min at 5m), during which every
+    signal fails Gate 2 with "feature vector not ready". Backfilling makes the
+    strategy tradeable within seconds of launch instead.
+    """
+    try:
+        klines = await client.get_klines(
+            symbol=SYMBOL, interval=settings.TIMEFRAME, limit=limit
+        )
+    except Exception as exc:
+        logger.warning("[Main] Feature candle backfill failed (%s) — cold warmup", exc)
+        return
+    closed = klines[:-1] if klines else []  # last kline is the in-progress candle
+    for k in closed:
+        feature_computer.update_candle(Candle(
+            open_time=datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
+            open=float(k[1]), high=float(k[2]), low=float(k[3]),
+            close=float(k[4]), volume=float(k[5]), is_closed=True,
+        ))
+    logger.info(
+        "[Main] Backfilled %d closed %s candles — feature vector warm at startup",
+        len(closed), settings.TIMEFRAME,
+    )
+
+
 def _build_portfolio_payload(
     portfolio: PortfolioState,
     risk_tier: str | None = None,
@@ -532,6 +564,7 @@ async def main() -> None:
     # 3. Reconcile on startup — BEFORE starting any coroutines ────────────────
     if client is not None:
         await reconcile_on_startup(client, portfolio, risk_engine, symbol=SYMBOL)
+        await _backfill_feature_candles(client, feature_computer)
     else:
         logger.info("[Main] Skipping reconciliation — no Binance client")
 

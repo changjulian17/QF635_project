@@ -24,6 +24,7 @@ from core.cvd import WelfordOnline
 from core.signal_telemetry import SignalRecord
 from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState
 from risk.engine import TIER_MIN_CONFIDENCE, TIER_SCALARS
+from risk.sizing import clamp_stop_bps
 from strategy.spec import EntryRules
 
 logger = logging.getLogger(__name__)
@@ -473,7 +474,9 @@ class StrategyExecutor:
             equity     = self._equity_fn()
             pw_price   = signal.protection_wall.price
             raw_bps    = abs(signal.mid_price - pw_price) / signal.mid_price * 10_000
-            capped_bps = min(raw_bps, settings.PROTECTION_MAX_DISTANCE_BPS)
+            capped_bps = clamp_stop_bps(
+                raw_bps, settings.PROTECTION_MIN_DISTANCE_BPS, settings.PROTECTION_MAX_DISTANCE_BPS
+            )
             sl_est     = signal.mid_price * capped_bps / 10_000
             if sl_est > 0:
                 est_notional = (equity * notional_hint / sl_est) * signal.mid_price

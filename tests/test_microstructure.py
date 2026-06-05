@@ -241,6 +241,26 @@ def test_sweep_rejects_far_protection_wall():
     assert fired is False
 
 
+def test_sweep_rejects_too_close_protection_wall():
+    """A protective wall essentially at mid (< PROTECTION_MIN_DISTANCE_BPS) is degenerate:
+    it implies a near-zero stop distance and therefore an unbounded position size. The
+    detector must not fire on it (regression for the testnet thin-book $164M-notional bug)."""
+    now = int(time.time() * 1000)
+    consumed_ask = WallState(
+        price=30010.0, qty_initial=50.0, qty_current=5.0,
+        first_seen_ts=now - 600, last_seen_ts=now, side="ask", sigma=3.0,
+    )
+    # bid wall 0.5 pt below a 30005 mid → ~0.17 bps — far below the 1.0 bps minimum
+    near_bid = WallState(
+        price=30004.5, qty_initial=30.0, qty_current=30.0,
+        first_seen_ts=now - 500, last_seen_ts=now, side="bid", sigma=3.0,
+    )
+    fired, _ = detect_sweep_with_protection(
+        consumed_ask, 0.0005, 5.0, [near_bid], mid_price=30005.0
+    )
+    assert fired is False
+
+
 def test_dynamic_threshold_floor_and_warmed_percentile():
     floor = price_move_floor_pct()
     assert rolling_abs_move_threshold([0.01], floor_pct=floor, min_samples=3) == pytest.approx(floor)

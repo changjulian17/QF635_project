@@ -76,12 +76,13 @@ def valid_protection_walls(
         return None, []
 
     max_bps = settings.PROTECTION_MAX_DISTANCE_BPS if max_distance_bps is None else max_distance_bps
+    min_bps = settings.PROTECTION_MIN_DISTANCE_BPS
     valid = [
         w for w in fresh_walls_behind
         if w.side == required_side
         and (now_ms - w.first_seen_ts) <= settings.LOB_FRESH_WALL_MS
         and mid_price > 0.0
-        and abs(w.price - mid_price) / mid_price * 10_000 <= max_bps
+        and min_bps <= abs(w.price - mid_price) / mid_price * 10_000 <= max_bps
         and is_behind(w)
     ]
     valid.sort(key=lambda w: abs(w.price - mid_price))

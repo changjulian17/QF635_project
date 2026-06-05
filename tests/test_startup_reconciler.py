@@ -193,6 +193,7 @@ def test_s2_equity_set_from_usdt_and_btc(tmp_path):
 
     with patch("core.startup_reconciler.settings") as mock_settings:
         mock_settings.DRY_RUN = False
+        mock_settings.LIQUIDATE_BTC_ON_STARTUP = True   # liquidation-enabled case
         mock_settings.REGISTRY_DB = db_path
         mock_settings.QTY_STEP_SIZE = 0.00001
         mock_settings.MIN_NOTIONAL  = 100.0
@@ -204,6 +205,32 @@ def test_s2_equity_set_from_usdt_and_btc(tmp_path):
     assert abs(portfolio.usdt_balance - 18_000.0) < 1e-6
     assert abs(portfolio.btc_balance) < 1e-9
     assert abs(portfolio.btc_price - 10_000.0) < 1e-6
+
+
+def test_s2b_no_liquidation_by_default_retains_btc(tmp_path):
+    """Default LIQUIDATE_BTC_ON_STARTUP=False: BTC is retained (no SELL order),
+    so SHORT entries have inventory to sell. Regression test for the SHORT-execution bug."""
+    db_path = str(tmp_path / "registry.db")
+    balances = [
+        {"asset": "BTC",  "free": "1.0", "locked": "0.0"},
+        {"asset": "USDT", "free": "8000.0", "locked": "0.0"},
+    ]
+    client = _make_client(account_balances=balances, ticker_price="10000.0")
+    client.create_order = AsyncMock()  # must NOT be called
+    portfolio = _make_portfolio(equity=10_000.0)
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.LIQUIDATE_BTC_ON_STARTUP = False   # the new default
+        mock_settings.REGISTRY_DB = db_path
+        mock_settings.QTY_STEP_SIZE = 0.00001
+        mock_settings.MIN_NOTIONAL  = 100.0
+        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    client.create_order.assert_not_called()              # no liquidation SELL
+    assert abs(portfolio.btc_balance - 1.0) < 1e-9        # BTC retained for shorts
+    assert abs(portfolio.equity - 18_000.0) < 1e-6        # 8000 USDT + 1 BTC × 10000
 
 
 def test_s2_ticker_failure_falls_back_to_zero_btc_price(tmp_path):

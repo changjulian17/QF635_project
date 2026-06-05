@@ -42,6 +42,7 @@ from config import settings
 from execution.orders import IOCLimitOrder, OCOOrder
 from models import FillDetail, MicroOrderRequest
 from risk.killswitch import GlobalKillswitch
+from risk.sizing import clamp_stop_bps
 
 logger = logging.getLogger(__name__)
 
@@ -353,7 +354,9 @@ class OrderManager:
 
         protection_wall_price = req.micro_signal.protection_wall.price
         raw_bps    = abs(signal_price - protection_wall_price) / signal_price * 10_000
-        capped_bps = min(raw_bps, settings.PROTECTION_MAX_DISTANCE_BPS)
+        capped_bps = clamp_stop_bps(
+            raw_bps, settings.PROTECTION_MIN_DISTANCE_BPS, settings.PROTECTION_MAX_DISTANCE_BPS
+        )
         sl_distance = signal_price * capped_bps / 10_000
         if sl_distance < 1e-8:
             logger.warning(
@@ -510,7 +513,9 @@ class OrderManager:
         """
         raw_wall   = req.micro_signal.protection_wall.price
         raw_bps    = abs(fill_price - raw_wall) / fill_price * 10_000
-        capped_bps = min(raw_bps, settings.PROTECTION_MAX_DISTANCE_BPS)
+        capped_bps = clamp_stop_bps(
+            raw_bps, settings.PROTECTION_MIN_DISTANCE_BPS, settings.PROTECTION_MAX_DISTANCE_BPS
+        )
         sl_distance = fill_price * capped_bps / 10_000
         sl_price    = round(
             fill_price - sl_distance if entry_side == "BUY" else fill_price + sl_distance, 2
