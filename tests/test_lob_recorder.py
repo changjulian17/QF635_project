@@ -600,3 +600,22 @@ def test_bucketed_snapshot_retains_resolution_for_wall_detection():
     levels = [(float(p), float(q)) for p, q in bids]
     walls = identify_walls(levels, "bid", sigma_threshold=2.5, window=5)
     assert len(walls) >= 1, "planted wall not detectable in bucketed snapshot"
+
+
+def test_seed_failure_does_not_mark_synced():
+    """REST seed failure must leave _synced False (no recording on a partial book)."""
+    import aiohttp
+    rec, tmp = _recorder_with_tmpdb()
+
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    try:
+        with patch("core.lob_recorder.aiohttp.ClientSession",
+                   side_effect=aiohttp.ClientError("seed boom")), \
+             patch("core.lob_recorder.asyncio.sleep", new=_no_sleep):
+            asyncio.run(rec._sync_snapshot())
+        assert rec._synced is False, "recorder marked synced despite failed REST seed"
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)

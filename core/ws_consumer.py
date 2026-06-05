@@ -17,6 +17,7 @@ from models import AggTrade, Candle, SharedState
 logger = logging.getLogger(__name__)
 
 _MAX_CONNECTION_SECONDS = 86_000  # reconnect 400 s before Binance's 24 h limit
+_SEED_MAX_ATTEMPTS      = 3        # REST seed retries before staying UNSYNCED
 
 
 class HeartbeatMonitor:
@@ -289,41 +290,51 @@ class BinanceWebSocketConsumer:
                 logger.warning("[WS] Malformed message: %s", exc)
 
     async def _sync_lob_snapshot(self) -> None:
-        """
-        Fetch a REST depth snapshot to seed the local book, then apply any
-        diffs that arrived during the fetch. Mirrors the LOBRecorder pattern.
-        Falls back to marking synced anyway so data continues to flow on failure.
+        """Seed the local book from a REST snapshot, retrying on failure.
+
+        Only sets _lob_synced=True after a successful seed, so Gate 0 never sees
+        SYNCED on a partial book reconstructed from diffs alone.
         """
         url = f"{settings.REST_BASE}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    resp.raise_for_status()
-                    snap = await resp.json()
+        for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        resp.raise_for_status()
+                        snap = await resp.json()
 
-            self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
-            self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
-            last_uid = int(snap["lastUpdateId"])
+                self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
+                self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
+                last_uid = int(snap["lastUpdateId"])
+                for event in self._lob_pending:
+                    if int(event.get("u", 0)) <= last_uid:
+                        continue
+                    self._apply_depth_diff(event)
+                self._lob_pending.clear()
+                self._lob_update_id = last_uid
+                self._lob_synced = True
+                logger.info(
+                    "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
+                    last_uid, len(self._bid_book), len(self._ask_book),
+                )
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
+                logger.error(
+                    "[WS] LOB seed attempt %d/%d failed: %s", attempt, _SEED_MAX_ATTEMPTS, exc,
+                )
+                await asyncio.sleep(min(2 ** (attempt - 1), 5))
 
-            for event in self._lob_pending:
-                if int(event.get("u", 0)) <= last_uid:
-                    continue
-                self._apply_depth_diff(event)
-
-            self._lob_update_id = last_uid
-            logger.info(
-                "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
-                last_uid, len(self._bid_book), len(self._ask_book),
-            )
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.error("[WS] LOB REST seed failed (%s) — continuing with buffered diffs.", exc)
-        finally:
-            self._lob_pending.clear()
-            self._lob_synced = True
-            if self._bid_book and self._ask_book:
+        # All attempts failed — stay unsynced so Gate 0 won't trade on a partial book.
+        self._lob_pending.clear()
+        self._lob_synced = False
+        logger.critical(
+            "[WS] LOB seed failed after %d attempts — staying UNSYNCED (Gate 0 will block)",
+            _SEED_MAX_ATTEMPTS,
+        )
+        if self._bid_book and self._ask_book:
                 self._enqueue_latest_depth_snapshot(
                     self._reconstruct_depth_msg(int(time.time() * 1000))
                 )
