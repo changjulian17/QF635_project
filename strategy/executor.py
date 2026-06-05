@@ -24,7 +24,7 @@ from core.cvd import WelfordOnline
 from core.signal_telemetry import SignalRecord
 from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState
 from risk.engine import TIER_MIN_CONFIDENCE, TIER_SCALARS
-from risk.sizing import clamp_stop_bps
+from risk.sizing import clamp_stop_bps, cap_risk_fraction
 from strategy.spec import EntryRules
 
 logger = logging.getLogger(__name__)
@@ -466,6 +466,14 @@ class StrategyExecutor:
         if not ok:
             self._reject(rec, "GATE_3_FAIL", reason)
             return
+
+        # Cap per-trade risk by the remaining daily-loss budget. gate_3_capital only
+        # checks remaining > 0, so near exhaustion a full-size trade could risk more
+        # than the allowance left — clamp the risk fraction to remaining / equity.
+        if self._equity_fn is not None and self._budget is not None:
+            _eq = self._equity_fn()
+            if _eq > 0:
+                notional_hint = round(cap_risk_fraction(notional_hint, _eq, budget_remaining), 6)
 
         # Gate 3 position-size check — reject if estimated notional exceeds MAX_ORDER_NOTIONAL_PCT
         # of equity. Uses bps-capped sl_distance from mid_price for a consistent estimate with

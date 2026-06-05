@@ -316,7 +316,7 @@ Single class used identically in live trading and backtesting. Uses Welford onli
 **Position Sizing:**
 ```
 notional_hint = confidence × KELLY_FRACTION × RISK_PER_TRADE_PCT × tier_scalar
-sl_distance   = signal_price × min(protection_wall_bps, PROTECTION_MAX_DISTANCE_BPS) / 10,000
+sl_distance   = signal_price × clamp(protection_wall_bps, PROTECTION_MIN_DISTANCE_BPS, PROTECTION_MAX_DISTANCE_BPS) / 10,000
 qty           = floor((equity × notional_hint / sl_distance) / QTY_STEP_SIZE) × QTY_STEP_SIZE
 ```
 `notional_hint` is computed in `StrategyExecutor` (Gate 2). Final qty is computed in `OrderManager._place_entry`.
@@ -487,6 +487,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `LOB_FRESH_WALL_MS` | `3_000` | Protection wall must appear within this window |
 | `LOB_STALE_WALL_MS` | `30_000` | Prune wall states not seen for this long |
 | `PROTECTION_MAX_DISTANCE_BPS` | `25.0` | Max protection wall distance from mid |
+| `PROTECTION_MIN_DISTANCE_BPS` | `1.0` | Min protection wall distance from mid — floors the stop so size stays bounded; rejects degenerate near-mid walls |
 | `PRICE_PRUNE_INTERVAL` | `100` | Prune stale price keys every N bars — **legacy-engine-only; see TODO** |
 | `PRICE_PRUNE_BAND` | `0.02` | Keep prices within ±2% of current mid — **legacy-engine-only; see TODO** |
 | `MICRO_PRICE_MOVE_FLOOR_BPS` | `3.0` | Minimum price move to confirm sweep |
@@ -514,7 +515,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `TIER_PASSIVE_PCT` | `0.009` | ≥ 0.9% DOV loss → PASSIVE (no new entries) |
 | `TIER_HALTED_PCT` | `0.01` | ≥ 1.0% DOV loss → HALTED |
 | `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 5-min cooldown |
-| `RISK_PER_TRADE_PCT` | `0.01` | Equity risked per trade (1%) |
+| `RISK_PER_TRADE_PCT` | `0.001` | Equity risked per trade (0.1%) — sized for ~10 bps microstructure stops |
 | `KELLY_FRACTION` | `0.25` | Fractional Kelly applied to sizing |
 | `ATR_MULTIPLIER_SL` | `1.5` | Stop-loss distance in ATR units |
 | `ATR_MULTIPLIER_TP` | `3.0` | Take-profit distance in ATR units |

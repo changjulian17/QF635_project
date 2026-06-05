@@ -18,6 +18,11 @@ from models import FeatureVector, MicroSignal
 
 logger = logging.getLogger(__name__)
 
+# NOTE: `pattern_r2` and `protection_wall_present` are always 0 in live + replay —
+# FeatureComputer.compute() is called without them in executor.py and tick_replay.py
+# (pattern_r2 has no live source; protection_wall_present is known at signal time but
+# not wired in). Before training a model, either wire real values or drop them from
+# FEATURE_ORDER, else the model learns on two dead features.
 FEATURE_ORDER: list[str] = [
     "price_vs_vwap", "obi_zscore", "cvd_delta", "vol_ratio",
     "atr_percentile", "rsi_value", "spread_bps", "pattern_r2",
