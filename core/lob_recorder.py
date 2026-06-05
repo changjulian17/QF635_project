@@ -29,7 +29,11 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _DEPTH_LEVELS        = 100     # levels per side kept in local book before bucketing
-_BUCKET_WIDTH        = 25.0    # USD — price bucket width for storage compression
+# USD price-bucket width for storage compression. Must stay fine enough to preserve the
+# LOB shape for wall detection: BTCUSDT's top-100 levels span only ~$15, so the old $25
+# width collapsed each snapshot to 1-2 buckets → identify_walls found nothing → 0 backtest
+# trades. $1 keeps ~15-25 buckets/side — enough resolution while still compressing.
+_BUCKET_WIDTH        = 1.0     # USD
 _FLUSH_RECORDS       = 100
 _FLUSH_SECONDS       = 5.0
 _MAX_RECONNECT_DELAY = 60.0
