@@ -40,6 +40,11 @@ class Settings(BaseSettings):
 
     # Execution
     DRY_RUN: bool = True
+    # When True, the startup reconciler sells all BTC → USDT to start "clean in USDT".
+    # MUST stay False for a strategy that takes SHORT entries: on a spot account a SHORT
+    # is a SELL of held BTC, so liquidating all BTC at startup makes every SHORT entry
+    # fail the "insufficient BTC" pre-flight. Default False keeps BTC inventory tradeable.
+    LIQUIDATE_BTC_ON_STARTUP: bool = False
     IOC_TIMEOUT_MS: int = 200          # IOC order max age before cancel-no-retry
     QTY_STEP_SIZE: float = 0.00001     # BTCUSDT LOT_SIZE stepSize
     MIN_NOTIONAL: float = 100.0        # BTCUSDT NOTIONAL filter minimum (USD)
@@ -77,6 +82,12 @@ class Settings(BaseSettings):
     MICRO_PRICE_MOVE_PERCENTILE: float = 0.90
     MICRO_PRICE_MOVE_MIN_SAMPLES: int = 50
     PROTECTION_MAX_DISTANCE_BPS: float = 25.0
+    # Minimum mid→protection-wall distance. A protective wall closer than this to mid is
+    # not a meaningful structural level — it implies a near-zero stop and therefore an
+    # unbounded position size (qty = risk / stop_distance). Filters degenerate signals
+    # (e.g. on the thin Binance testnet book, where walls sit ~0.001 bps from mid) and
+    # floors the stop distance used for sizing. Must be < PROTECTION_MAX_DISTANCE_BPS.
+    PROTECTION_MIN_DISTANCE_BPS: float = 1.0
     MICRO_MAX_HOLD_MS: int = 60_000
     MICRO_EXIT_SPREAD_HARD_CAP_BPS: float = 12.0
     LOB_FRESH_WALL_MS: int = 3_000    # protection wall must appear within this window
@@ -144,8 +155,9 @@ class Settings(BaseSettings):
             "MICRO_PRICE_MOVE_PERCENTILE must be in (0, 1)"
         assert 0 < self.MICRO_PRICE_MOVE_MIN_SAMPLES <= self.MICRO_PRICE_MOVE_WINDOW, \
             "MICRO_PRICE_MOVE_MIN_SAMPLES must be in [1, MICRO_PRICE_MOVE_WINDOW]"
-        assert self.PROTECTION_MAX_DISTANCE_BPS > 0.0, \
-            "PROTECTION_MAX_DISTANCE_BPS must be > 0"
+        assert 0.0 < self.PROTECTION_MIN_DISTANCE_BPS < self.PROTECTION_MAX_DISTANCE_BPS, \
+            (f"PROTECTION_MIN_DISTANCE_BPS ({self.PROTECTION_MIN_DISTANCE_BPS}) must be in "
+             f"(0, PROTECTION_MAX_DISTANCE_BPS={self.PROTECTION_MAX_DISTANCE_BPS})")
         assert self.MICRO_MAX_HOLD_MS > 0, \
             "MICRO_MAX_HOLD_MS must be > 0"
         assert self.MICRO_EXIT_SPREAD_HARD_CAP_BPS > 0.0, \

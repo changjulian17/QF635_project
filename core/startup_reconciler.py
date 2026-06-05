@@ -82,10 +82,12 @@ async def reconcile_on_startup(
             logger.warning("[Reconcile] Could not fetch ticker: %s", exc)
             btc_price = 0.0
 
-        # S2b — liquidate any BTC holdings to start clean in USDT
+        # S2b — optionally liquidate BTC holdings to start clean in USDT.
+        # Gated on LIQUIDATE_BTC_ON_STARTUP (default False): liquidating all BTC
+        # breaks SHORT entries, which sell held BTC on a spot account.
         try:
             _min_btc = settings.QTY_STEP_SIZE
-            if not settings.DRY_RUN and btc_price > 0 and btc_free > _min_btc:
+            if settings.LIQUIDATE_BTC_ON_STARTUP and not settings.DRY_RUN and btc_price > 0 and btc_free > _min_btc:
                 step = settings.QTY_STEP_SIZE
                 qty  = round(math.floor(btc_free / step) * step, 5)
                 limit_price = round(btc_price * 0.98, 2)  # 2% below last price, crosses bid on testnet
