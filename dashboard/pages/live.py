@@ -1,17 +1,28 @@
-import requests
+import json
+
 import dash
 import plotly.graph_objects as go
 from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
+from dash_extensions import WebSocket
 
 from config import settings
 from dashboard._db import fetch_portfolio_history, fetch_session_stats, fetch_signal_funnel, DBOffline
-from dashboard._logic import validate_ks_confirm as _validate_ks, fire_killswitch as _fire_ks
+from dashboard._logic import (
+    fire_killswitch as _fire_ks,
+    update_portfolio_state,
+    validate_ks_confirm as _validate_ks,
+)
 from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/", name="Live", redirect_from=["/live"])
 
 _API_BASE = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
+_WS_URL   = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/portfolio"
+
+# Server-side cache of the latest portfolio snapshot (shared across clients — the
+# engine pushes identical data to everyone, so a single cache is correct).
+_PORTFOLIO: dict = {}
 
 _TIER_COLORS = {
     "ACTIVE": "success",
@@ -35,7 +46,14 @@ def _metric_card(label: str, value: str, color: str = "light", width: int = 3) -
 
 
 layout = html.Div([
-    dcc.Interval(id="live-interval", interval=5000),
+    WebSocket(id="live-ws", url=_WS_URL),
+    dcc.Store(id="live-portfolio-tick"),                # bumps on each WS push
+    dcc.Interval(id="live-interval", interval=5000),    # 5s — drives session stats / funnel
+
+    # ── Header: connection badge ────────────────────────────────────────────
+    html.Div([
+        html.Span(id="live-conn-status"),
+    ], className="d-flex justify-content-end align-items-center mb-2"),
 
     # ── Portfolio metrics ──────────────────────────────────────────────────
     dbc.Row(id="live-metrics-row", className="mb-2 g-3"),
@@ -99,58 +117,26 @@ layout = html.Div([
 ])
 
 
-@callback(
-    Output("live-metrics-row", "children"),
-    Output("live-session-row", "children"),
-    Output("live-equity-chart", "figure"),
-    Output("live-funnel-table", "children"),
-    Output("live-positions-table", "children"),
-    Output("live-ks-status", "children"),
-    Output("live-ks-open-modal", "disabled"),
-    Output("live-balance-row", "children"),
-    Input("live-interval", "n_intervals"),
-    Input("engine-state-store", "data"),
-)
-def update_live_page(n, engine_state):
-    ks_active = engine_state.get("killswitch_active", False) if engine_state else False
-    engine_online = engine_state is not None
+# ── Render helpers ─────────────────────────────────────────────────────────
 
-    # ── Portfolio via REST ─────────────────────────────────────────────────
-    portfolio = None
-    try:
-        resp = requests.get(f"{_API_BASE}/api/portfolio", timeout=2)
-        if resp.ok:
-            portfolio = resp.json()
-    except Exception:
-        pass
+def _placeholder_metrics() -> list:
+    return [_metric_card(label, "—") for label in ("Equity", "Daily PnL", "Drawdown", "Risk Tier")]
 
-    equity    = portfolio.get("equity")       if portfolio else None
-    daily_pnl = portfolio.get("daily_pnl")   if portfolio else None
-    drawdown  = portfolio.get("drawdown_pct") if portfolio else None
-    usdt_bal  = portfolio.get("usdt_balance") if portfolio else None
-    btc_bal   = portfolio.get("btc_balance")  if portfolio else None
-    btc_mtm   = portfolio.get("btc_mtm")      if portfolio else None
-    btc_price = portfolio.get("btc_price", 0) if portfolio else 0
-    risk_tier = engine_state.get("risk_tier", "—") if engine_state else "—"
+
+def _build_metrics_row(portfolio: dict) -> list:
+    equity    = portfolio.get("equity")
+    daily_pnl = portfolio.get("daily_pnl")
+    drawdown  = portfolio.get("drawdown_pct")
+    risk_tier = portfolio.get("risk_tier") or "—"
     tier_color = _TIER_COLORS.get(risk_tier, "light")
 
-    usdt_str  = f"${usdt_bal:,.2f}"          if isinstance(usdt_bal, (int, float)) else "—"
-    btc_str   = f"{btc_bal:.6f} BTC"        if isinstance(btc_bal,  (int, float)) else "—"
-    mtm_str   = f"${btc_mtm:,.2f}"          if isinstance(btc_mtm,  (int, float)) and btc_price != 0 else "—"
-
-    balance_row = [
-        _metric_card("USDT Balance (at open)", usdt_str, width=4),
-        _metric_card("BTC Holdings (at open)", btc_str,  width=4),
-        _metric_card("BTC Value (at open)",    mtm_str,  width=4),
-    ]
-
-    equity_str = f"${equity:,.2f}"          if isinstance(equity,    (int, float)) else "—"
-    pnl_str    = f"${daily_pnl:+,.2f}"      if isinstance(daily_pnl, (int, float)) else "—"
-    dd_str     = f"{drawdown * 100:.2f}%"   if isinstance(drawdown,  (int, float)) else "—"
+    equity_str = f"${equity:,.2f}"        if isinstance(equity,    (int, float)) else "—"
+    pnl_str    = f"${daily_pnl:+,.2f}"    if isinstance(daily_pnl, (int, float)) else "—"
+    dd_str     = f"{drawdown * 100:.2f}%" if isinstance(drawdown,  (int, float)) else "—"
     pnl_color  = "success" if isinstance(daily_pnl, (int, float)) and daily_pnl >= 0 else "danger"
     dd_color   = "success" if isinstance(drawdown,  (int, float)) and drawdown < 0.02 else "warning"
 
-    metrics_row = [
+    return [
         _metric_card("Equity", equity_str),
         _metric_card("Daily PnL", pnl_str, pnl_color),
         _metric_card("Drawdown", dd_str, dd_color),
@@ -165,7 +151,98 @@ def update_live_page(n, engine_state):
         ),
     ]
 
-    # ── Session stats ──────────────────────────────────────────────────────
+
+def _build_balance_row(portfolio: dict) -> list:
+    usdt_bal  = portfolio.get("usdt_balance")
+    btc_bal   = portfolio.get("btc_balance")
+    btc_mtm   = portfolio.get("btc_mtm")
+    btc_price = portfolio.get("btc_price", 0)
+
+    usdt_str  = f"${usdt_bal:,.2f}"   if isinstance(usdt_bal, (int, float)) else "—"
+    btc_str   = f"{btc_bal:.6f} BTC"  if isinstance(btc_bal,  (int, float)) else "—"
+    mtm_str   = f"${btc_mtm:,.2f}"    if isinstance(btc_mtm,  (int, float)) and btc_price != 0 else "—"
+
+    return [
+        _metric_card("USDT Balance (at open)", usdt_str, width=4),
+        _metric_card("BTC Holdings (at open)", btc_str,  width=4),
+        _metric_card("BTC Value (at open)",    mtm_str,  width=4),
+    ]
+
+
+def _build_positions_table(portfolio: dict):
+    positions = portfolio.get("positions", []) or []
+    if not positions:
+        return html.P("No open positions.", className="text-muted")
+    return dbc.Table([
+        html.Thead(html.Tr([
+            html.Th("Side"), html.Th("Entry"), html.Th("Qty"),
+            html.Th("SL"), html.Th("TP"), html.Th("Unrealised PnL"),
+        ])),
+        html.Tbody([
+            html.Tr([
+                html.Td(p.get("side", "—")),
+                html.Td(f"{p['entry_price']:.2f}" if p.get("entry_price") is not None else "—"),
+                html.Td(f"{p['quantity']:.6f}"    if p.get("quantity")    is not None else "—"),
+                html.Td(f"{p['stop_loss']:.2f}"   if p.get("stop_loss")   is not None else "—"),
+                html.Td(f"{p['take_profit']:.2f}" if p.get("take_profit") is not None else "—"),
+                html.Td(f"{p['unrealised_pnl']:+.4f}" if p.get("unrealised_pnl") is not None else "—"),
+            ])
+            for p in positions
+        ]),
+    ], striped=True, bordered=True, hover=True, size="sm")
+
+
+# ── WS routing: append portfolio snapshot to the cache ─────────────────────
+
+@callback(
+    Output("live-portfolio-tick", "data"),
+    Input("live-ws", "message"),
+    prevent_initial_call=True,
+)
+def on_ws_message(message):
+    """Route one pushed portfolio payload to the server-side cache; return ts to trigger redraw."""
+    global _PORTFOLIO
+    if not message or "data" not in message:
+        return no_update
+    try:
+        msg = json.loads(message["data"])
+    except (TypeError, ValueError):
+        return no_update
+    _PORTFOLIO = update_portfolio_state(_PORTFOLIO, msg)
+    return msg.get("ts", no_update)
+
+
+# ── Portfolio section (WS-driven, 1 Hz) ────────────────────────────────────
+
+@callback(
+    Output("live-metrics-row", "children"),
+    Output("live-balance-row", "children"),
+    Output("live-positions-table", "children"),
+    Input("live-portfolio-tick", "data"),
+)
+def render_portfolio_section(_tick):
+    if not _PORTFOLIO:
+        return (
+            _placeholder_metrics(),
+            _build_balance_row({}),
+            html.P("Waiting for engine…", className="text-muted"),
+        )
+    return (
+        _build_metrics_row(_PORTFOLIO),
+        _build_balance_row(_PORTFOLIO),
+        _build_positions_table(_PORTFOLIO),
+    )
+
+
+# ── Session stats + equity curve + funnel section (5 s interval; 24 h) ─────
+
+@callback(
+    Output("live-session-row", "children"),
+    Output("live-equity-chart", "figure"),
+    Output("live-funnel-table", "children"),
+    Input("live-interval", "n_intervals"),
+)
+def update_session_section(_n):
     session_result = fetch_session_stats(hours=24)
     if isinstance(session_result, DBOffline) or not session_result:
         session_row = [dbc.Col(dbc.Alert("No session data yet.", color="secondary"), width=12)]
@@ -222,7 +299,6 @@ def update_live_page(n, engine_state):
             showlegend=False,
         )
 
-    # ── Signal funnel ──────────────────────────────────────────────────────
     funnel_result = fetch_signal_funnel(hours=24)
     if isinstance(funnel_result, DBOffline):
         funnel_table = dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
@@ -242,44 +318,41 @@ def update_live_page(n, engine_state):
     else:
         funnel_table = html.P("No signal data in last 24h.", className="text-muted")
 
-    # ── Active positions ───────────────────────────────────────────────────
-    positions = portfolio.get("positions", []) if portfolio else []
-    if positions:
-        pos_table = dbc.Table([
-            html.Thead(html.Tr([
-                html.Th("Side"), html.Th("Entry"), html.Th("Qty"),
-                html.Th("SL"), html.Th("TP"), html.Th("Unrealised PnL"),
-            ])),
-            html.Tbody([
-                html.Tr([
-                    html.Td(p.get("side", "—")),
-                    html.Td(f"{p['entry_price']:.2f}" if p.get("entry_price") is not None else "—"),
-                    html.Td(f"{p['quantity']:.6f}"    if p.get("quantity")    is not None else "—"),
-                    html.Td(f"{p['stop_loss']:.2f}"   if p.get("stop_loss")   is not None else "—"),
-                    html.Td(f"{p['take_profit']:.2f}" if p.get("take_profit") is not None else "—"),
-                    html.Td(f"{p['unrealised_pnl']:+.4f}" if p.get("unrealised_pnl") is not None else "—"),
-                ])
-                for p in positions
-            ]),
-        ], striped=True, bordered=True, hover=True, size="sm")
-    else:
-        pos_table = html.P("No open positions.", className="text-muted")
+    return session_row, equity_fig, funnel_table
 
-    # ── Kill switch status ─────────────────────────────────────────────────
+
+# ── Killswitch status (engine-state-driven) ────────────────────────────────
+
+@callback(
+    Output("live-ks-status", "children"),
+    Output("live-ks-open-modal", "disabled"),
+    Input("engine-state-store", "data"),
+)
+def update_ks_status(engine_state):
+    ks_active     = engine_state.get("killswitch_active", False) if engine_state else False
+    engine_online = engine_state is not None
     if ks_active:
-        ks_status = dbc.Alert(
-            "KILLSWITCH ACTIVE — engine restart required to resume trading.",
-            color="danger",
-        )
-        ks_disabled = True
-    elif not engine_online:
-        ks_status = dbc.Alert("Engine offline — kill switch unavailable.", color="secondary")
-        ks_disabled = True
-    else:
-        ks_status = html.Span()
-        ks_disabled = False
+        return dbc.Alert(
+            "KILLSWITCH ACTIVE — engine restart required to resume trading.", color="danger",
+        ), True
+    if not engine_online:
+        return dbc.Alert("Engine offline — kill switch unavailable.", color="secondary"), True
+    return html.Span(), False
 
-    return metrics_row, session_row, equity_fig, funnel_table, pos_table, ks_status, ks_disabled, balance_row
+
+# ── WS connection badge ────────────────────────────────────────────────────
+
+@callback(
+    Output("live-conn-status", "children"),
+    Input("live-ws", "state"),
+)
+def update_conn_status(state):
+    ready = (state or {}).get("readyState")
+    if ready == 1:
+        return dbc.Badge("● LIVE", color="success", className="fs-6")
+    if ready == 0:
+        return dbc.Badge("● Connecting…", color="warning", className="fs-6")
+    return dbc.Badge("● Engine offline", color="secondary", className="fs-6")
 
 
 @callback(

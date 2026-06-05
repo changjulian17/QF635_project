@@ -43,6 +43,24 @@ def decay_badge_label(rolling_sharpe: float, backtest_sharpe: float) -> str:
     return f"{ratio:.0%} — Decay Alert"
 
 
+def update_portfolio_state(state: dict, msg: dict) -> dict:
+    """Replace the cached portfolio state with the latest WS payload.
+
+    Pure function (no Dash/browser deps) so the streaming logic is unit-testable.
+
+    Portfolio is a *snapshot of current state*, not a stream of events, so each
+    valid push replaces the previous state entirely. Malformed messages or those
+    tagged with a non-portfolio type return the existing state unchanged.
+    """
+    if not isinstance(msg, dict):
+        return state
+    if msg.get("type") != "portfolio":
+        return state
+    if "equity" not in msg:  # minimal shape check — the one field we always render
+        return state
+    return msg
+
+
 def update_lob_buffer(buffer: list[dict], msg: dict, max_points: int) -> list[dict]:
     """Append a streamed LOB snapshot to the rolling buffer, trimmed to max_points.
 
