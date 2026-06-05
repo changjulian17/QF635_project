@@ -213,16 +213,17 @@ def test_apply_diff_updates_last_update_id():
 # ── Local order book — _bucket_levels ────────────────────────────────────────
 
 def test_bucket_levels_aggregates_same_bucket():
-    """Two levels that fall in the same $25 bucket must sum their qty."""
+    """Two levels that fall in the same price bucket must sum their qty."""
     rec, tmp = _recorder_with_tmpdb()
     try:
-        # Both 30000 and 30010 fall in the [30000, 30025) bucket
-        levels = [(30000.0, 1.0), (30010.0, 2.0)]
+        # Two prices guaranteed to share one bucket, regardless of _BUCKET_WIDTH
+        base = (30000.0 // _BUCKET_WIDTH) * _BUCKET_WIDTH
+        levels = [(base + _BUCKET_WIDTH * 0.1, 1.0), (base + _BUCKET_WIDTH * 0.6, 2.0)]
         result = rec._bucket_levels(levels)
         assert len(result) == 1
         bucket_price = float(result[0][0])
         bucket_qty   = float(result[0][1])
-        assert bucket_price == 30000.0  # math.floor(30000 / 25) * 25
+        assert bucket_price == base
         assert abs(bucket_qty - 3.0) < 1e-9
     finally:
         rec._conn.close()
@@ -546,3 +547,26 @@ def test_cleanup_purges_old_records():
     finally:
         rec._conn.close()
         os.unlink(tmp)
+
+
+def test_bucketed_snapshot_retains_resolution_for_wall_detection():
+    """A realistic dense BTC book, once bucketed for storage, must keep enough price
+    resolution for identify_walls to work — otherwise recorded data is useless for
+    backtesting (regression: $25 buckets collapsed the book to ~2 levels → 0 walls)."""
+    from strategy.microstructure import identify_walls
+
+    rec = LOBRecorder()
+    # 100 bid levels spaced $0.5 apart (span ~$50, typical near-top BTC density).
+    # Non-periodic background (so adjacent levels don't sum to a constant per bucket →
+    # rolling std stays > 0) with a ~10x liquidity wall planted at level 20.
+    top = 62000.0
+    bg = lambda i: 1.0 + ((i * 37) % 13) * 0.1   # varied 1.0..2.2, period 13
+    rec._bid_book = {round(top - i * 0.5, 2): (12.0 if i == 20 else bg(i)) for i in range(100)}
+    rec._ask_book = {round(top + 1 + i * 0.5, 2): bg(i) for i in range(100)}
+
+    bids, _asks = rec._snapshot_levels()
+    assert len(bids) >= 10, f"bucketed snapshot too coarse for wall detection: {len(bids)} levels"
+
+    levels = [(float(p), float(q)) for p, q in bids]
+    walls = identify_walls(levels, "bid", sigma_threshold=2.5, window=5)
+    assert len(walls) >= 1, "planted wall not detectable in bucketed snapshot"
