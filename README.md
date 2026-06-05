@@ -42,7 +42,7 @@ OPTIONAL BOOST — Chart Pattern Context (OHLCV) [not active in live path]
            │
            ▼
 FILTER — Confidence Scorer
-  Rule-based placeholder (→ XGBoost after data collection)
+  XGBoostScorer (falls back to RuleBasedScorer when no trained artifact)
   confidence ≥ 0.58 required to proceed
            │
            ▼
@@ -122,15 +122,11 @@ CryptoSentinel/
 │   ├── registry.db            # SQLite: signal_records + system events
 │   └── {name}_v{version}.yaml # Frozen YAML strategy specs (written directly to strategies/ by StrategyRegistry)
 │
-├── engine/                    # Legacy shim directory + real-time hub
+├── engine/                    # Shared persistence, snapshot, and hub components
 │   ├── db_writer.py           # SQLite persistence + rolling cleanup + lob_snapshots table
 │   ├── lob_snapshot_writer.py # LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
-│   ├── realtime_hub.py        # RealtimeHub — fan-out JSON pushes to /ws/lob WebSocket clients
-│   ├── microstructure_engine.py # Legacy MicrostructureEngine (NOT started in live path; used by backtesting tests only)
-│   ├── websocket_consumer.py  # Shim re-exporting core.ws_consumer
-│   ├── lob_engine.py          # Shim re-exporting core.lob_engine
-│   ├── risk_engine.py         # Shim re-exporting risk.engine
-│   └── order_manager.py       # Shim re-exporting execution.order_manager
+│   ├── realtime_hub.py        # RealtimeHub — fan-out JSON pushes to WebSocket clients
+│   └── microstructure_engine.py # Legacy MicrostructureEngine (NOT started in live path; used by backtesting tests only)
 │
 ├── scripts/
 │   ├── test_connection.py     # Connectivity + auth check
@@ -138,7 +134,7 @@ CryptoSentinel/
 │   ├── run_backtest.py        # CLI for tick-level walk-forward backtest (writes to backtest_results.db)
 │   └── signal_injector.py     # Synthetic signal injection — dev/testnet only (start_test.sh)
 │
-├── tests/                     # pytest unit + integration tests (451 total)
+├── tests/                     # pytest unit + integration tests (510 total)
 │   │                          # Phase 1 — live trading engine
 │   ├── test_models.py
 │   ├── test_lob_engine.py
@@ -175,8 +171,10 @@ CryptoSentinel/
 │   ├── test_dashboard_registry.py
 │   ├── test_dashboard_walls.py
 │   ├── test_lob_snapshot_writer.py
+│   ├── test_portfolio_broadcast.py
 │   ├── test_realtime_hub.py
-│   └── test_rest_api.py
+│   ├── test_rest_api.py
+│   └── test_signal_broadcast.py
 │
 ```
 
@@ -514,7 +512,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `TIER_PASSIVE_PCT` | `0.009` | ≥ 0.9% DOV loss → PASSIVE (no new entries) |
 | `TIER_HALTED_PCT` | `0.01` | ≥ 1.0% DOV loss → HALTED |
 | `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 5-min cooldown |
-| `RISK_PER_TRADE_PCT` | `0.01` | Equity risked per trade (1%) |
+| `RISK_PER_TRADE_PCT` | `0.001` | Equity risked per trade (0.1% — sized for ~10 bps microstructure stops) |
 | `KELLY_FRACTION` | `0.25` | Fractional Kelly applied to sizing |
 | `ATR_MULTIPLIER_SL` | `1.5` | Stop-loss distance in ATR units |
 | `ATR_MULTIPLIER_TP` | `3.0` | Take-profit distance in ATR units |
@@ -559,7 +557,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 ### Dashboard
 | Setting | Default | Description |
 |---|---|---|
-| `DASHBOARD_API_PORT` | `8080` | Port for aiohttp REST API (`/api/health`, `/api/portfolio`, `/api/killswitch`) |
+| `DASHBOARD_API_PORT` | `8080` | Port for aiohttp REST API (`/api/health`, `/api/portfolio`, `/api/session`, `/api/killswitch`) and WebSocket streams (`/ws/lob`, `/ws/portfolio`, `/ws/signals`) |
 
 ### Alerting
 | Setting | Default | Description |
@@ -572,47 +570,49 @@ All settings live in `config.py` and can be overridden via `.env`.
 
 ```
 Phase 1 — Live trading engine
-tests/test_risk_engine.py            8 tests  — sync_tier transitions, tier callback, record_trade_result, mark_unrealised, session reset
-tests/test_microstructure_engine.py 30 tests  — legacy microstructure engine
-tests/test_executor.py              40 tests  — all 7 gates, telemetry emission
-tests/test_order_manager.py         30 tests  — IOC entry, OCO bracket, fill handling
-tests/test_lob_engine.py            22 tests  — state machine, gap detection, wall scan
-tests/test_startup_reconciler.py    17 tests  — reconciliation, midnight reset
-tests/test_microstructure.py        22 tests  — wall identification, absorption, sweep
-tests/test_lob_recorder.py          27 tests  — recorder flush, reconnect, stats
-tests/test_features.py              14 tests  — Welford, no-lookahead, VWAP reset
-tests/test_cvd.py                   14 tests  — buy/sell CVD, 5-bar delta, std
-tests/test_db_writer.py              9 tests  — SQLite write, upsert, purge
-tests/test_signal_telemetry.py      10 tests  — flush, batch, timeout, outcome update
-tests/test_orders.py                11 tests  — order domain classes and enums
-tests/test_ws_consumer.py           12 tests  — heartbeat states, rate thresholds, hysteresis
-tests/test_models.py                 6 tests  — PortfolioState, WallState, FeatureVector
-tests/test_integration.py            2 tests  — end-to-end signal → execution pipeline
+tests/test_risk_engine.py            11 tests  — sync_tier transitions, tier callback, record_trade_result, mark_unrealised, session reset
+tests/test_microstructure_engine.py  30 tests  — legacy microstructure engine
+tests/test_executor.py               45 tests  — all 7 gates, telemetry emission
+tests/test_order_manager.py          34 tests  — IOC entry, OCO bracket, fill handling
+tests/test_lob_engine.py             22 tests  — state machine, gap detection, wall scan
+tests/test_startup_reconciler.py     17 tests  — reconciliation, midnight reset
+tests/test_microstructure.py         26 tests  — wall identification, absorption, sweep
+tests/test_lob_recorder.py           27 tests  — recorder flush, reconnect, stats
+tests/test_features.py               14 tests  — Welford, no-lookahead, VWAP reset
+tests/test_cvd.py                    15 tests  — buy/sell CVD, 5-bar delta, std
+tests/test_db_writer.py               9 tests  — SQLite write, upsert, purge
+tests/test_signal_telemetry.py       23 tests  — flush, batch, timeout, outcome update, hub broadcast, tape management
+tests/test_orders.py                 11 tests  — order domain classes and enums
+tests/test_ws_consumer.py            12 tests  — heartbeat states, rate thresholds, hysteresis
+tests/test_models.py                  6 tests  — PortfolioState, WallState, FeatureVector
+tests/test_integration.py             2 tests  — end-to-end signal → execution pipeline
 
 Phase 3 — REST API + LOB snapshot writer + Dash dashboard
-tests/test_rest_api.py              11 tests  — /api/health, /api/portfolio, /api/killswitch
-tests/test_lob_snapshot_writer.py    9 tests  — snapshot writer, rolling cap, WAL mode
-tests/test_realtime_hub.py           6 tests  — RealtimeHub fan-out, connection drop, /ws/lob endpoint
-tests/test_dashboard_live.py         6 tests  — /live page callback, engine badge, kill switch
-tests/test_dashboard_lob.py          6 tests  — /lob buffer helpers, CVD accumulation, dedup
-tests/test_dashboard_registry.py     4 tests  — /registry page, strategy lifecycle display
-tests/test_dashboard_walls.py        6 tests  — /walls page callback, trace structure, invalid-JSON guard
-tests/test_alerting.py               3 tests  — AlertDispatcher webhook, empty-URL guard
+tests/test_rest_api.py               11 tests  — /api/health, /api/portfolio, /api/session, /api/killswitch
+tests/test_lob_snapshot_writer.py     9 tests  — snapshot writer, rolling cap, WAL mode
+tests/test_realtime_hub.py            6 tests  — RealtimeHub fan-out, connection drop, /ws/lob endpoint
+tests/test_dashboard_live.py         10 tests  — /live page callback, engine badge, kill switch
+tests/test_dashboard_lob.py          15 tests  — /lob buffer helpers, CVD accumulation, dedup
+tests/test_dashboard_registry.py      4 tests  — /registry page, strategy lifecycle display
+tests/test_dashboard_walls.py         6 tests  — /walls page callback, trace structure, invalid-JSON guard
+tests/test_alerting.py                3 tests  — AlertDispatcher webhook, empty-URL guard
+tests/test_signal_broadcast.py        9 tests  — /ws/signals payload shape, SignalTelemetry hub broadcast, tape management
+tests/test_portfolio_broadcast.py     7 tests  — /ws/portfolio payload shape, _portfolio_mtm_loop broadcast, killswitch guard
 
 Phase 2 — Backtesting + strategy lifecycle
-tests/test_bt_event_engine.py       24 tests  — event-driven engine: tiers, exits, full run
-tests/test_registry.py              29 tests  — lifecycle gates, YAML roundtrip, promotion
-tests/test_bt_tick_replay.py        16 tests  — tick replay fidelity, streaming, CVD reset
-tests/test_bt_walk_forward.py        9 tests  — window splits, OOS isolation, leaderboard
-tests/test_bt_metrics.py            10 tests  — Sharpe, MDD, PF, composite score
-tests/test_validator.py              7 tests  — null repair, duplicate removal, gap detection
-tests/test_scorer.py                 7 tests  — XGBoost train, AUC, save/load, fallback
-tests/test_fetcher.py                6 tests  — OHLCV fetch, cache, resample
-tests/test_bt_signals.py             7 tests  — signal arrays, no-lookahead, SL/TP NaN
-tests/test_bt_vectorbt.py            6 tests  — Optuna optimisation, sensitivity
-tests/test_bt_costs.py               5 tests  — round-trip cost, maker/taker, zero qty
+tests/test_bt_event_engine.py        24 tests  — event-driven engine: tiers, exits, full run
+tests/test_registry.py               29 tests  — lifecycle gates, YAML roundtrip, promotion
+tests/test_bt_tick_replay.py         16 tests  — tick replay fidelity, streaming, CVD reset
+tests/test_bt_walk_forward.py         9 tests  — window splits, OOS isolation, leaderboard
+tests/test_bt_metrics.py             10 tests  — Sharpe, MDD, PF, composite score
+tests/test_validator.py               7 tests  — null repair, duplicate removal, gap detection
+tests/test_scorer.py                  7 tests  — XGBoost train, AUC, save/load, fallback
+tests/test_fetcher.py                 6 tests  — OHLCV fetch, cache, resample
+tests/test_bt_signals.py              7 tests  — signal arrays, no-lookahead, SL/TP NaN
+tests/test_bt_vectorbt.py             6 tests  — Optuna optimisation, sensitivity
+tests/test_bt_costs.py                5 tests  — round-trip cost, maker/taker, zero qty
 ──────────────────────────────────────────────────────────────────────────────
-Total                              451 tests
+Total                               510 tests
 ```
 
 ---
@@ -712,17 +712,17 @@ These rules are invariants. Any code that violates them is incorrect.
 ### Lead-quant backlog
 
 - [ ] **Dead code — MicrostructureEngine**: `engine/microstructure_engine.py` (~410 lines) is not started in `main.py`'s TaskGroup and has no live producer. `ms_bar_queue` is orphaned. Either wire it into the live path or delete it — currently it creates confusion about the actual signal source.
-- [ ] **Dead code — engine shims**: `engine/lob_engine.py`, `engine/risk_engine.py`, `engine/websocket_consumer.py`, `engine/order_manager.py` are one-line re-export shims. No external code should depend on them; remove the shims and update any remaining importers.
+- [x] **Dead code — engine shims**: `engine/lob_engine.py`, `engine/risk_engine.py`, `engine/websocket_consumer.py`, `engine/order_manager.py` have been removed. `engine/` now contains only real implementations: `db_writer.py`, `lob_snapshot_writer.py`, `realtime_hub.py`, and `microstructure_engine.py` (legacy, backtesting only).
 - [ ] **Redundant config — pattern settings**: `PATTERN_LOOKBACK`, `SWING_WINDOW`, `BREAKOUT_VOL_MULT`, `MIN_R2` in `config.py` have no consumer in the live codebase. Remove or annotate clearly as reserved for a future pattern module.
 - [ ] **Unused FeatureVector fields**: `pattern_r2` and `protection_wall_present` are always 0 in the live path — `executor.py` never passes them into `FeatureComputer.compute()`. XGBoost trains on these zero-variance columns. Either wire the inputs or drop the features from `FEATURE_ORDER` and retrain.
 - [ ] **Gate 4 spread check is duplicated**: `gate_4_order_selection()` checks both `EntryRules.spread_max_bps` (8.0) and `spread_p95 × 2`. The hard cap and the adaptive cap serve the same purpose; consolidate into a single threshold derived from session p95 data with a sensible floor.
 - [ ] **Position sizing ignores remaining_budget**: `notional_hint` is computed from `confidence × KELLY × RISK_PCT × tier_scalar` without consulting `DailyBudget.remaining`. A run of near-threshold trades could drain the budget silently — add a budget-fraction cap to `notional_hint` in `gate_3_position_size`.
 - [ ] **Test coverage gap — StrategyExecutor + RiskEngine integration**: Gate 3 capital gate and tier-elevated confidence are tested in isolation but no test exercises the full `StrategyExecutor → OrderManager → fill_processor` path under a non-FULL risk tier. Add at least one integration scenario for REDUCED/MINIMAL tier flow.
 - [x] **Test coverage gap — HeartbeatMonitor SUSTAINED_DEGRADED**: `test_ws_consumer.py` now includes `test_heartbeat_sustained_degraded` and `test_heartbeat_recovery_from_sustained` covering the 10 s transition and hysteresis band recovery (12 tests total).
-- [ ] **Test coverage gap — RiskEngine throttle and circuit breakers**: `test_risk_engine.py` has only 8 tests (sync_tier transitions and basic record_trade_result). The 5-tier drawdown circuit breaker, consecutive-loss cooldown timer, budget-loss tier thresholds, and all `_check_circuit_breakers()` branches are untested. This is a liability for a risk-critical module — expand to at least 25 tests covering the full tier ladder and each circuit breaker trigger.
+- [ ] **Test coverage gap — RiskEngine throttle and circuit breakers**: `test_risk_engine.py` has only 11 tests (sync_tier transitions and basic record_trade_result). The 5-tier drawdown circuit breaker, consecutive-loss cooldown timer, budget-loss tier thresholds, and all `_check_circuit_breakers()` branches remain under-covered. This is a liability for a risk-critical module — expand to at least 25 tests covering the full tier ladder and each circuit breaker trigger.
 - [ ] **Dead config — CANDLE_INTERVAL**: `config.py` defines `CANDLE_INTERVAL: str = "1s"` with the comment "legacy — ws_consumer uses this", but `ws_consumer.py` never imports or reads this setting (it uses `TIMEFRAME` for klines). Remove the setting or delete it before more code takes a dependency on it.
 - [ ] **Dead config — legacy-engine-only settings**: `SWEEP_THRESHOLD`, `SWEEP_LEVELS`, `BREAK_PROTECT_WINDOW_MS`, `ICEBERG_PRICE_TOL`, `BOOK_FLIP_SIGMA`, `BOOK_FLIP_MIN_CONSUMED`, `BOOK_FLIP_AGG_RATIO`, `BREAK_MIN_VOL`, `RELOAD_SIGMA`, `ICEBERG_WINDOW_MS`, `ICEBERG_MIN_REPLENISH`, `ICEBERG_MIN_QTY`, `PRICE_PRUNE_INTERVAL`, `PRICE_PRUNE_BAND` are defined in `config.py` but consumed exclusively by `engine/microstructure_engine.py` (the legacy engine that is not started in the live path). Note: `OBI_BREAK_THRESH` remains in the list above but IS used — it drives a reference line in `dashboard/pages/lob.py` (visual only, not a trading gate). Removing the legacy engine removes all consumers for the other settings listed; delete them at that point.
-- [ ] **STARTING_EQUITY duplication**: `main.py` defines `STARTING_EQUITY = 10_000.0` as a module-level constant instead of reading `settings.STARTING_EQUITY`. If someone sets `STARTING_EQUITY` in `.env`, the main orchestrator ignores it — only `backtesting/event_engine.py` picks it up. Consolidate: replace the `main.py` constant with `settings.STARTING_EQUITY` so the value is controlled from a single source.
+- [x] **STARTING_EQUITY duplication**: Resolved. `main.py` line 67 defines `STARTING_EQUITY = settings.STARTING_EQUITY`, reading from the single `config.py` source. All component initialisation also reads from `settings.STARTING_EQUITY` directly.
 - [ ] **Absorption prerequisite adds false negatives**: `gate_1_microstructure()` hard-gates on `prior_absorption == True`. A wall that appears and is immediately consumed (e.g. within the first 500ms of its first_seen_ts) will always be rejected — absorption can never arm a wall that is gone before it persists. At the 100ms tick rate this blocks genuine fast institutional sweeps of newly-posted deep liquidity. Evaluate demoting Absorption from a Gate 1 hard prerequisite to a Gate 2 scoring bonus (e.g. `absorption_ratio > 0 → +0.10` in `RuleBasedScorer`) to recover these signals without opening a false-positive flood.
 - [ ] **Dual-store registry is over-engineered for a single-strategy system**: `strategy/registry.py` writes every spec to both a YAML file and a SQLite `strategies` table. For the current single-strategy deployment, a single SQLite store would suffice; the YAML mirror adds sync risk (YAML written first, then DB — a crash between the two leaves them inconsistent). Consolidate into SQLite-only in `strategy/registry.py` and `strategy/builder.py`, retaining YAML export as an explicit `export()` method for human review.
 - [ ] **Low-signal features in FEATURE_ORDER**: `strategy/scorer.py` trains XGBoost on all 15 features including `pattern_r2` (always 0.0 in live path — `strategy/executor.py` never passes it to `FeatureComputer.compute()`), `vwap_reclaim` (binary flag, rarely 1 on a per-tick basis), and `rsi_value` (14-bar candle momentum on a 5m timeframe — coarse relative to 100ms microstructure signals). After first XGBoost training run, call `scorer.feature_importances()` and prune any feature with importance < 0.01 from `FEATURE_ORDER`; retrain and compare AUC.
