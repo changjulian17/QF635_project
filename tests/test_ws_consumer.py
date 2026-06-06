@@ -186,3 +186,21 @@ def test_heartbeat_recovery_from_sustained():
 
     assert hb.status == "HEALTHY"
     assert hb._degraded_since_ms is None
+
+
+def test_ws_seed_failure_stays_unsynced():
+    """REST seed failure must leave _lob_synced False so Gate 0 won't see SYNCED."""
+    import asyncio, aiohttp
+    from core.ws_consumer import BinanceWebSocketConsumer
+
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
+
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    with patch("core.ws_consumer.aiohttp.ClientSession",
+               side_effect=aiohttp.ClientError("seed boom")), \
+         patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+        asyncio.run(consumer._sync_lob_snapshot())
+
+    assert consumer._lob_synced is False

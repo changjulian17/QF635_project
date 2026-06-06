@@ -153,3 +153,35 @@ def test_budget_rebase_updates_equity_preserves_pnl():
     assert b.dov          == pytest.approx(1_000_000.0)
     assert b.hard_limit   == pytest.approx(10_000.0)
     assert b.realised_pnl == pytest.approx(-50.0)  # PnL must survive rebase
+
+
+# ── Circuit breakers: drawdown + consecutive-loss cooldown ──────────────────
+
+def test_drawdown_circuit_breaker_halts():
+    pf = make_portfolio(equity=9_400.0, peak_equity=10_000.0)   # 6% drawdown >= 5%
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.HALTED
+
+
+def test_drawdown_below_threshold_does_not_halt():
+    pf = make_portfolio(equity=9_600.0, peak_equity=10_000.0)   # 4% drawdown < 5%
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is not CircuitBreakerStatus.HALTED
+
+
+def test_consecutive_loss_cooldown_pauses():
+    pf = make_portfolio(consecutive_losses=3)                   # >= MAX_CONSECUTIVE_LOSSES
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED
+
+
+def test_cooldown_persists_after_losses_cleared():
+    pf = make_portfolio(consecutive_losses=3)
+    eng = make_engine(pf)
+    eng.sync_tier()                                             # arms 300s cooldown
+    pf.consecutive_losses = 0                                   # losses reset, but window still open
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED

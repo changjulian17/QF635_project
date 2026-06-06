@@ -44,7 +44,7 @@ def _make_db(tmp_path, n: int = 60, separable: bool = False) -> str:
             )
         """)
         for i in range(n):
-            fv_arr = rng.standard_normal(15).tolist()
+            fv_arr = rng.standard_normal(len(FEATURE_ORDER)).tolist()
             if separable:
                 fv_arr[1] = float(rng.choice([-2.0, 2.0]))   # obi_zscore at index 1
                 outcome = "WIN" if fv_arr[1] > 0 else "LOSS"
@@ -91,7 +91,7 @@ def test_scorer_auc_above_chance_on_synthetic_data(tmp_path):
 
 
 def test_feature_importances_cover_all_features(tmp_path):
-    """feature_importances() must return all 15 features with positive total importance."""
+    """feature_importances() must return all FEATURE_ORDER features with positive total importance."""
     db = _make_db(tmp_path, n=100, separable=True)
     scorer = XGBoostScorer.train_from_registry(db_path=db, min_trades=50)
     imps = scorer.feature_importances()

@@ -79,3 +79,6 @@ strategies/registry.db-wal
 
 # Notes
 research/
+
+# Agent guidance scratch (not tracked)
+AGENTS.md
