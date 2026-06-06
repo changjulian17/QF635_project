@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: str = ""
     BINANCE_API_SECRET: str = ""
     BINANCE_TESTNET: bool = True
+    BINANCE_DEMO: bool = False
+    DEMO_BINANCE_API_KEY: str = ""
+    DEMO_BINANCE_API_SECRET: str = ""
     WS_BASE: str = "wss://stream.testnet.binance.vision"
     REST_BASE: str = "https://testnet.binance.vision"
     LOB_RECORDER_WS: str = "wss://stream.binance.com:9443"  # real Binance public stream (Rule 4)
@@ -59,7 +62,7 @@ class Settings(BaseSettings):
     LOB_DEPTH: int = 1000
     LOB_OBI_DEPTH: int = 20
     LOB_HISTORY: int = 18000
-    LOB_HEATMAP_BUCKET: float = 5.0
+    LOB_HEATMAP_BUCKET: float = 1.0
     LOB_WALL_SIGMA: float = 2.5        # σ threshold for Wall identification (§5)
     LOB_WALL_WINDOW: int = 5           # ticks each side for Wall median/std
     RELOAD_SIGMA: float = 3.0
@@ -128,7 +131,17 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":
-        if not self.DRY_RUN and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
+        if self.BINANCE_TESTNET and self.BINANCE_DEMO:
+            raise ValueError(
+                "BINANCE_TESTNET and BINANCE_DEMO cannot both be True. "
+                "Set BINANCE_TESTNET=false when using demo.binance.com."
+            )
+        if self.BINANCE_DEMO and (not self.DEMO_BINANCE_API_KEY or not self.DEMO_BINANCE_API_SECRET):
+            raise ValueError(
+                "DEMO_BINANCE_API_KEY and DEMO_BINANCE_API_SECRET must be set "
+                "when BINANCE_DEMO=True. Add them to .env."
+            )
+        if not self.DRY_RUN and not self.BINANCE_DEMO and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
             raise ValueError(
                 "BINANCE_API_KEY and BINANCE_API_SECRET must be set when DRY_RUN=False. "
                 "Add them to .env or set DRY_RUN=True for paper trading."

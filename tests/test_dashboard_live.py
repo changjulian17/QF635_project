@@ -121,14 +121,15 @@ def test_portfolio_state_rejects_malformed():
     assert update_portfolio_state(prev, {"type": "portfolio"}) is prev   # no equity
 
 
-def test_portfolio_state_replaces_not_merges():
-    """Snapshot semantics: each push replaces the prior state in full."""
+def test_portfolio_state_merges_new_wins():
+    """Merge semantics: new msg fields win; fields absent from msg are preserved from state."""
     from dashboard._logic import update_portfolio_state
-    prev = {"type": "portfolio", "equity": 10_000.0, "positions": [{"side": "LONG"}]}
+    prev = {"type": "portfolio", "equity": 10_000.0, "positions": [{"side": "LONG"}], "risk_tier": "FULL"}
     nxt  = {"type": "portfolio", "equity":  9_950.0, "positions": []}
     result = update_portfolio_state(prev, nxt)
-    assert result == nxt          # full replacement
-    assert result["positions"] == []  # not merged with prior list
+    assert result["equity"]    == 9_950.0       # new value wins
+    assert result["positions"] == []            # new value wins (overrides prior list)
+    assert result["risk_tier"] == "FULL"        # preserved from state (absent in nxt)
 
 
 def test_ks_modal_clears_input_on_post_failure():

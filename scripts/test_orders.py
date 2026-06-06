@@ -16,10 +16,13 @@ TRADE_QTY = 0.001  # BTC — small enough to always be affordable on testnet
 
 
 async def run() -> None:
+    _api_key    = settings.DEMO_BINANCE_API_KEY if settings.BINANCE_DEMO else settings.BINANCE_API_KEY
+    _api_secret = settings.DEMO_BINANCE_API_SECRET if settings.BINANCE_DEMO else settings.BINANCE_API_SECRET
     client = await AsyncClient.create(
-        api_key    = settings.BINANCE_API_KEY,
-        api_secret = settings.BINANCE_API_SECRET,
+        api_key    = _api_key,
+        api_secret = _api_secret,
         testnet    = settings.BINANCE_TESTNET,
+        demo       = settings.BINANCE_DEMO,
     )
 
     try:

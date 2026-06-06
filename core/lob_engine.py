@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class LocalOrderBook:
     """
     Maintains a local copy of the Binance order book. Receives reconstructed
-    full-book snapshots (top 100 levels per side) produced by BinanceWebSocketConsumer
+    full-book snapshots (full available depth) produced by BinanceWebSocketConsumer
     from the incremental diff stream (btcusdt@depth@100ms + REST seed).
 
     State machine:
@@ -53,7 +53,7 @@ class LocalOrderBook:
     async def apply_snapshot(self, msg: dict) -> bool:
         """
         Apply a full-book snapshot message reconstructed by BinanceWebSocketConsumer
-        from the incremental diff stream (100 levels per side).
+        from the incremental diff stream (full available depth).
 
         Returns True if the snapshot was applied, False if it was rejected
         (stale lastUpdateId). On rejection the book is NOT cleared — it

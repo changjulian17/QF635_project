@@ -111,10 +111,9 @@ class HeartbeatMonitor:
 
 
 class BinanceWebSocketConsumer:
-    # Incremental diff-depth stream: 100 levels per side vs the old 20-level snapshot.
-    # At BTC prices ~$77k, 100 levels spans ~$50–200 from mid — sufficient range for
-    # deep-book institutional wall detection above the transaction cost floor.
-    _DEPTH_LEVELS = 100
+    # Incremental diff-depth stream seeded by a 1000-level REST snapshot.
+    # All levels from the internal book are forwarded to LOBEngine on each tick
+    # — no artificial depth cap — so the full available book is visible downstream.
     _MAX_PENDING_DIFFS = 500   # cap pending diff buffer during REST snapshot fetch
 
     STREAMS = [
@@ -141,7 +140,7 @@ class BinanceWebSocketConsumer:
         self._heartbeat_cb    = heartbeat_cb
         self._running         = False
         self._reconnect_delay = 1.0
-        self._max_delay       = 60.0
+        self._max_delay       = 10.0
         self.heartbeat        = HeartbeatMonitor()
         self._frame_counts: dict[str, int] = {}
         self._frame_log_ts: float = 0.0
@@ -319,13 +318,12 @@ class BinanceWebSocketConsumer:
 
     def _reconstruct_depth_msg(self, event_ms: int) -> dict:
         """
-        Build a full-snapshot-style dict from the local book (top _DEPTH_LEVELS
-        per side) so downstream consumers (LOBEngine, MicrostructureDetector)
-        receive the same message format as the old depth20 stream, but with
-        100 levels instead of 20.
+        Build a full-snapshot-style dict from the local book so downstream
+        consumers (LOBEngine, MicrostructureDetector) receive the complete
+        available depth on every tick.
         """
-        bids = sorted(self._bid_book.items(), reverse=True)[: self._DEPTH_LEVELS]
-        asks = sorted(self._ask_book.items())[: self._DEPTH_LEVELS]
+        bids = sorted(self._bid_book.items(), reverse=True)
+        asks = sorted(self._ask_book.items())
         return {
             "lastUpdateId": self._lob_update_id,
             "E": event_ms,

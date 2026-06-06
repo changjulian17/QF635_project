@@ -68,11 +68,11 @@ open_window() {
 
 echo "Launching TESTNET components (DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true)..."
 open_window "LOB Recorder"               "'$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine (TESTNET)"   "DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true TIMEFRAME=1s '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Trading Engine (TESTNET)"   "BINANCE_TESTNET=true DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true TIMEFRAME=1s '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
 open_window "Dash Dashboard"             "'$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""
 echo "  LOB Recorder             → python -m core.lob_recorder"
-echo "  Trading Engine (TESTNET) → DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true python main.py"
+echo "  Trading Engine (TESTNET) → BINANCE_TESTNET=true DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true python main.py"
 echo "  Dash Dashboard           → http://127.0.0.1:8050"

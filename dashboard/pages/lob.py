@@ -24,13 +24,18 @@ from dash_extensions import WebSocket
 from plotly.subplots import make_subplots
 
 from config import settings
-from dashboard._db import fetch_lob_snapshots, fetch_agg_trades, fetch_cvd_series_24h, DBOffline
+from dashboard._db import (
+    fetch_lob_snapshots,
+    fetch_agg_trades,
+    fetch_agg_trade_bin_qtys,
+    DBOffline,
+)
 from dashboard._logic import add_event_markers, update_event_buffer, update_lob_buffer
 from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/lob", name="LOB")
 
-_DEPTH_WARNING = settings.LOB_DEPTH < 100
+_DEPTH_WARNING = settings.LOB_DEPTH < 500
 _STALE_THRESHOLD_S = 30  # flag data as stale after 30s without a new snapshot
 _SGT = timezone(timedelta(hours=8))
 _WS_URL = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/lob"
@@ -62,13 +67,9 @@ def _refresh_baseline_if_stale() -> None:
     if time.time() - _BASELINE_TS < _BASELINE_TTL:
         return
     since_24h = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
-    raw = fetch_agg_trades(since_24h, limit=800_000)
-    if raw and not isinstance(raw, DBOffline):
-        bdf = pd.DataFrame(raw)
-        bdf["price_bkt"] = (bdf["price"] / _BUCKET_SIZE).round() * _BUCKET_SIZE
-        bdf["ts_sec"]    = bdf["ts_event"] // 1000
-        agg = bdf.groupby(["ts_sec", "price_bkt", "is_buyer_maker"])["qty"].sum()
-        _BASELINE_BIN_QTYS = agg.values.astype(np.float64)
+    bin_qtys = fetch_agg_trade_bin_qtys(since_24h, _BUCKET_SIZE, limit=800_000)
+    if bin_qtys and not isinstance(bin_qtys, DBOffline):
+        _BASELINE_BIN_QTYS = np.asarray(bin_qtys, dtype=np.float64)
         _BASELINE_TS = time.time()
 
 
@@ -136,6 +137,33 @@ layout = html.Div([
 ])
 
 
+def _parse_levels(entry: dict, key: str) -> list:
+    """Return bid/ask levels from entry, parsing JSON lazily and caching in-place.
+
+    WS entries already have the key as a list — returned immediately.
+    DB-seeded entries have *_json strings instead; parsed on first access and cached
+    under the bare key so subsequent renders skip the JSON decode.
+    isinstance guard is NaN-safe (pd.DataFrame fills absent keys with float NaN).
+    """
+    val = entry.get(key)
+    if isinstance(val, list):
+        return val
+    raw = entry.get(key + "_json")
+    val = json.loads(raw) if raw else []
+    entry[key] = val
+    return val
+
+
+def _levels_to_arrays(entry: dict, key: str) -> tuple[np.ndarray, np.ndarray]:
+    levels = _parse_levels(entry, key)
+    if not levels:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    arr = np.asarray(levels, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    return arr[:, 0], arr[:, 1]
+
+
 def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pctile, events=None):
     """Build the 4-row LOB figure from a list of snapshot dicts (ascending by ts).
 
@@ -159,7 +187,7 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         rows=4, cols=1, shared_xaxes=True,
         row_heights=[0.50, 0.17, 0.17, 0.16],
         vertical_spacing=0.03,
-        subplot_titles=("Liquidity Heatmap", "OBI", "CVD (24h)", "Spread"),
+        subplot_titles=("Liquidity Heatmap", "OBI", "CVD", "Spread"),
     )
 
     # ── Row 1: heatmap ─────────────────────────────────────────────────────
@@ -175,18 +203,26 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         bid_matrix = np.zeros((n_prices, n_times))
         ask_matrix = np.zeros((n_prices, n_times))
 
+        # hm_snaps_raw is aligned with hm_df by construction (both are the last
+        # rows_needed entries of snaps/df). Direct dict iteration avoids the
+        # pd.DataFrame NaN-for-missing-keys footgun on DB-seeded entries.
+        hm_snaps_raw = list(snaps)[max(0, len(snaps) - rows_needed):]
         valid_cols = []
-        for col_idx, row in enumerate(hm_df.itertuples(index=False)):
+        for col_idx, entry_dict in enumerate(hm_snaps_raw):
             col_ok = False
-            for levels, matrix in (("bid_levels", bid_matrix), ("ask_levels", ask_matrix)):
+            for levels_key, matrix in (("bid_levels", bid_matrix), ("ask_levels", ask_matrix)):
                 try:
-                    for p, q in getattr(row, levels) or []:
-                        ri = int((p - price_lo) / bucket_size)
-                        if 0 <= ri < n_prices:
-                            matrix[ri, col_idx] += q
-                    col_ok = True
+                    prices, qtys = _levels_to_arrays(entry_dict, levels_key)
                 except Exception:
-                    pass
+                    continue
+                if len(prices) == 0:
+                    col_ok = True
+                    continue
+                ri = ((prices - price_lo) / bucket_size).astype(np.int64)
+                mask = (ri >= 0) & (ri < n_prices)
+                if np.any(mask):
+                    np.add.at(matrix[:, col_idx], ri[mask], qtys[mask])
+                col_ok = True
             valid_cols.append(col_ok)
 
         ts_labels = hm_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
@@ -240,21 +276,17 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         fig.add_hline(y=-settings.OBI_BREAK_THRESH, line=dict(dash="dot", color="red",  width=1), row=2, col=1)
         fig.add_hline(y=0, line=dict(color="white", width=0.5), row=2, col=1)
 
-        since_24h_ms = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
-        cvd_rows = fetch_cvd_series_24h(since_24h_ms)
-        if cvd_rows and not isinstance(cvd_rows, DBOffline):
-            cvd_ms  = np.array([r["ts_sec_ms"] for r in cvd_rows], dtype=np.int64)
-            cvd_cum = np.cumsum([r["delta"]     for r in cvd_rows])
-            # Use .timestamp()*1000: obi_df["ts"] is datetime64[us, UTC] in pandas 3.x,
-            # so astype(int64) gives microseconds — // 10**6 would yield seconds, not ms.
-            obi_ms  = np.array([int(t.timestamp() * 1000) for t in obi_df["ts"]], dtype=np.int64)
-            cvd_y   = [float(cvd_cum[np.argmin(np.abs(cvd_ms - t))]) for t in obi_ms]
-        else:
-            cvd_y = [0.0] * len(obi_ts)
+        # CVD from buffer — no DB query; cvd_delta already stored per snapshot
+        buf_ts_ms = np.array([int(pd.Timestamp(s["ts"]).timestamp() * 1000)
+                               for s in snaps], dtype=np.int64)
+        cvd_cum   = np.cumsum([s["cvd_delta"] for s in snaps])
+        obi_ms    = np.array([int(t.timestamp() * 1000) for t in obi_df["ts"]], dtype=np.int64)
+        cvd_idx   = np.searchsorted(buf_ts_ms, obi_ms, side="left").clip(0, len(cvd_cum) - 1)
+        cvd_y     = cvd_cum[cvd_idx].tolist()
 
         fig.add_trace(go.Scatter(
             x=obi_ts, y=cvd_y, mode="lines",
-            line=dict(color="orange", width=1.2), name="CVD (24h)",
+            line=dict(color="orange", width=1.2), name="CVD",
             fill="tozeroy", fillcolor="rgba(255,165,0,0.12)",
         ), row=3, col=1)
         fig.add_hline(y=0, line=dict(color="white", width=0.5), row=3, col=1)
@@ -286,10 +318,13 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         if trades and not isinstance(trades, DBOffline):
             tdf = pd.DataFrame(trades)
             if not tdf.empty:
-                tdf["snapped_x"] = [
-                    ts_labels[int(np.argmin(np.abs(snap_ms - t)))]
-                    for t in tdf["ts_event"].values
-                ]
+                trade_ms = tdf["ts_event"].to_numpy(dtype=np.int64)
+                right = np.searchsorted(snap_ms, trade_ms, side="left")
+                right = np.clip(right, 0, len(snap_ms) - 1)
+                left = np.clip(right - 1, 0, len(snap_ms) - 1)
+                use_left = np.abs(trade_ms - snap_ms[left]) <= np.abs(snap_ms[right] - trade_ms)
+                nearest_idx = np.where(use_left, left, right)
+                tdf["snapped_x"] = np.asarray(ts_labels, dtype=object)[nearest_idx]
                 tdf["price_bkt"] = (tdf["price"] / bucket_size).round() * bucket_size
                 tdf["ts_sec"]    = tdf["ts_event"] // 1000
 
@@ -347,6 +382,8 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
     fig.update_xaxes(showticklabels=False, row=2, col=1)
     fig.update_xaxes(showticklabels=False, row=3, col=1)
     fig.update_xaxes(title_text="Time (SGT)", row=4, col=1)
+    if not hm_df.empty:
+        fig.update_yaxes(range=[price_lo, price_hi], row=1, col=1)
 
     if is_stale:
         fig.add_annotation(
@@ -366,15 +403,11 @@ def _seed_buffer_from_db() -> str | None:
         return None
     seeded = []
     for r in rows:  # ascending (oldest first)
-        try:
-            bid = json.loads(r.get("bid_levels_json") or "[]")
-            ask = json.loads(r.get("ask_levels_json") or "[]")
-        except Exception:
-            bid, ask = [], []
         seeded.append({
             "ts": r["ts"], "mid_price": r["mid_price"], "spread": r["spread"],
             "obi": r["obi"], "cvd_delta": r["cvd_delta"],
-            "bid_levels": bid, "ask_levels": ask,
+            "bid_levels_json": r.get("bid_levels_json") or "[]",
+            "ask_levels_json": r.get("ask_levels_json") or "[]",
         })
     _BUFFER = seeded
     return seeded[-1]["ts"]
@@ -386,9 +419,19 @@ def _seed_buffer_from_db() -> str | None:
     prevent_initial_call=True,
 )
 def backfill_buffer(_n):
-    """Seed the server-side buffer once from the DB so the chart isn't empty on load."""
-    if _BUFFER:
-        return no_update
+    """Re-seed snapshots from DB and clear stale events on every page mount.
+
+    Always re-seeding ensures that snapshots accumulated while the page was not
+    open (engine writes continuously regardless of dashboard clients) are shown
+    immediately rather than waiting for the WS to trickle them in live.
+
+    _EVENTS is cleared because absorption/sweep events are broadcast-only and
+    not persisted to any DB table. Stale events from a prior session can sit at
+    old price levels after price moves, appearing far from mid. Clearing here
+    forces fresh accumulation once the WS reconnects.
+    """
+    global _EVENTS
+    _EVENTS = []
     ts = _seed_buffer_from_db()
     return ts if ts else no_update
 

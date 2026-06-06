@@ -354,6 +354,10 @@ class LOBRecorder:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_depth_ts ON depth_snapshots(ts_event)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON agg_trades(ts_event)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trades_cov "
+            "ON agg_trades(ts_event, qty, is_buyer_maker)"
+        )
         conn.commit()
         return conn
 

@@ -97,6 +97,51 @@ def fetch_agg_trades(
     return [dict(r) for r in reversed(rows)]
 
 
+def fetch_agg_trade_bin_qtys(
+    since_ts_ms: int,
+    bucket_size: float,
+    limit: int | None = 800_000,
+) -> Union[list[float], DBOffline]:
+    """Return per-second/per-price-bucket trade quantities for baseline percentiles."""
+    if not os.path.exists(LOB_TICK_DB):
+        return []
+    with lob_tick_db() as conn:
+        try:
+            if limit is None:
+                rows = conn.execute(
+                    """
+                    SELECT SUM(qty) AS qty
+                    FROM agg_trades
+                    WHERE ts_event >= ?
+                    GROUP BY (ts_event / 1000),
+                             ROUND(price / ?) * ?,
+                             is_buyer_maker
+                    """,
+                    (since_ts_ms, bucket_size, bucket_size),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT SUM(qty) AS qty
+                    FROM (
+                        SELECT ts_event, price, qty, is_buyer_maker
+                        FROM agg_trades
+                        WHERE ts_event >= ?
+                        ORDER BY ts_event DESC
+                        LIMIT ?
+                    )
+                    GROUP BY (ts_event / 1000),
+                             ROUND(price / ?) * ?,
+                             is_buyer_maker
+                    """,
+                    (since_ts_ms, limit, bucket_size, bucket_size),
+                ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] lob_tick offline: %s", e)
+            return DBOffline(str(e))
+    return [float(r["qty"]) for r in rows if r["qty"] is not None]
+
+
 def fetch_cvd_series_24h(since_ms: int) -> Union[list[dict], DBOffline]:
     """Per-second CVD delta from agg_trades, aggregated from since_ms to now."""
     if not os.path.exists(LOB_TICK_DB):
@@ -161,6 +206,34 @@ def fetch_signal_funnel(hours: int = 24) -> Union[list[dict], DBOffline]:
             logger.warning("[DB] registry offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in rows]
+
+
+def fetch_recent_signals(limit: int = 50) -> Union[list[dict], DBOffline]:
+    """Return the most recent ``limit`` signal records (newest first) for tape hydration."""
+    with registry_db() as conn:
+        try:
+            rows = conn.execute(
+                """SELECT timestamp, signal_id, micro_signal, gate_passed,
+                          rejection_reason, direction, confidence
+                   FROM signal_records
+                   ORDER BY timestamp DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] registry offline: %s", e)
+            return DBOffline(str(e))
+    return [
+        {
+            "ts":               r["timestamp"],
+            "signal_id":        r["signal_id"],
+            "micro_signal":     r["micro_signal"],
+            "gate_passed":      r["gate_passed"],
+            "rejection_reason": r["rejection_reason"],
+            "direction":        r["direction"],
+            "confidence":       r["confidence"],
+        }
+        for r in rows
+    ]
 
 
 def fetch_gate_funnel_drift() -> Union[list[dict], DBOffline]:

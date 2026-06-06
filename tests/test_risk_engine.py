@@ -153,3 +153,45 @@ def test_budget_rebase_updates_equity_preserves_pnl():
     assert b.dov          == pytest.approx(1_000_000.0)
     assert b.hard_limit   == pytest.approx(10_000.0)
     assert b.realised_pnl == pytest.approx(-50.0)  # PnL must survive rebase
+
+
+# ── record_trade_result used as budget_update_cb ──────────────────────────────
+
+def test_record_trade_result_updates_all_portfolio_counters():
+    """record_trade_result must update every counter that the dashboard reads."""
+    pf = make_portfolio()
+    engine = make_engine(portfolio=pf)
+
+    engine.record_trade_result(pnl=50.0)
+
+    assert pf.equity      == pytest.approx(10_050.0)
+    assert pf.daily_pnl   == pytest.approx(50.0)
+    assert pf.peak_equity == pytest.approx(10_050.0)
+    assert pf.num_trades  == 1
+    assert pf.num_wins    == 1
+    assert pf.consecutive_losses == 0
+
+
+def test_record_trade_result_loss_increments_consecutive_losses():
+    pf = make_portfolio()
+    engine = make_engine(portfolio=pf)
+
+    engine.record_trade_result(pnl=-100.0)
+
+    assert pf.num_trades         == 1
+    assert pf.num_wins           == 0
+    assert pf.consecutive_losses == 1
+    assert pf.daily_pnl          == pytest.approx(-100.0)
+    assert pf.equity             == pytest.approx(9_900.0)
+
+
+def test_record_trade_result_as_budget_update_cb_updates_budget():
+    """Verify the callback wiring: record_trade_result must also update budget.realised_pnl."""
+    pf     = make_portfolio()
+    budget = DailyBudget.from_equity(pf.starting_equity)
+    engine = make_engine(portfolio=pf, budget=budget)
+
+    engine.record_trade_result(pnl=-200.0)
+
+    assert budget.realised_pnl == pytest.approx(-200.0)
+    assert pf.budget_loss_pct  == pytest.approx(budget.loss_pct)

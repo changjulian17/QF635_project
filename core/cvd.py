@@ -97,6 +97,10 @@ class CVDCalculator:
         """Net signed volume over the trailing 24 hours (minute-binned)."""
         return sum(delta for _, delta in self._rolling_bins)
 
+    def get_raw_cvd(self) -> float:
+        """Return the current running CVD total (sum of all signed quantities seen so far)."""
+        return self._cvd
+
     def get_cvd_delta(self, ticks: int = 5) -> float:
         """CVD change over the last `ticks` ticks. Returns 0.0 if insufficient history."""
         if len(self._history) <= ticks:

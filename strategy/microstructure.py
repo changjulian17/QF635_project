@@ -20,7 +20,8 @@ from models import AggTrade, LOBLevel, LOBSnapshot, MicroSignal, WallState
 
 logger = logging.getLogger(__name__)
 
-_CONSUMED_RATIO   = 0.15     # wall qty below this fraction of initial → consumed
+_CONSUMED_RATIO          = 0.15      # wall qty below this fraction of peak → consumed
+_ABSORPTION_ARM_TTL_MS   = 60_000    # armed flag expires if absorption not re-confirmed within 60 s
 
 
 def price_move_floor_pct(floor_bps: float | None = None) -> float:
@@ -134,7 +135,7 @@ def identify_walls(
 
 def detect_absorption(
     wall: WallState,
-    cvd_delta_1t: float,
+    cvd_delta: float,
     price_move_pct: float,
     reload_ratio: float,   # explicit param (not wall.reload_ratio) so tests can inject arbitrary values
 ) -> bool:
@@ -142,15 +143,15 @@ def detect_absorption(
     Return True when all four absorption conditions are met:
       1. Wall has been visible >= 500 ms (is_persistent)
       2. Directional aggression against the wall:
-           bid wall → sellers aggressing (cvd_delta_1t < 0)
-           ask wall → buyers aggressing  (cvd_delta_1t > 0)
+           bid wall → sellers aggressing (cvd_delta < 0)
+           ask wall → buyers aggressing  (cvd_delta > 0)
       3. Price barely moved (|price_move_pct| < configured floor)
-      4. Wall has reloaded to >= 70% of initial qty
+      4. Wall has reloaded to >= 70% of its rolling peak qty
     """
     if wall.side == "bid":
-        directional_aggression = cvd_delta_1t < -1e-9
+        directional_aggression = cvd_delta < -1e-9
     else:
-        directional_aggression = cvd_delta_1t > 1e-9
+        directional_aggression = cvd_delta > 1e-9
 
     return (
         wall.is_persistent
@@ -250,11 +251,13 @@ class MicrostructureDetector:
         self._hub          = hub
 
         self._wall_states: dict[float, WallState] = {}
-        self._absorption_armed: dict[float, bool] = {}  # keyed by wall price
+        self._absorption_armed: dict[float, bool] = {}     # keyed by wall price
+        self._absorption_armed_ts: dict[float, int] = {}   # ms epoch of last arm confirmation
         self._prev_mid: float = 0.0
         self._abs_mid_history: deque[float] = deque(maxlen=settings.MICRO_PRICE_MOVE_WINDOW)
         self._absorption_batch: dict[float, WallState] = {}
         self._absorption_last_log_ms: int = 0
+        self._prev_snapshot_raw_cvd: float = 0.0           # CVD at end of previous depth snapshot
 
     async def run(self) -> None:
         asyncio.create_task(self._collect_trades())
@@ -291,6 +294,10 @@ class MicrostructureDetector:
         mid      = (best_bid + best_ask) / 2.0
         now_ms   = int(time.time() * 1000)
 
+        # CVD accumulated since the previous depth snapshot — more meaningful than
+        # a fixed N-trade window, which can span < 1 ms on a busy market.
+        snapshot_cvd_delta = self._cvd.get_raw_cvd() - self._prev_snapshot_raw_cvd
+
         bid_levels = sorted(bids_raw.items(), reverse=True)
         ask_levels = sorted(asks_raw.items())
         new_walls = {
@@ -299,11 +306,12 @@ class MicrostructureDetector:
             + identify_walls(ask_levels, "ask", self._sigma, self._window)
         }
 
-        # Update existing walls; create new ones
+        # Update existing walls; create new ones; maintain rolling qty_peak
         for price, wall_data in new_walls.items():
             if price in self._wall_states:
                 ws = self._wall_states[price]
                 ws.qty_current  = wall_data["qty"]
+                ws.qty_peak     = max(ws.qty_peak, ws.qty_current)
                 ws.last_seen_ts = now_ms
             else:
                 self._wall_states[price] = WallState(
@@ -321,6 +329,7 @@ class MicrostructureDetector:
             if price not in new_walls:
                 book = bids_raw if ws.side == "bid" else asks_raw
                 ws.qty_current  = book.get(price, 0.0)
+                ws.qty_peak     = max(ws.qty_peak, ws.qty_current)
                 ws.last_seen_ts = now_ms
 
         if self._feature_computer is not None:
@@ -336,15 +345,15 @@ class MicrostructureDetector:
             ]
             self._feature_computer.update_orderbook(snap, wall_dicts)
 
-        # Absorption check — 3-tick delta reduces single-trade noise while staying
-        # responsive enough to detect multi-trade aggression against a wall.
-        price_move_pct   = (mid - self._prev_mid) / self._prev_mid if self._prev_mid > 0 else 0.0
+        # Absorption check — use per-snapshot CVD delta (all trades since last depth update)
+        # rather than a fixed N-trade window that can span < 1 ms on BTC/USDT.
+        price_move_pct       = (mid - self._prev_mid) / self._prev_mid if self._prev_mid > 0 else 0.0
         price_move_threshold = rolling_abs_move_threshold(tuple(self._abs_mid_history))
-        cvd_delta_3t     = self._cvd.get_cvd_delta(3)
         for ws in self._wall_states.values():
-            if detect_absorption(ws, cvd_delta_3t, price_move_pct, ws.reload_ratio):
+            if detect_absorption(ws, snapshot_cvd_delta, price_move_pct, ws.reload_ratio):
                 was_armed = self._absorption_armed.get(ws.price, False)
                 self._absorption_armed[ws.price] = True
+                self._absorption_armed_ts[ws.price] = now_ms  # refresh each confirmed tick
                 self._absorption_batch[ws.price] = ws
                 if not was_armed and self._hub is not None:
                     await self._hub.broadcast({
@@ -397,13 +406,18 @@ class MicrostructureDetector:
             )
             if fired:
                 pw = info.get("protection_wall")
+                armed_ts  = self._absorption_armed_ts.get(price, 0)
+                prior_abs = (
+                    self._absorption_armed.get(price, False)
+                    and (now_ms - armed_ts) <= _ABSORPTION_ARM_TTL_MS
+                )
                 signal = MicroSignal(
                     signal_type      = "SWEEP_WITH_PROTECTION",
                     direction        = info["direction"],
                     timestamp_ms     = now_ms,
                     consumed_wall    = ws,
                     protection_wall  = pw,
-                    prior_absorption = self._absorption_armed.get(price, False),
+                    prior_absorption = prior_abs,
                     cvd_std          = cvd_spike_std,
                     price_move_pct   = price_move_pct,
                     mid_price        = mid,
@@ -428,6 +442,7 @@ class MicrostructureDetector:
                     cvd_spike_std, price_move_pct * 100,
                 )
                 self._absorption_armed.pop(price, None)
+                self._absorption_armed_ts.pop(price, None)
                 del self._wall_states[price]
                 break  # one signal per depth tick — prevents cascade signals from simultaneous sweeps
 
@@ -436,6 +451,8 @@ class MicrostructureDetector:
         for p in stale:
             del self._wall_states[p]
             self._absorption_armed.pop(p, None)
+            self._absorption_armed_ts.pop(p, None)
         if self._prev_mid > 0:
             self._abs_mid_history.append(abs(price_move_pct))
         self._prev_mid = mid
+        self._prev_snapshot_raw_cvd = self._cvd.get_raw_cvd()

@@ -63,13 +63,15 @@ def update_signal_tape(buffer: list[dict], msg: dict, max_events: int) -> list[d
 
 
 def update_portfolio_state(state: dict, msg: dict) -> dict:
-    """Replace the cached portfolio state with the latest WS payload.
+    """Merge the latest WS portfolio payload into the cached state.
 
     Pure function (no Dash/browser deps) so the streaming logic is unit-testable.
 
-    Portfolio is a *snapshot of current state*, not a stream of events, so each
-    valid push replaces the previous state entirely. Malformed messages or those
-    tagged with a non-portfolio type return the existing state unchanged.
+    Uses merge-then-update semantics: fields present in ``msg`` always win, but
+    fields absent from ``msg`` (e.g. ``risk_tier`` in a fill-push that was built
+    without it) are preserved from the prior ``state``. This prevents the Risk Tier
+    card from briefly blanking when a partial fill-push arrives between 1 Hz MTM ticks.
+    Malformed messages or those tagged with a non-portfolio type return unchanged state.
     """
     if not isinstance(msg, dict):
         return state
@@ -77,7 +79,9 @@ def update_portfolio_state(state: dict, msg: dict) -> dict:
         return state
     if "equity" not in msg:  # minimal shape check — the one field we always render
         return state
-    return msg
+    merged = dict(state)
+    merged.update(msg)
+    return merged
 
 
 def update_lob_buffer(buffer: list[dict], msg: dict, max_points: int) -> list[dict]:
@@ -157,6 +161,22 @@ def add_event_markers(fig, events, ts_labels, hm_ts_snap):
         hovertemplate="%{text}<extra></extra>",
     ), row=1, col=1)
     return len(abs_x), len(swp_x)
+
+
+def handle_position_event(state: dict, msg: dict) -> dict:
+    """Update cached position state from a position_opened or close_event WS message.
+
+    Pure function — returns a new dict; does not mutate inputs.
+    - position_opened: returns the position payload from msg (replaces any prior state)
+    - close_event: returns {} (position cleared)
+    Any other type returns state unchanged.
+    """
+    event_type = msg.get("type")
+    if event_type == "position_opened":
+        return {k: v for k, v in msg.items() if k != "type"}
+    if event_type == "close_event":
+        return {}
+    return state
 
 
 def update_event_buffer(buffer: list[dict], msg: dict, max_events: int) -> list[dict]:

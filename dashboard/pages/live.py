@@ -7,9 +7,10 @@ import dash_bootstrap_components as dbc
 from dash_extensions import WebSocket
 
 from config import settings
-from dashboard._db import fetch_portfolio_history, fetch_session_stats, fetch_signal_funnel, DBOffline
+from dashboard._db import fetch_portfolio_history, fetch_session_stats, fetch_signal_funnel, fetch_recent_signals, DBOffline
 from dashboard._logic import (
     fire_killswitch as _fire_ks,
+    handle_position_event,
     update_portfolio_state,
     update_signal_tape,
     validate_ks_confirm as _validate_ks,
@@ -30,6 +31,10 @@ _PORTFOLIO: dict = {}
 # clients — the engine pushes the same data to everyone.
 _TAPE_MAX = 50
 _TAPE: list[dict] = []
+
+# Latest position event from the user data stream (position_opened / close_event).
+# Cleared to {} on close_event; takes precedence over the 1 Hz MTM snapshot.
+_LAST_POSITION_EVENT: dict = {}
 
 _TIER_COLORS = {
     "ACTIVE": "success",
@@ -67,7 +72,9 @@ layout = html.Div([
     WebSocket(id="live-signals-ws", url=_SIGNALS_WS_URL),
     dcc.Store(id="live-portfolio-tick"),                # bumps on each portfolio WS push
     dcc.Store(id="live-signals-tick"),                  # bumps on each new signal event
+    dcc.Store(id="live-position-event-tick"),           # bumps on position_opened/close_event
     dcc.Interval(id="live-interval", interval=5000),    # 5s — drives session stats / funnel fallback
+    dcc.Interval(id="live-tape-init", interval=500, max_intervals=1),  # fires once to seed tape from DB
 
     # ── Header: connection badge ────────────────────────────────────────────
     html.Div([
@@ -266,12 +273,32 @@ def on_ws_message(message):
     return msg.get("ts", no_update)
 
 
+# ── WS routing: position_opened / close_event ──────────────────────────────
+
+@callback(
+    Output("live-position-event-tick", "data"),
+    Input("live-ws", "message"),
+    prevent_initial_call=True,
+)
+def on_ws_position_event(message):
+    global _LAST_POSITION_EVENT
+    if not message or "data" not in message:
+        return no_update
+    try:
+        msg = json.loads(message["data"])
+    except (TypeError, ValueError):
+        return no_update
+    if msg.get("type") not in ("position_opened", "close_event"):
+        return no_update
+    _LAST_POSITION_EVENT = handle_position_event(_LAST_POSITION_EVENT, msg)
+    return msg.get("ts", no_update)
+
+
 # ── Portfolio section (WS-driven, 1 Hz) ────────────────────────────────────
 
 @callback(
     Output("live-metrics-row", "children"),
     Output("live-balance-row", "children"),
-    Output("live-positions-table", "children"),
     Input("live-portfolio-tick", "data"),
 )
 def render_portfolio_section(_tick):
@@ -279,13 +306,24 @@ def render_portfolio_section(_tick):
         return (
             _placeholder_metrics(),
             _build_balance_row({}),
-            html.P("Waiting for engine…", className="text-muted"),
         )
     return (
         _build_metrics_row(_PORTFOLIO),
         _build_balance_row(_PORTFOLIO),
-        _build_positions_table(_PORTFOLIO),
     )
+
+
+# ── Active positions (sole owner of live-positions-table) ──────────────────
+
+@callback(
+    Output("live-positions-table", "children"),
+    Input("live-portfolio-tick", "data"),
+    Input("live-position-event-tick", "data"),
+)
+def render_positions(_portfolio_tick, _event_tick):
+    if _LAST_POSITION_EVENT:
+        return _build_positions_table({"positions": [_LAST_POSITION_EVENT]})
+    return _build_positions_table(_PORTFOLIO)
 
 
 # ── Session stats + equity curve (5 s interval; 24 h aggregates) ───────────
@@ -373,6 +411,23 @@ def on_signal_ws_message(message):
         return no_update
     _TAPE = update_signal_tape(_TAPE, msg, _TAPE_MAX)
     return msg.get("ts", no_update)
+
+
+@callback(
+    Output("live-signals-tick", "data", allow_duplicate=True),
+    Input("live-tape-init", "n_intervals"),
+    prevent_initial_call=True,
+)
+def _hydrate_tape_from_db(_n):
+    """Seed the tape from DB on page load so history is visible before the next WS push."""
+    global _TAPE
+    if _TAPE:
+        return no_update
+    rows = fetch_recent_signals(limit=_TAPE_MAX)
+    if isinstance(rows, DBOffline) or not rows:
+        return no_update
+    _TAPE = rows  # already newest-first from ORDER BY DESC
+    return rows[0].get("ts", no_update)
 
 
 @callback(

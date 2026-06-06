@@ -30,6 +30,7 @@ from core.lob_engine import LocalOrderBook
 from core.lob_recorder import LOBRecorder
 from core.signal_telemetry import SignalTelemetry
 from core.startup_reconciler import reconcile_on_startup
+from core.user_data_stream import UserDataStreamConsumer
 from core.ws_consumer import BinanceWebSocketConsumer
 from engine.db_writer import DBWriter, init_db
 from engine.lob_snapshot_writer import lob_snapshot_writer as _lob_snapshot_writer
@@ -262,9 +263,9 @@ def _build_portfolio_payload(
         for p in portfolio.positions
     ]
     if order_manager is not None:
-        dry_pos = order_manager.get_dry_run_position()
-        if dry_pos is not None:
-            positions = [dry_pos]
+        live_pos = order_manager.get_open_position()
+        if live_pos is not None:
+            positions = [live_pos]
     payload: dict = {
         "equity":             portfolio.equity,
         "usdt_balance":       portfolio.usdt_balance,
@@ -386,9 +387,11 @@ async def _api_server(
 
 
 async def _process_fills(
-    fill_q: asyncio.Queue,
-    portfolio: PortfolioState,
-    telemetry: SignalTelemetry,
+    fill_q:        asyncio.Queue,
+    portfolio:     PortfolioState,
+    telemetry:     SignalTelemetry,
+    order_manager=None,
+    portfolio_hub: RealtimeHub | None = None,
 ) -> None:
     """Consume and log IOC entry fills. Outcome/PnL recording happens via update_outcome_cb."""
     while True:
@@ -403,6 +406,11 @@ async def _process_fills(
             portfolio.avg_slippage_bps = 0.1 * fill.slippage_bps + 0.9 * portfolio.avg_slippage_bps
         portfolio.num_fill_samples += 1
         await telemetry.update_fill(fill.signal_id, fill.slippage_bps)
+        if portfolio_hub is not None:
+            payload = _build_portfolio_payload(portfolio, order_manager=order_manager)
+            payload["type"] = "portfolio"
+            payload["ts"]   = datetime.now(timezone.utc).isoformat()
+            await portfolio_hub.broadcast(payload)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -511,7 +519,15 @@ async def main() -> None:
     else:
         logger.warning("[Main] No registered strategy found — using default strategy_id and EntryRules")
 
-    # OrderManager constructed first so its reference can be injected into StrategyExecutor
+    # RiskEngine constructed before OrderManager so record_trade_result can be
+    # wired as budget_update_cb — it updates equity, daily_pnl, num_trades, and
+    # all other portfolio counters on every position close.
+    risk_engine = RiskEngine(
+        portfolio=portfolio,
+        budget=budget,
+        killswitch=killswitch,
+        tier_change_cb=_on_tier_change,
+    )
     order_manager = OrderManager(
         signal_queue=om_queue,
         fill_queue=fill_queue,
@@ -520,7 +536,8 @@ async def main() -> None:
         book_fn=lob_engine.best_bid_ask,
         ks_fire_cb=_ks_fire_cb,
         update_outcome_cb=telemetry.update_outcome,
-        budget_update_cb=lambda pnl: setattr(budget, "realised_pnl", budget.realised_pnl + pnl),
+        budget_update_cb=risk_engine.record_trade_result,
+        portfolio_hub=portfolio_hub,
     )
     strategy_executor = StrategyExecutor(
         micro_signal_queue=micro_signal_queue,
@@ -537,12 +554,6 @@ async def main() -> None:
     )
     if _active_spec:
         strategy_executor.set_entry_rules(_active_spec.entry_rules)
-    risk_engine = RiskEngine(
-        portfolio=portfolio,
-        budget=budget,
-        killswitch=killswitch,
-        tier_change_cb=_on_tier_change,
-    )
     db_writer = DBWriter(
         candle_queue=candle_db_queue,
         portfolio=portfolio,
@@ -552,14 +563,18 @@ async def main() -> None:
     # 2. Connect to Binance testnet ───────────────────────────────────────────
     client = None
     try:
+        _api_key    = settings.DEMO_BINANCE_API_KEY if settings.BINANCE_DEMO else settings.BINANCE_API_KEY
+        _api_secret = settings.DEMO_BINANCE_API_SECRET if settings.BINANCE_DEMO else settings.BINANCE_API_SECRET
+        _mode_label = "demo" if settings.BINANCE_DEMO else "testnet" if settings.BINANCE_TESTNET else "live"
         client = await AsyncClient.create(
-            api_key=settings.BINANCE_API_KEY,
-            api_secret=settings.BINANCE_API_SECRET,
-            testnet=settings.BINANCE_TESTNET,
+            api_key    = _api_key,
+            api_secret = _api_secret,
+            testnet    = settings.BINANCE_TESTNET,
+            demo       = settings.BINANCE_DEMO,
         )
-        logger.info("[Main] Connected to Binance testnet")
+        logger.info("[Main] Connected to Binance %s", _mode_label)
     except Exception as exc:
-        logger.warning("[Main] Could not connect to Binance testnet: %s — proceeding without client", exc)
+        logger.warning("[Main] Could not connect to Binance %s: %s — proceeding without client", _mode_label, exc)
 
     # 3. Reconcile on startup — BEFORE starting any coroutines ────────────────
     if client is not None:
@@ -567,6 +582,8 @@ async def main() -> None:
         await _backfill_feature_candles(client, feature_computer)
     else:
         logger.info("[Main] Skipping reconciliation — no Binance client")
+
+    user_data_stream = UserDataStreamConsumer(client=client) if client is not None else None
 
     # Rebase risk limits to actual Binance account equity
     actual_equity = portfolio.equity
@@ -590,6 +607,9 @@ async def main() -> None:
     # 5. LOB warm-up guard ────────────────────────────────────────────────────
     await asyncio.sleep(0.5)
 
+    async def _on_execution_report(msg: dict) -> None:
+        await order_manager.on_execution_report(msg)
+
     # 6. Start TaskGroup with all coroutines ──────────────────────────────────
     try:
         async with asyncio.TaskGroup() as tg:
@@ -605,7 +625,12 @@ async def main() -> None:
             tg.create_task(telemetry.run(),                                                   name="signal_telemetry")
             tg.create_task(midnight_reset_loop(risk_engine),                                  name="midnight_reset")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
-            tg.create_task(_process_fills(fill_queue, portfolio, telemetry),                  name="fill_processor")
+            tg.create_task(
+                _process_fills(fill_queue, portfolio, telemetry,
+                               order_manager=order_manager,
+                               portfolio_hub=portfolio_hub),
+                name="fill_processor",
+            )
             tg.create_task(
                 _portfolio_mtm_loop(
                     killswitch, budget, order_manager, portfolio, telemetry,
@@ -627,6 +652,11 @@ async def main() -> None:
                 ),
                 name="api_server",
             )
+            if not settings.DRY_RUN and user_data_stream is not None:
+                tg.create_task(
+                    user_data_stream.start(execution_report_cb=_on_execution_report),
+                    name="user_data_stream",
+                )
             if settings.TEST_SIGNAL_INJECT:
                 logger.info("[Main] TEST_SIGNAL_INJECT=True — signal injector starting")
                 from scripts.signal_injector import run as _injector_run
@@ -640,6 +670,8 @@ async def main() -> None:
         logger.error("[Main] TaskGroup error(s): %s", eg.exceptions)
     finally:
         await shutdown_handler(order_manager, portfolio, telemetry)
+        if user_data_stream is not None:
+            await user_data_stream.stop()
         if client is not None:
             await client.close_connection()
         logger.info("=== CryptoSentinel Stopped ===")

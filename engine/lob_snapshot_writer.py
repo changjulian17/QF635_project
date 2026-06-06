@@ -10,6 +10,7 @@ WebSocket clients so the dashboard can stream updates instead of polling the DB.
 """
 import asyncio
 import logging
+import sys
 
 from config import settings
 from core.cvd import CVDCalculator
@@ -20,10 +21,10 @@ from models import LOBSnapshot
 
 logger = logging.getLogger(__name__)
 
-# Bound the WebSocket payload: only push levels within this band of mid, capped
-# at this many per side. LOB_DEPTH is 1000, far more than the dashboard renders.
+# Bound the WebSocket payload: only push levels within this price band of mid,
+# capped at this many per side. 2000 levels covers the full book in normal conditions.
 _PUSH_PRICE_BAND = 2000.0
-_PUSH_MAX_LEVELS = 400
+_PUSH_MAX_LEVELS = 2000
 
 
 def _trim_levels(levels: list, mid: float) -> list[list[float]]:
@@ -56,7 +57,7 @@ async def lob_snapshot_writer(
         try:
             if lob_engine.lob_status != "SYNCED":
                 continue
-            snapshot: LOBSnapshot | None = await lob_engine.get_snapshot(depth=settings.LOB_DEPTH)
+            snapshot: LOBSnapshot | None = await lob_engine.get_snapshot(depth=sys.maxsize)
             if snapshot is None:
                 continue
             # Use LOB_OBI_DEPTH levels — consistent with engine OBI computation
