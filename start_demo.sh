@@ -55,13 +55,20 @@ if [[ -f /tmp/cs_engine.pid ]]; then
 fi
 
 # --- Pre-flight: connectivity test ---
-echo "Running connectivity test (scripts/test_futures_demo.py)..."
-if ! "$PYTHON" "$SCRIPT_DIR/scripts/test_futures_demo.py"; then
+echo "Running connectivity test (scripts/test_connection.py)..."
+if ! BINANCE_DEMO=true BINANCE_TESTNET=false "$PYTHON" "$SCRIPT_DIR/scripts/test_connection.py"; then
     log_err "Connectivity test failed. Check DEMO_BINANCE_API_KEY / DEMO_BINANCE_API_SECRET in .env."
     exit 1
 fi
 log_ok "Connectivity OK"
-export TRADING_MODE=demo
+
+# --- Export demo env overrides ---
+# These override .env defaults; pydantic-settings resolves env vars before the .env file.
+export BINANCE_TESTNET=false
+export BINANCE_DEMO=true
+export DRY_RUN=false
+export WS_BASE="wss://demo-stream.binance.com"
+export REST_BASE="https://demo-api.binance.com"
 
 # --- Launch each component in a new Terminal window ---
 open_window() {
@@ -77,9 +84,9 @@ open_window() {
 }
 
 echo "Launching DEMO components (BINANCE_DEMO=true, DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true)..."
-open_window "LOB Recorder"            "TRADING_MODE=demo '$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine (DEMO)"  "TRADING_MODE=demo '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
-open_window "Dash Dashboard"          "TRADING_MODE=demo '$PYTHON' dashboard/app.py"
+open_window "LOB Recorder"             "'$PYTHON' -m core.lob_recorder"
+open_window "Trading Engine (DEMO)"   "BINANCE_TESTNET=false BINANCE_DEMO=true DRY_RUN=false WS_BASE=wss://demo-stream.binance.com REST_BASE=https://demo-api.binance.com MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true TIMEFRAME=1s '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Dash Dashboard"           "'$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""
@@ -87,4 +94,4 @@ echo "  LOB Recorder          → python -m core.lob_recorder"
 echo "  Trading Engine (DEMO) → BINANCE_DEMO=true DRY_RUN=false python main.py"
 echo "  Dash Dashboard        → http://127.0.0.1:8050"
 echo ""
-echo "  View trades at        → https://demo.binance.com/en/futures/BTCUSDT"
+echo "  View trades at        → https://demo.binance.com/en/trade/BTC_USDT?type=spot"

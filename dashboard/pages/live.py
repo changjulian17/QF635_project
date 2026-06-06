@@ -37,6 +37,7 @@ _TAPE: list[dict] = []
 # Cleared to {} on close_event; takes precedence over the 1 Hz MTM snapshot.
 _LAST_POSITION_EVENT: dict = {}
 
+<<<<<<< HEAD
 # 30-second TTL cache for the two 24-hour aggregate queries that run at 5-second poll cadence.
 _STATS_CACHE: dict | list | None = None
 _STATS_CACHE_TS: float = 0.0
@@ -44,6 +45,8 @@ _FUNNEL_CACHE: list | None = None
 _FUNNEL_CACHE_TS: float = 0.0
 _LIVE_STATS_TTL: float = 30.0
 
+=======
+>>>>>>> 4d4f1d0 (feat: enhance WallState with qty_peak tracking and reload ratio adjustments)
 _TIER_COLORS = {
     "ACTIVE": "success",
     "REDUCED": "warning",
@@ -312,6 +315,7 @@ def on_ws_position_event(message):
 )
 def render_portfolio_section(_tick, _n):
     if not _PORTFOLIO:
+<<<<<<< HEAD
         history = fetch_portfolio_history(limit=1)
         if history and not isinstance(history, DBOffline):
             last = history[-1]
@@ -322,6 +326,12 @@ def render_portfolio_section(_tick, _n):
             }
             return (_build_metrics_row(fallback), _build_balance_row({}))
         return (_placeholder_metrics(), _build_balance_row({}))
+=======
+        return (
+            _placeholder_metrics(),
+            _build_balance_row({}),
+        )
+>>>>>>> 4d4f1d0 (feat: enhance WallState with qty_peak tracking and reload ratio adjustments)
     return (
         _build_metrics_row(_PORTFOLIO),
         _build_balance_row(_PORTFOLIO),

@@ -113,7 +113,7 @@ class OrderManager:
         ks_fire_cb: Callable[[str], Awaitable[None]] | None = None,
         update_outcome_cb: Callable[[str, str, float, float, float, float | None], Awaitable[None]] | None = None,
         budget_update_cb: Callable[[float], None] | None = None,
-        portfolio_hub=None,
+        portfolio_hub=None
     ) -> None:
         """
         book_fn: optional callable returning (best_bid, best_ask) without a REST
@@ -599,6 +599,42 @@ class OrderManager:
                     ),
                     name=f"oco_watcher_{req.signal_id[:8]}",
                 )
+                if self._portfolio_hub is not None:
+                    _t = asyncio.create_task(
+                        self._portfolio_hub.broadcast({
+                            "type":        "position_opened",
+                            "ts":          time.time(),
+                            "signal_id":   req.signal_id,
+                            "side":        entry_side,
+                            "entry_price": fill_price,
+                            "quantity":    fill_qty,
+                            "stop_loss":   sl_price,
+                            "take_profit": tp_price,
+                        })
+                    )
+                    _t.add_done_callback(
+                        lambda t: logger.error(
+                            "[Exec] position_opened broadcast failed: %s", t.exception()
+                        ) if not t.cancelled() and t.exception() is not None else None
+                    )
+                if self._portfolio_hub is not None:
+                    _t = asyncio.create_task(
+                        self._portfolio_hub.broadcast({
+                            "type":        "position_opened",
+                            "ts":          time.time(),
+                            "signal_id":   req.signal_id,
+                            "side":        entry_side,
+                            "entry_price": fill_price,
+                            "quantity":    fill_qty,
+                            "stop_loss":   sl_price,
+                            "take_profit": tp_price,
+                        })
+                    )
+                    _t.add_done_callback(
+                        lambda t: logger.error(
+                            "[Exec] position_opened broadcast failed: %s", t.exception()
+                        ) if not t.cancelled() and t.exception() is not None else None
+                    )
                 if self._portfolio_hub is not None:
                     _t = asyncio.create_task(
                         self._portfolio_hub.broadcast({

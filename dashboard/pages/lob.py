@@ -250,6 +250,10 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         # rows_needed entries of the filtered snapshots. Direct dict iteration avoids the
         # pd.DataFrame NaN-for-missing-keys footgun on DB-seeded entries.
         hm_snaps_raw = snaps[max(0, len(snaps) - rows_needed):]
+        # hm_snaps_raw is aligned with hm_df by construction (both are the last
+        # rows_needed entries of snaps/df). Direct dict iteration avoids the
+        # pd.DataFrame NaN-for-missing-keys footgun on DB-seeded entries.
+        hm_snaps_raw = list(snaps)[max(0, len(snaps) - rows_needed):]
         valid_cols = []
         for col_idx, entry_dict in enumerate(hm_snaps_raw):
             col_ok = False
