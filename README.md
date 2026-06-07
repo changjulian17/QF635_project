@@ -222,12 +222,12 @@ Every potential trade passes through seven sequential gates. Failure at any gate
 | **Gate 0** | Data Fidelity | `lob_status == SYNCED` AND `heartbeat` not in `(CRITICAL, SUSTAINED_DEGRADED)` | `GATE_0_FAIL: LOB_STALE` or `GATE_0_FAIL: HEARTBEAT_CRITICAL` or `GATE_0_FAIL: HEARTBEAT_SUSTAINED_DEGRADED` |
 | **Gate 1** | Microstructure Trigger | Sweep + Fresh Wall confirmed | `GATE_1_FAIL: NO_SWEEP_SIGNAL` |
 | **Gate 2** | Confidence Score | `confidence >= 0.58` | `GATE_2_FAIL: LOW_CONFIDENCE 0.47 < 0.58` |
-| **Gate 3** | Capital Gate | `remaining_budget > 0` AND `tier not in (HALTED, PASSIVE)` AND `no active exposure` | `GATE_3_FAIL: BUDGET_EXHAUSTED` or `GATE_3_FAIL: RISK_TIER_{tier}` or `GATE_3_FAIL: ACTIVE_EXPOSURE` |
+| **Gate 3** | Capital Gate | `remaining_budget > 0` AND `tier not in (HALTED, PASSIVE)` AND `no active exposure` AND `estimated_notional <= MAX_ORDER_NOTIONAL_PCT × equity` | `GATE_3_FAIL: BUDGET_EXHAUSTED` or `GATE_3_FAIL: RISK_TIER_{tier}` or `GATE_3_FAIL: ACTIVE_EXPOSURE` or `GATE_3_FAIL: NOTIONAL_EXCEEDED` |
 | **Gate 4** | Order Selection | `spread_bps <= EntryRules.spread_max_bps` (8.0 bps hard cap) AND `spread_bps <= spread_p95 × 2` | `GATE_4_FAIL: SPREAD_TOO_WIDE` |
 | **Gate 5** | Execution Sync | `signal_age < 200ms` AND `last_delta < HEARTBEAT_CRITICAL_MS` (500ms) | `GATE_5_FAIL: SIGNAL_STALE` |
-| **Gate 6** | Persistence Monitor | Protection Wall still present (post-entry) | `GATE_6_ALERT: PROTECTION_WALL_REMOVED` |
+| **Gate 6** | Persistence Monitor | Protection wall present AND hold time < `MICRO_MAX_HOLD_MS` AND heartbeat not `(CRITICAL, SUSTAINED_DEGRADED)` AND spread < `MICRO_EXIT_SPREAD_HARD_CAP_BPS` (post-entry) | `GATE_6_ALERT: PROTECTION_WALL_REMOVED` or `GATE_6_ALERT: MAX_HOLD` or `GATE_6_ALERT: LATENCY_CRITICAL` or `GATE_6_ALERT: SPREAD_HARD_CAP` |
 
-Gate 6 is the only post-entry gate. It runs as an async task after fill confirmation and triggers early exit if the protection wall is cancelled.
+Gate 6 is the only post-entry gate. It runs as an async task after fill confirmation and triggers early exit when the protection wall is removed, the position hold time exceeds `MICRO_MAX_HOLD_MS`, heartbeat becomes `CRITICAL` or `SUSTAINED_DEGRADED`, or exit spread exceeds `MICRO_EXIT_SPREAD_HARD_CAP_BPS`.
 
 ---
 
