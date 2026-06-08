@@ -995,3 +995,44 @@ async def test_oco_sl_price_anchored_to_fill_price():
     assert abs(actual_sl - expected_sl) < 1.0, (
         f"sl_price {actual_sl} not within 25bps of fill_price {fill_price}"
     )
+
+
+# ── Unrealised PnL (fed to budget/killswitch via the MTM loop) ───────────────
+
+def test_unrealised_pnl_zero_when_no_position():
+    om, *_ = _make_manager(book_fn=lambda: (100.0, 100.02))
+    assert om.unrealised_pnl() == 0.0
+
+
+def test_unrealised_pnl_long_marks_to_mid():
+    om, *_ = _make_manager(book_fn=lambda: (109.0, 111.0))   # mid 110
+    om._open_position_side = "BUY"
+    om._open_position_qty  = 2.0
+    om._open_entry_price    = 100.0
+    assert om.unrealised_pnl() == pytest.approx((110.0 - 100.0) * 2.0)   # +20
+
+
+def test_unrealised_pnl_short_loss_is_negative():
+    om, *_ = _make_manager(book_fn=lambda: (109.0, 111.0))   # mid 110
+    om._open_position_side = "SELL"
+    om._open_position_qty  = 2.0
+    om._open_entry_price    = 100.0
+    assert om.unrealised_pnl() == pytest.approx((100.0 - 110.0) * 2.0)   # -20
+
+
+def test_unrealised_pnl_zero_without_book():
+    om, *_ = _make_manager(book_fn=None)
+    om._open_position_side = "BUY"
+    om._open_position_qty  = 2.0
+    om._open_entry_price    = 100.0
+    assert om.unrealised_pnl() == 0.0   # no book → cannot mark to market
+
+
+def test_dry_run_position_reports_unrealised_pnl():
+    with patch.object(settings, "DRY_RUN", True):
+        om, *_ = _make_manager(book_fn=lambda: (109.0, 111.0))
+        om._open_position_side = "BUY"
+        om._open_position_qty  = 2.0
+        om._open_entry_price    = 100.0
+        pos = om.get_dry_run_position()
+    assert pos["unrealised_pnl"] == pytest.approx(20.0)
