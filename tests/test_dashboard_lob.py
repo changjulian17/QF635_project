@@ -48,6 +48,46 @@ def test_non_dict_or_missing_ts_ignored():
     assert update_lob_buffer(buf, {"no_ts": 1}, max_points=10) is buf
 
 
+def test_build_lob_figure_accepts_mixed_timestamp_formats():
+    import dash
+
+    dash.Dash(__name__, use_pages=True, pages_folder="")
+    from dashboard.pages.lob import _build_lob_figure
+
+    snaps = [
+        {
+            "ts": "2026-06-01T10:00:00+00:00",
+            "mid_price": 30000.0,
+            "spread": 10.0,
+            "obi": 0.1,
+            "cvd_delta": 1.0,
+            "bid_levels": [],
+            "ask_levels": [],
+        },
+        {
+            "ts": "not-a-timestamp",
+            "mid_price": 30010.0,
+            "spread": 12.0,
+            "obi": 0.2,
+            "cvd_delta": -0.5,
+            "bid_levels": [],
+            "ask_levels": [],
+        },
+        {
+            "ts": "2026-06-01T10:00:02+00:00",
+            "mid_price": 30005.0,
+            "spread": 11.0,
+            "obi": 0.15,
+            "cvd_delta": 0.25,
+            "bid_levels": [],
+            "ask_levels": [],
+        },
+    ]
+
+    fig = _build_lob_figure(snaps, hm_minutes=1, half_range=100, contrast_pctile=95, trade_pctile=95)
+    assert len(fig.data) > 0
+
+
 def test_running_cvd_is_cumulative_sum_over_buffer():
     """Running CVD (computed at render time) is the cumulative sum of cvd_delta."""
     buf = []

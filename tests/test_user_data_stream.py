@@ -59,7 +59,8 @@ def _make_order_manager(portfolio_hub=None):
     om._position_lock               = asyncio.Lock()
     om._open_position_side          = None
     om._open_position_qty           = 0.0
-    om._open_oco_list_id            = None
+    om._open_tp_order_id            = None
+    om._open_sl_order_id            = None
     om._open_position_closed_event  = None
     om._open_signal_id              = None
     om._open_entry_price            = 0.0
@@ -74,16 +75,19 @@ def _make_order_manager(portfolio_hub=None):
     om._budget_update_cb            = None
     om._update_outcome_cb           = None
     om._portfolio_hub               = portfolio_hub
+    om._client                      = None
     return om
 
 
 def _open_position(om, *, side="BUY", entry_price=50000.0, qty=0.001,
-                   oco_list_id=99, sl_price=49000.0, tp_price=52000.0,
+                   tp_order_id=99, sl_order_id=100,
+                   sl_price=49000.0, tp_price=52000.0,
                    signal_id="sig-abc"):
     om._open_position_side   = side
     om._open_entry_price     = entry_price
     om._open_position_qty    = qty
-    om._open_oco_list_id     = oco_list_id
+    om._open_tp_order_id     = tp_order_id
+    om._open_sl_order_id     = sl_order_id
     om._open_sl_price        = sl_price
     om._open_tp_price        = tp_price
     om._open_signal_id       = signal_id
@@ -93,45 +97,61 @@ def _open_position(om, *, side="BUY", entry_price=50000.0, qty=0.001,
     return pce
 
 
+def _futures_msg(order_id: int, status: str = "FILLED", last_price: str = "51000.0") -> dict:
+    """Build a minimal futures ORDER_TRADE_UPDATE message."""
+    return {"e": "ORDER_TRADE_UPDATE", "o": {"X": status, "i": order_id, "L": last_price}}
+
+
 @pytest.mark.asyncio
 async def test_on_execution_report_ignores_non_filled():
     om = _make_order_manager()
-    _open_position(om, oco_list_id=99)
-    msg = {"e": "executionReport", "X": "NEW", "g": 99, "L": "51000.0"}
+    _open_position(om, tp_order_id=99, sl_order_id=100)
+    msg = _futures_msg(99, status="NEW")
     await om.on_execution_report(msg)
     assert om._open_position_side == "BUY"   # state unchanged
 
 
 @pytest.mark.asyncio
-async def test_on_execution_report_ignores_wrong_oco_id():
+async def test_on_execution_report_ignores_wrong_order_id():
     om = _make_order_manager()
-    _open_position(om, oco_list_id=99)
-    msg = {"e": "executionReport", "X": "FILLED", "g": 42, "L": "51000.0"}
+    _open_position(om, tp_order_id=99, sl_order_id=100)
+    msg = _futures_msg(42, status="FILLED")   # unknown order id
     await om.on_execution_report(msg)
-    assert om._open_position_side == "BUY"   # wrong OCO id — ignored
+    assert om._open_position_side == "BUY"   # unknown order id — ignored
 
 
 @pytest.mark.asyncio
-async def test_on_execution_report_resets_state_on_fill():
+async def test_on_execution_report_resets_state_on_tp_fill():
     om = _make_order_manager()
-    pce = _open_position(om, oco_list_id=99, entry_price=50000.0, side="BUY")
-    msg = {"e": "executionReport", "X": "FILLED", "g": 99, "L": "51000.0"}
+    pce = _open_position(om, tp_order_id=99, sl_order_id=100, entry_price=50000.0, side="BUY")
+    msg = _futures_msg(99, status="FILLED", last_price="51000.0")  # TP hit
     await om.on_execution_report(msg)
     assert om._open_position_side is None
-    assert om._open_oco_list_id is None
+    assert om._open_tp_order_id is None
+    assert om._open_sl_order_id is None
+    assert pce.is_set()
+
+
+@pytest.mark.asyncio
+async def test_on_execution_report_resets_state_on_sl_fill():
+    om = _make_order_manager()
+    pce = _open_position(om, tp_order_id=99, sl_order_id=100, entry_price=50000.0, side="BUY")
+    msg = _futures_msg(100, status="FILLED", last_price="49000.0")  # SL hit
+    await om.on_execution_report(msg)
+    assert om._open_position_side is None
     assert pce.is_set()
 
 
 @pytest.mark.asyncio
 async def test_on_execution_report_cancels_watcher_task():
     om = _make_order_manager()
-    _open_position(om, oco_list_id=99)
+    _open_position(om, tp_order_id=99, sl_order_id=100)
 
     async def _never_ends():
         await asyncio.sleep(999)
 
     om._oco_watcher_task = asyncio.create_task(_never_ends())
-    msg = {"e": "executionReport", "X": "FILLED", "g": 99, "L": "51000.0"}
+    msg = _futures_msg(99, status="FILLED")
     await om.on_execution_report(msg)
     await asyncio.sleep(0)   # let cancellation propagate
     assert om._oco_watcher_task is None
@@ -142,8 +162,8 @@ async def test_on_execution_report_broadcasts_close_event():
     hub = MagicMock()
     hub.broadcast = AsyncMock()
     om = _make_order_manager(portfolio_hub=hub)
-    _open_position(om, oco_list_id=99, side="BUY", entry_price=50000.0)
-    msg = {"e": "executionReport", "X": "FILLED", "g": 99, "L": "51500.0"}
+    _open_position(om, tp_order_id=99, sl_order_id=100, side="BUY", entry_price=50000.0)
+    msg = _futures_msg(99, status="FILLED", last_price="51500.0")
     await om.on_execution_report(msg)
     await asyncio.sleep(0)
     hub.broadcast.assert_called_once()
@@ -156,8 +176,8 @@ async def test_on_execution_report_broadcasts_close_event():
 @pytest.mark.asyncio
 async def test_on_execution_report_no_hub_no_error():
     om = _make_order_manager(portfolio_hub=None)
-    _open_position(om, oco_list_id=99)
-    msg = {"e": "executionReport", "X": "FILLED", "g": 99, "L": "51000.0"}
+    _open_position(om, tp_order_id=99, sl_order_id=100)
+    msg = _futures_msg(99, status="FILLED")
     await om.on_execution_report(msg)   # must not raise
     assert om._open_position_side is None
 
@@ -187,7 +207,7 @@ async def test_get_open_position_returns_state():
 @pytest.mark.asyncio
 async def test_get_open_position_none_after_fill():
     om = _make_order_manager()
-    _open_position(om, oco_list_id=99)
-    msg = {"e": "executionReport", "X": "FILLED", "g": 99, "L": "50500.0"}
+    _open_position(om, tp_order_id=99, sl_order_id=100)
+    msg = _futures_msg(99, status="FILLED", last_price="50500.0")
     await om.on_execution_report(msg)
     assert om.get_open_position() is None

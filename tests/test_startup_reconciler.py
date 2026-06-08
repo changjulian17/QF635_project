@@ -30,16 +30,13 @@ def _make_risk_engine():
     return engine
 
 
-def _make_client(open_orders=None, account_balances=None, ticker_price="73628.96"):
+def _make_client(open_orders=None, usdt_balance: str = "10000.0"):
+    """Return a mock AsyncClient wired for futures reconciler calls."""
     client = AsyncMock()
-    client.get_open_orders = AsyncMock(return_value=open_orders or [])
-    client.get_account = AsyncMock(return_value={
-        "balances": account_balances or [
-            {"asset": "BTC", "free": "0.1", "locked": "0.0"},
-            {"asset": "USDT", "free": "9900.0", "locked": "0.0"},
-        ]
-    })
-    client.get_symbol_ticker = AsyncMock(return_value={"price": ticker_price})
+    client.futures_get_open_orders = AsyncMock(return_value=open_orders or [])
+    client.futures_account_balance = AsyncMock(return_value=[
+        {"asset": "USDT", "balance": usdt_balance},
+    ])
     return client
 
 
@@ -79,8 +76,7 @@ def test_write_event_idempotent_table_creation(tmp_path):
 # ── reconcile_on_startup — DRY_RUN ───────────────────────────────────────────
 
 def test_dry_run_fetches_balance_skips_order_submission(tmp_path):
-    """Balance is always fetched so equity is real, even in DRY_RUN mode.
-    Only order submission (in order_manager.py) is skipped in DRY_RUN."""
+    """Balance is always fetched so equity is real, even in DRY_RUN mode."""
     db_path = str(tmp_path / "registry.db")
     client = _make_client()
     portfolio = _make_portfolio()
@@ -93,10 +89,10 @@ def test_dry_run_fetches_balance_skips_order_submission(tmp_path):
             reconcile_on_startup(client, portfolio, risk_engine)
         )
 
-    client.get_open_orders.assert_called_once()
-    client.get_account.assert_called_once()
+    client.futures_get_open_orders.assert_called_once()
+    client.futures_account_balance.assert_called_once()
     assert result["open_orders"] == []
-    assert "get_account" not in " ".join(result["errors"])
+    assert "futures_account_balance" not in " ".join(result["errors"])
 
 
 # ── reconcile_on_startup — S1: open orders ───────────────────────────────────
@@ -119,8 +115,8 @@ def test_s1_open_orders_logged(tmp_path):
 def test_s1_exchange_error_captured(tmp_path):
     db_path = str(tmp_path / "registry.db")
     client = AsyncMock()
-    client.get_open_orders = AsyncMock(side_effect=Exception("network timeout"))
-    client.get_account = AsyncMock(return_value={"balances": []})
+    client.futures_get_open_orders = AsyncMock(side_effect=Exception("network timeout"))
+    client.futures_account_balance = AsyncMock(return_value=[])
     portfolio = _make_portfolio()
     risk_engine = _make_risk_engine()
 
@@ -132,16 +128,13 @@ def test_s1_exchange_error_captured(tmp_path):
     assert any("get_open_orders" in e for e in result["errors"])
 
 
-# ── reconcile_on_startup — S2: BTC balance ───────────────────────────────────
+# ── reconcile_on_startup — S2: futures USDT balance ──────────────────────────
 
-def test_s2_btc_balance_extracted(tmp_path):
+def test_s2_usdt_wallet_balance_sets_equity(tmp_path):
+    """futures_account_balance() USDT wallet balance sets portfolio equity."""
     db_path = str(tmp_path / "registry.db")
-    balances = [
-        {"asset": "BTC", "free": "0.05", "locked": "0.025"},
-        {"asset": "USDT", "free": "9000.0", "locked": "0.0"},
-    ]
-    client = _make_client(account_balances=balances)
-    portfolio = _make_portfolio()
+    client = _make_client(usdt_balance="12345.67")
+    portfolio = _make_portfolio(equity=10_000.0)
     risk_engine = _make_risk_engine()
 
     with patch("core.startup_reconciler.settings") as mock_settings:
@@ -149,13 +142,40 @@ def test_s2_btc_balance_extracted(tmp_path):
         mock_settings.REGISTRY_DB = db_path
         result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
 
-    assert abs(result["btc_balance"] - 0.075) < 1e-9
+    assert abs(result["actual_equity"] - 12345.67) < 1e-6
+    assert abs(portfolio.equity - 12345.67) < 1e-6
+    assert result["btc_balance"] == 0.0
 
 
-def test_s2_missing_btc_asset_returns_zero(tmp_path):
+def test_s2_equity_set_from_futures_usdt_balance(tmp_path):
+    """All portfolio equity fields are updated from USDT wallet balance."""
     db_path = str(tmp_path / "registry.db")
-    client = _make_client(account_balances=[{"asset": "USDT", "free": "1000.0", "locked": "0.0"}])
-    portfolio = _make_portfolio()
+    client = _make_client(usdt_balance="18000.0")
+    portfolio = _make_portfolio(equity=10_000.0)
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.REGISTRY_DB = db_path
+        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    assert abs(portfolio.equity - 18_000.0) < 1e-6
+    assert abs(portfolio.starting_equity - 18_000.0) < 1e-6
+    assert abs(portfolio.peak_equity - 18_000.0) < 1e-6
+    assert abs(portfolio.usdt_balance - 18_000.0) < 1e-6
+    assert abs(portfolio.btc_balance) < 1e-9
+
+
+def test_s2_missing_usdt_asset_returns_zero(tmp_path):
+    """If USDT is absent from futures_account_balance, equity defaults to 0."""
+    db_path = str(tmp_path / "registry.db")
+    client = AsyncMock()
+    client.futures_get_open_orders = AsyncMock(return_value=[])
+    # Return a list with no USDT entry
+    client.futures_account_balance = AsyncMock(return_value=[
+        {"asset": "BNB", "balance": "0.5"},
+    ])
+    portfolio = _make_portfolio(equity=10_000.0)
     risk_engine = _make_risk_engine()
 
     with patch("core.startup_reconciler.settings") as mock_settings:
@@ -164,102 +184,15 @@ def test_s2_missing_btc_asset_returns_zero(tmp_path):
         result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
 
     assert result["btc_balance"] == 0.0
-
-
-def test_s2_equity_set_from_usdt_and_btc(tmp_path):
-    db_path = str(tmp_path / "registry.db")
-    balances = [
-        {"asset": "BTC",  "free": "1.0", "locked": "0.0"},
-        {"asset": "USDT", "free": "8000.0", "locked": "0.0"},
-    ]
-    # ticker price = 10000 → total equity = 8000 + 1.0 × 10000 = 18000
-    # BTC is liquidated at startup: SELL 1.0 BTC → 9800 USDT (filled at 10000 × 0.98)
-    # Post-liquidation balances returned by the re-fetch:
-    post_balances = [
-        {"asset": "BTC",  "free": "0.0", "locked": "0.0"},
-        {"asset": "USDT", "free": "18000.0", "locked": "0.0"},
-    ]
-    client = _make_client(account_balances=balances, ticker_price="10000.0")
-    client.create_order = AsyncMock(return_value={
-        "executedQty": "1.0",
-        "cummulativeQuoteQty": "9800.0",
-    })
-    client.get_account = AsyncMock(side_effect=[
-        {"balances": balances},      # initial S2 fetch
-        {"balances": post_balances}, # re-fetch after liquidation
-    ])
-    portfolio = _make_portfolio(equity=10_000.0)
-    risk_engine = _make_risk_engine()
-
-    with patch("core.startup_reconciler.settings") as mock_settings:
-        mock_settings.DRY_RUN = False
-        mock_settings.LIQUIDATE_BTC_ON_STARTUP = True   # liquidation-enabled case
-        mock_settings.REGISTRY_DB = db_path
-        mock_settings.QTY_STEP_SIZE = 0.00001
-        mock_settings.MIN_NOTIONAL  = 100.0
-        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
-
-    assert abs(portfolio.equity - 18_000.0) < 1e-6
-    assert abs(portfolio.starting_equity - 18_000.0) < 1e-6   # no trades today
-    assert abs(portfolio.peak_equity - 18_000.0) < 1e-6
-    assert abs(portfolio.usdt_balance - 18_000.0) < 1e-6
-    assert abs(portfolio.btc_balance) < 1e-9
-    assert abs(portfolio.btc_price - 10_000.0) < 1e-6
-
-
-def test_s2b_no_liquidation_by_default_retains_btc(tmp_path):
-    """Default LIQUIDATE_BTC_ON_STARTUP=False: BTC is retained (no SELL order),
-    so SHORT entries have inventory to sell. Regression test for the SHORT-execution bug."""
-    db_path = str(tmp_path / "registry.db")
-    balances = [
-        {"asset": "BTC",  "free": "1.0", "locked": "0.0"},
-        {"asset": "USDT", "free": "8000.0", "locked": "0.0"},
-    ]
-    client = _make_client(account_balances=balances, ticker_price="10000.0")
-    client.create_order = AsyncMock()  # must NOT be called
-    portfolio = _make_portfolio(equity=10_000.0)
-    risk_engine = _make_risk_engine()
-
-    with patch("core.startup_reconciler.settings") as mock_settings:
-        mock_settings.DRY_RUN = False
-        mock_settings.LIQUIDATE_BTC_ON_STARTUP = False   # the new default
-        mock_settings.REGISTRY_DB = db_path
-        mock_settings.QTY_STEP_SIZE = 0.00001
-        mock_settings.MIN_NOTIONAL  = 100.0
-        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
-
-    client.create_order.assert_not_called()              # no liquidation SELL
-    assert abs(portfolio.btc_balance - 1.0) < 1e-9        # BTC retained for shorts
-    assert abs(portfolio.equity - 18_000.0) < 1e-6        # 8000 USDT + 1 BTC × 10000
-
-
-def test_s2_ticker_failure_falls_back_to_zero_btc_price(tmp_path):
-    db_path = str(tmp_path / "registry.db")
-    balances = [
-        {"asset": "BTC",  "free": "1.0", "locked": "0.0"},
-        {"asset": "USDT", "free": "5000.0", "locked": "0.0"},
-    ]
-    client = _make_client(account_balances=balances)
-    client.get_symbol_ticker = AsyncMock(side_effect=Exception("ticker timeout"))
-    portfolio = _make_portfolio(equity=10_000.0)
-    risk_engine = _make_risk_engine()
-
-    with patch("core.startup_reconciler.settings") as mock_settings:
-        mock_settings.DRY_RUN = False
-        mock_settings.REGISTRY_DB = db_path
-        result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
-
-    # equity = USDT only (BTC priced at 0)
-    assert abs(portfolio.equity - 5_000.0) < 1e-6
-    assert any("get_symbol_ticker" in e for e in result["errors"])
+    # actual_equity == 0 → portfolio equity stays at initialised value
+    assert abs(portfolio.equity - 10_000.0) < 1e-6
 
 
 def test_s2_account_failure_keeps_initialised_equity(tmp_path):
     db_path = str(tmp_path / "registry.db")
     client = AsyncMock()
-    client.get_open_orders = AsyncMock(return_value=[])
-    client.get_account = AsyncMock(side_effect=Exception("network error"))
-    client.get_symbol_ticker = AsyncMock(return_value={"price": "73628.0"})
+    client.futures_get_open_orders = AsyncMock(return_value=[])
+    client.futures_account_balance = AsyncMock(side_effect=Exception("network error"))
     portfolio = _make_portfolio(equity=10_000.0)
     risk_engine = _make_risk_engine()
 
@@ -268,9 +201,8 @@ def test_s2_account_failure_keeps_initialised_equity(tmp_path):
         mock_settings.REGISTRY_DB = db_path
         result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
 
-    # if actual_equity == 0 the guard keeps the initialised value
     assert abs(portfolio.equity - 10_000.0) < 1e-6
-    assert any("get_account" in e for e in result["errors"])
+    assert any("futures_account_balance" in e for e in result["errors"])
 
 
 # ── reconcile_on_startup — S3: position reconciliation ───────────────────────
@@ -333,7 +265,6 @@ def test_s3_no_positions_and_no_orders_is_noop(tmp_path):
 def test_s4_restores_pnl_from_today_trades(tmp_path):
     db_path = str(tmp_path / "registry.db")
 
-    # Pre-populate signal_records with today's closed trades
     conn = sqlite3.connect(db_path)
     conn.execute("""CREATE TABLE IF NOT EXISTS signal_records (
         signal_id TEXT PRIMARY KEY,
@@ -381,7 +312,6 @@ def test_s4_missing_signal_records_table_does_not_crash(tmp_path):
         mock_settings.REGISTRY_DB = db_path
         result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
 
-    # signal_records doesn't exist yet → error captured, pnl stays 0
     assert result["restored_pnl"] == 0.0
     assert any("restore_pnl" in e for e in result["errors"])
 
@@ -390,7 +320,6 @@ def test_s4_missing_signal_records_table_does_not_crash(tmp_path):
 
 def test_s5_startup_reconciliation_event_written(tmp_path):
     db_path = str(tmp_path / "registry.db")
-    # Pre-create signal_records so S4 succeeds (no error)
     conn = sqlite3.connect(db_path)
     conn.execute("""CREATE TABLE IF NOT EXISTS signal_records (
         signal_id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL,
@@ -441,4 +370,4 @@ def test_s5_dry_run_event_written(tmp_path):
 
     assert len(rows) == 1
     payload = json.loads(rows[0][0])
-    assert "errors" in payload   # result dict is always written to S5
+    assert "errors" in payload

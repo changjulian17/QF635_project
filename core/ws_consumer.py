@@ -151,6 +151,7 @@ class BinanceWebSocketConsumer:
         self._lob_update_id:  int  = 0
         self._lob_synced:     bool = False
         self._lob_pending:    list[dict] = []
+        self._depth_drop_count: int = 0
 
     async def start(self) -> None:
         self._running = True
@@ -271,7 +272,7 @@ class BinanceWebSocketConsumer:
         diffs that arrived during the fetch. Mirrors the LOBRecorder pattern.
         Falls back to marking synced anyway so data continues to flow on failure.
         """
-        url = f"{settings.REST_BASE}/api/v3/depth"
+        url = f"{settings.REST_BASE}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
         try:
             async with aiohttp.ClientSession() as session:
@@ -331,6 +332,38 @@ class BinanceWebSocketConsumer:
             "asks": [[str(p), str(q)] for p, q in asks],
         }
 
+    def _enqueue_latest_depth_snapshot(self, snapshot: dict) -> None:
+        """Keep the newest depth snapshot moving without blocking the websocket reader."""
+        if self._depth_queue is None:
+            return
+
+        try:
+            self._depth_queue.put_nowait(snapshot)
+            return
+        except asyncio.QueueFull:
+            try:
+                self._depth_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+
+            try:
+                self._depth_queue.put_nowait(snapshot)
+            except asyncio.QueueFull:
+                self._depth_drop_count += 1
+                if self._depth_drop_count == 1 or self._depth_drop_count % 100 == 0:
+                    logger.warning(
+                        "[WS] depth_queue saturated — dropped %d latest snapshots",
+                        self._depth_drop_count,
+                    )
+                return
+
+            self._depth_drop_count += 1
+            if self._depth_drop_count == 1 or self._depth_drop_count % 100 == 0:
+                logger.warning(
+                    "[WS] depth_queue saturated — replaced oldest snapshot (%d drops)",
+                    self._depth_drop_count,
+                )
+
     async def _dispatch(self, stream: str, msg: dict) -> None:
         event_type = msg.get("e")
 
@@ -372,8 +405,7 @@ class BinanceWebSocketConsumer:
                     self._lob_pending.append(msg)
             else:
                 self._apply_depth_diff(msg)
-                if self._depth_queue is not None:
-                    await self._depth_queue.put(self._reconstruct_depth_msg(event_ms))
+                self._enqueue_latest_depth_snapshot(self._reconstruct_depth_msg(event_ms))
 
         elif event_type == "bookTicker":
             # Best bid/ask for spread calculation; route alongside trades

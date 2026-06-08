@@ -300,13 +300,20 @@ def on_ws_position_event(message):
     Output("live-metrics-row", "children"),
     Output("live-balance-row", "children"),
     Input("live-portfolio-tick", "data"),
+    Input("live-interval", "n_intervals"),
 )
-def render_portfolio_section(_tick):
+def render_portfolio_section(_tick, _n):
     if not _PORTFOLIO:
-        return (
-            _placeholder_metrics(),
-            _build_balance_row({}),
-        )
+        history = fetch_portfolio_history(limit=1)
+        if history and not isinstance(history, DBOffline):
+            last = history[-1]
+            fallback = {
+                "equity":       last.get("equity"),
+                "daily_pnl":    last.get("daily_pnl"),
+                "drawdown_pct": last.get("drawdown_pct"),
+            }
+            return (_build_metrics_row(fallback), _build_balance_row({}))
+        return (_placeholder_metrics(), _build_balance_row({}))
     return (
         _build_metrics_row(_PORTFOLIO),
         _build_balance_row(_PORTFOLIO),

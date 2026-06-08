@@ -32,6 +32,16 @@ class _Fatal:
 _FATAL = _Fatal()
 
 
+def _extract_listen_key(resp: object) -> str | None:
+    """Normalize listen-key responses that may be a raw string or a dict."""
+    if isinstance(resp, str):
+        return resp or None
+    if isinstance(resp, dict):
+        value = resp.get("listenKey")
+        return value or None
+    return None
+
+
 class UserDataStreamConsumer:
     """Manages listenKey lifecycle + dispatches executionReport / balanceUpdate."""
 
@@ -57,7 +67,7 @@ class UserDataStreamConsumer:
         self._running = False
         if self._listen_key:
             try:
-                await self._client.delete_listen_key(listenKey=self._listen_key)
+                await self._client.futures_stream_close(listenKey=self._listen_key)
             except Exception as exc:
                 logger.warning("[UserData] Failed to delete listenKey on stop: %s", exc)
 
@@ -65,11 +75,13 @@ class UserDataStreamConsumer:
 
     async def _obtain_listen_key(self) -> "str | None | _Fatal":
         try:
-            resp = await self._client.stream_get_listen_key()
-            key  = resp.get("listenKey")
+            resp = await self._client.futures_stream_get_listen_key()
+            key = _extract_listen_key(resp)
             if key:
                 logger.info("[UserData] listenKey obtained: %s…", key[:8])
-            return key
+                return key
+            logger.error("[UserData] listenKey response missing listenKey: %r", resp)
+            return None
         except Exception as exc:
             exc_str = str(exc)
             # 410 Gone = endpoint permanently removed (e.g. testnet limitation).
@@ -90,7 +102,7 @@ class UserDataStreamConsumer:
             if not self._running or not self._listen_key:
                 return
             try:
-                await self._client.stream_keepalive(listenKey=self._listen_key)
+                await self._client.futures_stream_keepalive(listenKey=self._listen_key)
                 logger.debug("[UserData] listenKey keepalive sent")
             except Exception as exc:
                 logger.warning("[UserData] listenKey keepalive failed: %s", exc)
@@ -165,7 +177,7 @@ class UserDataStreamConsumer:
                 msg        = json.loads(raw_msg)
                 event_type = msg.get("e")
 
-                if event_type == "executionReport":
+                if event_type == "ORDER_TRADE_UPDATE":
                     if self._execution_report_cb is not None:
                         t = asyncio.create_task(
                             self._execution_report_cb(msg),
@@ -173,11 +185,11 @@ class UserDataStreamConsumer:
                         )
                         t.add_done_callback(
                             lambda t: logger.error(
-                                "[UserData] executionReport callback crashed: %s", t.exception()
+                                "[UserData] ORDER_TRADE_UPDATE callback crashed: %s", t.exception()
                             ) if not t.cancelled() and t.exception() is not None else None
                         )
 
-                elif event_type == "outboundAccountPosition":
+                elif event_type == "ACCOUNT_UPDATE":
                     if self._balance_update_cb is not None:
                         t = asyncio.create_task(
                             self._balance_update_cb(msg),
@@ -185,7 +197,7 @@ class UserDataStreamConsumer:
                         )
                         t.add_done_callback(
                             lambda t: logger.error(
-                                "[UserData] balanceUpdate callback crashed: %s", t.exception()
+                                "[UserData] ACCOUNT_UPDATE callback crashed: %s", t.exception()
                             ) if not t.cancelled() and t.exception() is not None else None
                         )
 

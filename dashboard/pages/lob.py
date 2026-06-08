@@ -77,7 +77,8 @@ layout = html.Div([
     WebSocket(id="lob-ws", url=_WS_URL),
     dcc.Store(id="lob-tick"),                                # bumps on each new snapshot
     dcc.Interval(id="lob-backfill", interval=500, max_intervals=1),  # one-shot DB seed
-    dcc.Interval(id="lob-clock-interval", interval=1_000),   # 1s — SGT clock
+    dcc.Interval(id="lob-reseed", interval=60_000),                 # 60s fallback re-seed
+    dcc.Interval(id="lob-clock-interval", interval=1_000),          # 1s — SGT clock
 
     # ── Header: SGT clock + connection badge ───────────────────────────────
     html.Div([
@@ -164,6 +165,20 @@ def _levels_to_arrays(entry: dict, key: str) -> tuple[np.ndarray, np.ndarray]:
     return arr[:, 0], arr[:, 1]
 
 
+def _parse_lob_timestamps(values: pd.Series) -> pd.Series:
+    """Parse LOB timestamps defensively across DB and live-stream formats.
+
+    Older rows, live WS payloads, and test fixtures can all surface slightly
+    different timestamp shapes. Mixed-format parsing avoids a hard failure when
+    a single row does not match the first inferred datetime pattern.
+    """
+    try:
+        parsed = pd.to_datetime(values, utc=True, format="mixed", errors="coerce")
+    except TypeError:
+        parsed = pd.to_datetime(values, utc=True, errors="coerce")
+    return parsed
+
+
 def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pctile, events=None):
     """Build the 4-row LOB figure from a list of snapshot dicts (ascending by ts).
 
@@ -173,9 +188,17 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
     ``events``: optional list of {ts, event: "absorption"|"sweep", price, side, ...}.
     Events whose ts falls inside the heatmap window are rendered as markers on row 1.
     """
+    snaps = list(snaps)
     rows_needed = hm_minutes * 60
     df = pd.DataFrame(snaps)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    parsed_ts = _parse_lob_timestamps(df["ts"])
+    valid_mask = parsed_ts.notna()
+    snaps = [snap for snap, ok in zip(snaps, valid_mask) if ok]
+    df = df.loc[valid_mask].copy()
+    df["ts"] = parsed_ts[valid_mask].to_numpy()
+
+    if df.empty:
+        return _empty_fig("Waiting for valid LOB timestamps…")
 
     age_s = (datetime.now(timezone.utc) - df["ts"].iloc[-1].to_pydatetime()).total_seconds()
     is_stale = age_s > _STALE_THRESHOLD_S
@@ -204,9 +227,9 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         ask_matrix = np.zeros((n_prices, n_times))
 
         # hm_snaps_raw is aligned with hm_df by construction (both are the last
-        # rows_needed entries of snaps/df). Direct dict iteration avoids the
+        # rows_needed entries of the filtered snapshots. Direct dict iteration avoids the
         # pd.DataFrame NaN-for-missing-keys footgun on DB-seeded entries.
-        hm_snaps_raw = list(snaps)[max(0, len(snaps) - rows_needed):]
+        hm_snaps_raw = snaps[max(0, len(snaps) - rows_needed):]
         valid_cols = []
         for col_idx, entry_dict in enumerate(hm_snaps_raw):
             col_ok = False
@@ -277,9 +300,8 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
         fig.add_hline(y=0, line=dict(color="white", width=0.5), row=2, col=1)
 
         # CVD from buffer — no DB query; cvd_delta already stored per snapshot
-        buf_ts_ms = np.array([int(pd.Timestamp(s["ts"]).timestamp() * 1000)
-                               for s in snaps], dtype=np.int64)
-        cvd_cum   = np.cumsum([s["cvd_delta"] for s in snaps])
+        buf_ts_ms = np.array([int(t.timestamp() * 1000) for t in df["ts"]], dtype=np.int64)
+        cvd_cum   = np.cumsum([float(s.get("cvd_delta") or 0.0) for s in snaps])
         obi_ms    = np.array([int(t.timestamp() * 1000) for t in obi_df["ts"]], dtype=np.int64)
         cvd_idx   = np.searchsorted(buf_ts_ms, obi_ms, side="left").clip(0, len(cvd_cum) - 1)
         cvd_y     = cvd_cum[cvd_idx].tolist()
@@ -432,6 +454,17 @@ def backfill_buffer(_n):
     """
     global _EVENTS
     _EVENTS = []
+    ts = _seed_buffer_from_db()
+    return ts if ts else no_update
+
+
+@callback(
+    Output("lob-tick", "data", allow_duplicate=True),
+    Input("lob-reseed", "n_intervals"),
+    prevent_initial_call=True,
+)
+def periodic_reseed(_n):
+    """Re-seed buffer from DB every 60s so chart stays fresh during WS outages."""
     ts = _seed_buffer_from_db()
     return ts if ts else no_update
 

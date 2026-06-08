@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     BINANCE_DEMO: bool = False
     DEMO_BINANCE_API_KEY: str = ""
     DEMO_BINANCE_API_SECRET: str = ""
-    WS_BASE: str = "wss://stream.testnet.binance.vision"
-    REST_BASE: str = "https://testnet.binance.vision"
-    LOB_RECORDER_WS: str = "wss://stream.binance.com:9443"  # real Binance public stream (Rule 4)
+    WS_BASE: str = "wss://stream.binancefuture.com"
+    REST_BASE: str = "https://testnet.binancefuture.com"
+    LOB_RECORDER_WS: str = "wss://fstream.binance.com"  # real Binance futures public stream (Rule 4)
 
     # Strategy
     SYMBOL: str = "BTCUSDT"
@@ -49,7 +49,8 @@ class Settings(BaseSettings):
     # fail the "insufficient BTC" pre-flight. Default False keeps BTC inventory tradeable.
     LIQUIDATE_BTC_ON_STARTUP: bool = False
     IOC_TIMEOUT_MS: int = 200          # IOC order max age before cancel-no-retry
-    QTY_STEP_SIZE: float = 0.00001     # BTCUSDT LOT_SIZE stepSize
+    QTY_STEP_SIZE: float = 0.001        # BTCUSDT perpetual futures LOT_SIZE stepSize
+    PRICE_TICK_SIZE: float = 0.10       # BTCUSDT perpetual futures price tick
     MIN_NOTIONAL: float = 100.0        # BTCUSDT NOTIONAL filter minimum (USD)
     MAX_ORDER_NOTIONAL_PCT: float = 0.90  # gate rejects signals whose estimated notional exceeds 90% of equity
     SLIPPAGE_RESEARCH_BPS: float = 3.0  # expected slippage assumption (KS-3 baseline)
@@ -135,11 +136,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "BINANCE_TESTNET and BINANCE_DEMO cannot both be True. "
                 "Set BINANCE_TESTNET=false when using demo.binance.com."
-            )
-        if self.BINANCE_DEMO and (not self.DEMO_BINANCE_API_KEY or not self.DEMO_BINANCE_API_SECRET):
-            raise ValueError(
-                "DEMO_BINANCE_API_KEY and DEMO_BINANCE_API_SECRET must be set "
-                "when BINANCE_DEMO=True. Add them to .env."
             )
         if not self.DRY_RUN and not self.BINANCE_DEMO and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
             raise ValueError(

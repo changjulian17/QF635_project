@@ -186,3 +186,37 @@ def test_heartbeat_recovery_from_sustained():
 
     assert hb.status == "HEALTHY"
     assert hb._degraded_since_ms is None
+
+
+def test_depth_update_replaces_oldest_snapshot_when_queue_full():
+    import asyncio
+
+    from core.ws_consumer import BinanceWebSocketConsumer
+
+    async def _run() -> None:
+        candle_q = asyncio.Queue()
+        depth_q = asyncio.Queue(maxsize=1)
+        consumer = BinanceWebSocketConsumer(candle_queue=candle_q, depth_queue=depth_q)
+        consumer._lob_synced = True
+        consumer._bid_book = {100.0: 1.0, 99.5: 2.0}
+        consumer._ask_book = {100.5: 1.5, 101.0: 2.0}
+        consumer._lob_update_id = 41
+
+        await depth_q.put({"sentinel": True})
+
+        msg = {
+            "e": "depthUpdate",
+            "E": 1234567890000,
+            "u": 42,
+            "b": [["100.0", "3.0"]],
+            "a": [],
+        }
+
+        await asyncio.wait_for(consumer._dispatch("btcusdt@depth@100ms", msg), timeout=0.2)
+
+        assert depth_q.qsize() == 1
+        snapshot = depth_q.get_nowait()
+        assert snapshot["lastUpdateId"] == 42
+        assert snapshot["bids"][0] == ["100.0", "3.0"]
+
+    asyncio.run(_run())

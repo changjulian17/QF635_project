@@ -39,7 +39,7 @@ from collections.abc import Awaitable, Callable
 from binance import AsyncClient
 
 from config import settings
-from execution.orders import IOCLimitOrder, OCOOrder
+from execution.orders import FuturesSLOrder, FuturesTPOrder, IOCLimitOrder
 from models import FillDetail, MicroOrderRequest
 from risk.killswitch import GlobalKillswitch
 from risk.sizing import clamp_stop_bps
@@ -56,7 +56,13 @@ _RECONNECT_DELAY_S    = 5.0
 
 
 def _weighted_avg_fill(resp: dict) -> float:
-    """Weighted-average fill price from a Binance order response."""
+    """Weighted-average fill price from a Binance order response.
+
+    Futures create_order responses carry avgPrice instead of a fills array.
+    """
+    avg = resp.get("avgPrice")
+    if avg:
+        return float(avg)
     fills = resp.get("fills", [])
     if not fills:
         return float(resp.get("price", 0.0))
@@ -141,7 +147,8 @@ class OrderManager:
         # ── Open-position state (written atomically on fill; cleared after exit) ──
         self._open_position_side:         str | None          = None
         self._open_position_qty:          float               = 0.0
-        self._open_oco_list_id:           int | None          = None
+        self._open_tp_order_id:           int | None          = None
+        self._open_sl_order_id:           int | None          = None
         self._open_position_closed_event: asyncio.Event | None = None
         self._open_signal_id:             str | None          = None
         self._open_entry_price:           float               = 0.0
@@ -285,7 +292,7 @@ class OrderManager:
                 math.floor(
                     _net_fill_qty(resp, req.side, settings.SYMBOL.removesuffix("USDT")) / step
                 ) * step,
-                5,
+                3,
             )
             await self._place_oco(req, fill_price, oco_qty, req.side)
         finally:
@@ -307,7 +314,7 @@ class OrderManager:
 
         for attempt in range(2):
             try:
-                book = await self._client.get_order_book(
+                book = await self._client.futures_order_book(
                     symbol=settings.SYMBOL, limit=5
                 )
                 bids = book.get("bids", [])
@@ -353,11 +360,12 @@ class OrderManager:
             return None
 
         spread = best_ask - best_bid
+        tick   = settings.PRICE_TICK_SIZE
         if side == "BUY":
-            limit_price  = round(best_ask + spread * 0.5, 2)
+            limit_price  = round(round((best_ask + spread * 0.5) / tick) * tick, 1)
             signal_price = best_ask
         else:
-            limit_price  = round(best_bid - spread * 0.5, 2)
+            limit_price  = round(round((best_bid - spread * 0.5) / tick) * tick, 1)
             signal_price = best_bid
 
         protection_wall_price = req.micro_signal.protection_wall.price
@@ -375,7 +383,7 @@ class OrderManager:
         raw_qty = (self._equity_fn() * req.notional_hint) / sl_distance
         step    = settings.QTY_STEP_SIZE
 
-        qty = round(math.floor(raw_qty / step) * step, 5)
+        qty = round(math.floor(raw_qty / step) * step, 3)
         if qty <= 0:
             logger.warning(
                 "[Exec] Zero qty for signal %s — skipped", req.signal_id[:8]
@@ -390,25 +398,6 @@ class OrderManager:
                 notional, settings.MIN_NOTIONAL, req.signal_id[:8], sl_distance,
             )
             return None
-
-        # Pre-flight: SHORT (SELL) entries require BTC on-account.
-        # The startup reconciler liquidates BTC to USDT, so a fresh session has 0 BTC.
-        if side == "SELL" and not settings.DRY_RUN and self._client is not None:
-            try:
-                account  = await self._client.get_account()
-                btc_free = next(
-                    (float(b["free"]) for b in account.get("balances", []) if b["asset"] == "BTC"),
-                    0.0,
-                )
-                if btc_free < qty:
-                    logger.warning(
-                        "[Exec] Insufficient BTC for SHORT entry "
-                        "(have=%.5f need=%.5f) — skipped %s",
-                        btc_free, qty, req.signal_id[:8],
-                    )
-                    return None
-            except Exception as exc:
-                logger.warning("[Exec] BTC balance pre-check failed (%s) — proceeding", exc)
 
         entry_order = IOCLimitOrder(
             symbol   = settings.SYMBOL,
@@ -430,7 +419,7 @@ class OrderManager:
             }
         else:
             try:
-                resp = await self._client.create_order(**entry_order.to_entry_params())
+                resp = await self._client.futures_create_order(**entry_order.to_entry_params())
             except Exception as exc:
                 logger.error("[Exec] IOC order failed: %s", exc, exc_info=True)
                 return None
@@ -461,7 +450,7 @@ class OrderManager:
             math.floor(
                 _net_fill_qty(resp, side, settings.SYMBOL.removesuffix("USDT")) / step
             ) * step,
-            5,
+            3,
         )
 
         # Acquire lock; all open-position writes are atomic with fill_queue put.
@@ -506,18 +495,18 @@ class OrderManager:
         entry_side: str,
     ) -> None:
         """
-        Place TP limit + SL stop-limit OCO bracket via OCOOrder after entry fill.
+        Place TP + SL bracket via FuturesTPOrder / FuturesSLOrder after entry fill.
 
         Concurrency (S1 fix):
-          _placing_oco is set True before the REST call and False after.
+          _placing_oco is set True before the first REST call and False after both.
           If Gate 6 fires during placement it sets _cancel_oco_on_placement=True
           and returns. _place_oco reads the flag atomically on completion and
-          cancels the freshly-placed OCO before calling _emergency_close.
+          cancels any placed orders before calling _emergency_close.
 
-        OCO failure (C1 / S2 fix):
-          On exception: _emergency_close is called immediately. On confirmed
-          close, _reset_open_position() is called and position_closed_event is
-          set so Gate 6 cannot fire a second close attempt.
+        Partial-placement (C1 / S2 fix):
+          On any exception: cancel whatever orders were placed, then emergency-close.
+          On confirmed close, _reset_open_position() is called and
+          position_closed_event is set so Gate 6 cannot fire a second close attempt.
         """
         raw_wall   = req.micro_signal.protection_wall.price
         raw_bps    = abs(fill_price - raw_wall) / fill_price * 10_000
@@ -525,63 +514,61 @@ class OrderManager:
             raw_bps, settings.PROTECTION_MIN_DISTANCE_BPS, settings.PROTECTION_MAX_DISTANCE_BPS
         )
         sl_distance = fill_price * capped_bps / 10_000
-        sl_price    = round(
-            fill_price - sl_distance if entry_side == "BUY" else fill_price + sl_distance, 2
-        )
+        tick        = settings.PRICE_TICK_SIZE
+        raw_sl      = fill_price - sl_distance if entry_side == "BUY" else fill_price + sl_distance
+        sl_price    = round(round(raw_sl / tick) * tick, 1)
         exit_side   = "SELL" if entry_side == "BUY" else "BUY"
         self._open_sl_price = sl_price
 
         if entry_side == "BUY":
             tp_price = fill_price + settings.ATR_MULTIPLIER_TP * sl_distance
-            sl_limit = round(sl_price * 0.999, 2)
+            sl_limit = round(round(sl_price * 0.999 / tick) * tick, 1)
         else:
             tp_price = fill_price - settings.ATR_MULTIPLIER_TP * sl_distance
-            sl_limit = round(sl_price * 1.001, 2)
+            sl_limit = round(round(sl_price * 1.001 / tick) * tick, 1)
         self._open_tp_price = tp_price
 
-        oco = OCOOrder(
-            symbol   = settings.SYMBOL,
-            side     = exit_side,
-            quantity = fill_qty,
-            tp_price = tp_price,
-            sl_price = sl_price,
-            sl_limit = sl_limit,
+        tp_order = FuturesTPOrder(
+            symbol      = settings.SYMBOL,
+            side        = exit_side,
+            quantity    = fill_qty,
+            stop_price  = tp_price,
+            limit_price = tp_price,
+        )
+        sl_order = FuturesSLOrder(
+            symbol      = settings.SYMBOL,
+            side        = exit_side,
+            quantity    = fill_qty,
+            stop_price  = sl_price,
+            limit_price = sl_limit,
         )
 
         if settings.DRY_RUN:
-            logger.info("[Exec] DRY RUN — %s", oco)
+            logger.info("[Exec] DRY RUN — TP=%s SL=%s", tp_order, sl_order)
             return
 
-        # S1: flag placement in-flight before the REST call.
+        # S1: flag placement in-flight before the first REST call.
         async with self._position_lock:
             self._placing_oco = True
 
         try:
-            oco_resp = await self._client.create_oco_order(**oco.to_entry_params())
+            tp_resp = await self._client.futures_create_order(**tp_order.to_entry_params())
+            sl_resp = await self._client.futures_create_order(**sl_order.to_entry_params())
 
-            # Atomically: record OCO id, clear flag, snapshot deferred-cancel flag.
+            # Atomically: record order IDs, clear flag, snapshot deferred-cancel flag.
             async with self._position_lock:
-                raw_id                        = oco_resp.get("orderListId")
-                self._open_oco_list_id        = int(raw_id) if raw_id is not None else None
+                self._open_tp_order_id        = int(tp_resp["orderId"])
+                self._open_sl_order_id        = int(sl_resp["orderId"])
                 self._placing_oco             = False
                 should_cancel                 = self._cancel_oco_on_placement
                 self._cancel_oco_on_placement = False
 
             if should_cancel:
-                # Gate 6 fired while OCO was in-flight — cancel the just-placed OCO.
+                # Gate 6 fired while orders were in-flight — cancel both and close.
                 logger.warning(
-                    "[Exec] Wall removed during OCO placement — cancelling OCO and closing"
+                    "[Exec] Wall removed during bracket placement — cancelling TP/SL and closing"
                 )
-                if self._open_oco_list_id is not None:
-                    try:
-                        await self._client.v3_delete_order_list(
-                            symbol      = settings.SYMBOL,
-                            orderListId = self._open_oco_list_id,
-                        )
-                    except Exception as cancel_exc:
-                        logger.error(
-                            "[Exec] Deferred OCO cancel failed: %s", cancel_exc
-                        )
+                await self._cancel_bracket_orders()
                 closed, close_p = await self._emergency_close(
                     fill_qty, entry_side, reason="WALL_REMOVED_DURING_OCO"
                 )
@@ -595,22 +582,23 @@ class OrderManager:
                         req.position_closed_event.set()
             else:
                 logger.info(
-                    "[Exec] OCO placed — TP=%.2f SL=%.2f listId=%s",
-                    tp_price, sl_price, self._open_oco_list_id,
+                    "[Exec] Bracket placed — TP=%.2f (id=%s) SL=%.2f (id=%s)",
+                    tp_price, self._open_tp_order_id,
+                    sl_price, self._open_sl_order_id,
                 )
-                if self._open_oco_list_id is not None:
-                    self._oco_watcher_task = asyncio.create_task(
-                        self._watch_oco_outcome(
-                            oco_list_id        = self._open_oco_list_id,
-                            signal_id          = req.signal_id,
-                            entry_side         = entry_side,
-                            entry_price        = fill_price,
-                            fill_qty           = fill_qty,
-                            entry_time         = self._open_entry_time,
-                            position_closed_event = req.position_closed_event,
-                        ),
-                        name=f"oco_watcher_{req.signal_id[:8]}",
-                    )
+                self._oco_watcher_task = asyncio.create_task(
+                    self._watch_oco_outcome(
+                        oco_tp_id             = self._open_tp_order_id,
+                        oco_sl_id             = self._open_sl_order_id,
+                        signal_id             = req.signal_id,
+                        entry_side            = entry_side,
+                        entry_price           = fill_price,
+                        fill_qty              = fill_qty,
+                        entry_time            = self._open_entry_time,
+                        position_closed_event = req.position_closed_event,
+                    ),
+                    name=f"oco_watcher_{req.signal_id[:8]}",
+                )
                 if self._portfolio_hub is not None:
                     _t = asyncio.create_task(
                         self._portfolio_hub.broadcast({
@@ -631,11 +619,12 @@ class OrderManager:
                     )
 
         except Exception as exc:
-            # C1: naked position — emergency-close immediately.
+            # C1: naked position — cancel any partially-placed orders then emergency-close.
             async with self._position_lock:
                 self._placing_oco             = False
                 self._cancel_oco_on_placement = False
-            logger.error("[Exec] OCO failed: %s", exc, exc_info=True)
+            logger.error("[Exec] Bracket placement failed: %s", exc, exc_info=True)
+            await self._cancel_bracket_orders()
             closed, close_p = await self._emergency_close(fill_qty, entry_side, reason="OCO_FAILED")
             # S2: reset state after confirmed close so Gate 6 cannot double-close.
             if closed:
@@ -647,11 +636,27 @@ class OrderManager:
                 if req.position_closed_event:
                     req.position_closed_event.set()
 
-    # ── OCO natural-fill watcher ──────────────────────────────────────────────
+    # ── Bracket cancel helper ─────────────────────────────────────────────────
+
+    async def _cancel_bracket_orders(self) -> None:
+        """Cancel whichever TP/SL bracket orders are currently recorded."""
+        if not self._client:
+            return
+        for oid in (self._open_tp_order_id, self._open_sl_order_id):
+            if oid is not None:
+                try:
+                    await self._client.futures_cancel_order(
+                        symbol=settings.SYMBOL, orderId=oid
+                    )
+                except Exception as cancel_exc:
+                    logger.error("[Exec] Cancel order %d failed: %s", oid, cancel_exc)
+
+    # ── Bracket natural-fill watcher ──────────────────────────────────────────
 
     async def _watch_oco_outcome(
         self,
-        oco_list_id: int,
+        oco_tp_id: int | None,
+        oco_sl_id: int | None,
         signal_id: str,
         entry_side: str,
         entry_price: float,
@@ -661,9 +666,9 @@ class OrderManager:
         poll_interval_s: float = 2.0,
     ) -> None:
         """
-        Background task: polls OCO status every poll_interval_s until:
+        Background task: polls TP and SL order status every poll_interval_s until:
           a) position_closed_event fires (Gate 6 / killswitch closed it) → exit quietly, or
-          b) OCO reaches ALL_DONE (natural TP or SL fill) → record outcome, set event.
+          b) either order reaches FILLED → cancel the other leg, record outcome, set event.
 
         Runs only in live mode (not spawned when DRY_RUN=True).
         Cancelled automatically by _reset_open_position() on any other close path.
@@ -678,33 +683,28 @@ class OrderManager:
             if not self._client:
                 return
 
-            try:
-                resp = await self._client.v3_get_order_list(orderListId=oco_list_id)
-            except Exception as exc:
-                logger.warning("[Exec] OCO poll failed (id=%d): %s", oco_list_id, exc)
-                continue
-
-            if resp.get("listStatusType") != "ALL_DONE":
-                continue
-
-            # OCO filled — identify the executed leg and its exit price.
             exit_price = 0.0
-            for order_ref in resp.get("orders", []):
+            filled_id: int | None = None
+            for oid in (oco_tp_id, oco_sl_id):
+                if oid is None:
+                    continue
                 try:
-                    detail = await self._client.get_order(
-                        symbol=settings.SYMBOL, orderId=order_ref["orderId"]
+                    detail = await self._client.futures_get_order(
+                        symbol=settings.SYMBOL, orderId=oid
                     )
-                    if float(detail.get("executedQty", 0)) > 0:
+                    if detail.get("status") == "FILLED":
                         exit_price = float(detail.get("avgPrice") or detail.get("price", 0))
+                        filled_id  = oid
                         break
                 except Exception as exc:
-                    logger.warning("[Exec] OCO leg detail fetch failed: %s", exc)
+                    logger.warning("[Exec] futures_get_order(%d) failed: %s", oid, exc)
+
+            if filled_id is None:
+                continue  # neither filled yet
 
             if exit_price <= 0:
-                # All leg-fetch calls failed — position is closed on exchange but we can't
-                # determine the exit price. Unblock Gate 6 so it doesn't hang; outcome not recorded.
                 logger.warning(
-                    "[Exec] OCO ALL_DONE but exit price unknown (leg fetch failed) — signal=%s",
+                    "[Exec] Bracket fill detected but exit price unknown — signal=%s",
                     signal_id[:8],
                 )
                 if not position_closed_event.is_set():
@@ -714,9 +714,18 @@ class OrderManager:
                     position_closed_event.set()
                 return
 
+            # Cancel the surviving leg.
+            other_id = oco_sl_id if filled_id == oco_tp_id else oco_tp_id
+            if other_id is not None and self._client:
+                try:
+                    await self._client.futures_cancel_order(
+                        symbol=settings.SYMBOL, orderId=other_id
+                    )
+                except Exception as exc:
+                    logger.warning("[Exec] Cancel surviving bracket leg %d failed: %s", other_id, exc)
+
             if not position_closed_event.is_set():
                 async with self._position_lock:
-                    # Guard: only reset if this watcher's signal still owns the position.
                     et = self._open_entry_time if self._open_signal_id == signal_id else entry_time
                     sl = self._open_sl_price if self._open_signal_id == signal_id else 0.0
                     if self._open_signal_id == signal_id:
@@ -724,7 +733,7 @@ class OrderManager:
                 self._record_outcome(signal_id, entry_side, entry_price, exit_price, fill_qty, et, sl)
                 position_closed_event.set()
                 logger.info(
-                    "[Exec] OCO natural fill — %s exit=%.2f signal=%s",
+                    "[Exec] Bracket natural fill — %s exit=%.2f signal=%s",
                     "WIN" if (exit_price > entry_price) == (entry_side == "BUY") else "LOSS",
                     exit_price, signal_id[:8],
                 )
@@ -733,19 +742,27 @@ class OrderManager:
     # ── User data stream callback ─────────────────────────────────────────────
 
     async def on_execution_report(self, msg: dict) -> None:
-        """Called by UserDataStreamConsumer for every executionReport event.
+        """Called by UserDataStreamConsumer for every ORDER_TRADE_UPDATE event.
 
-        Fires immediately on OCO fill — cancels the REST poller and records the
-        outcome without waiting for the 2-second polling cycle.
+        Fires immediately on bracket TP/SL fill — cancels the REST poller and
+        records the outcome without waiting for the 2-second polling cycle.
+        Futures events wrap order fields inside the 'o' key.
         """
-        if msg.get("X") != "FILLED":
+        order    = msg.get("o", {})   # futures: all order fields are inside 'o'
+        if order.get("X") != "FILLED":
             return
 
+        order_id = int(order.get("i", -1))
+        other_id: int | None = None
+
         async with self._position_lock:
-            if self._open_oco_list_id is None:
+            if order_id not in (self._open_tp_order_id, self._open_sl_order_id):
                 return
-            if int(msg.get("g", -1)) != self._open_oco_list_id:
-                return
+
+            other_id = (
+                self._open_sl_order_id if order_id == self._open_tp_order_id
+                else self._open_tp_order_id
+            )
 
             # Capture state before reset clears it.
             signal_id   = self._open_signal_id
@@ -757,11 +774,20 @@ class OrderManager:
             pce         = self._open_position_closed_event
             self._reset_open_position()
 
-        exit_price = float(msg.get("L", 0.0))
+        exit_price = float(order.get("L", 0.0))
         logger.info(
-            "[Exec] on_execution_report fill — side=%s exit=%.2f signal=%s",
+            "[Exec] ORDER_TRADE_UPDATE fill — side=%s exit=%.2f signal=%s",
             entry_side, exit_price, (signal_id or "")[:8],
         )
+
+        # Cancel the surviving bracket leg.
+        if other_id is not None and self._client:
+            try:
+                await self._client.futures_cancel_order(
+                    symbol=settings.SYMBOL, orderId=other_id
+                )
+            except Exception as exc:
+                logger.warning("[Exec] Cancel surviving bracket leg %d failed: %s", other_id, exc)
 
         result = self._record_outcome(
             signal_id, entry_side, entry_price, exit_price, fill_qty, entry_time, sl_price
@@ -844,17 +870,18 @@ class OrderManager:
         if not self._client:
             return False, 0.0
         try:
-            book = await self._client.get_order_book(symbol=settings.SYMBOL, limit=5)
+            book = await self._client.futures_order_book(symbol=settings.SYMBOL, limit=5)
             bids = book.get("bids", [])
             asks = book.get("asks", [])
             best_bid = float(bids[0][0]) if bids else 0.0
             best_ask = float(asks[0][0]) if asks else 0.0
             spread   = best_ask - best_bid
 
+            tick  = settings.PRICE_TICK_SIZE
             close_price = (
-                round(best_ask + spread * 0.5, 2)
+                round(round((best_ask + spread * 0.5) / tick) * tick, 1)
                 if close_side == "BUY"
-                else round(best_bid - spread * 0.5, 2)
+                else round(round((best_bid - spread * 0.5) / tick) * tick, 1)
             )
             close_order = IOCLimitOrder(
                 symbol   = settings.SYMBOL,
@@ -862,7 +889,7 @@ class OrderManager:
                 quantity = qty,
                 price    = close_price,
             )
-            resp = await self._client.create_order(**close_order.to_entry_params())
+            resp = await self._client.futures_create_order(**close_order.to_entry_params())
 
             if float(resp.get("executedQty", "0")) == 0.0:
                 logger.critical(
@@ -903,7 +930,6 @@ class OrderManager:
         async with self._position_lock:
             qty         = self._open_position_qty
             side        = self._open_position_side
-            oco_id      = self._open_oco_list_id
             event       = self._open_position_closed_event
             placing_oco = self._placing_oco
             if placing_oco:
@@ -912,12 +938,12 @@ class OrderManager:
 
         if placing_oco:
             logger.warning(
-                "[Exec] OCO placement in progress — deferred cancel-and-close scheduled"
+                "[Exec] Bracket placement in progress — deferred cancel-and-close scheduled"
             )
             return
 
         if settings.DRY_RUN:
-            logger.info("[Exec] DRY RUN — would cancel OCO and close position")
+            logger.info("[Exec] DRY RUN — would cancel bracket and close position")
             async with self._position_lock:
                 sig_id  = self._open_signal_id
                 ep      = self._open_entry_price
@@ -929,15 +955,7 @@ class OrderManager:
                 event.set()
             return
 
-        if oco_id is not None and self._client:
-            try:
-                await self._client.v3_delete_order_list(
-                    symbol      = settings.SYMBOL,
-                    orderListId = oco_id,
-                )
-                logger.info("[Exec] OCO %d cancelled for early exit", oco_id)
-            except Exception as exc:
-                logger.error("[Exec] OCO cancel failed: %s", exc, exc_info=True)
+        await self._cancel_bracket_orders()
 
         # S2 — fire position_closed_event only on confirmed fill.
         closed, close_p = False, 0.0
@@ -977,7 +995,8 @@ class OrderManager:
         self._oco_watcher_task            = None
         self._open_position_side          = None
         self._open_position_qty           = 0.0
-        self._open_oco_list_id            = None
+        self._open_tp_order_id            = None
+        self._open_sl_order_id            = None
         self._open_position_closed_event  = None
         self._open_signal_id              = None
         self._open_entry_price            = 0.0
@@ -1004,7 +1023,6 @@ class OrderManager:
         async with self._position_lock:
             qty         = self._open_position_qty
             side        = self._open_position_side
-            oco_id      = self._open_oco_list_id
             event       = self._open_position_closed_event
             placing_oco = self._placing_oco
 
@@ -1025,22 +1043,14 @@ class OrderManager:
                 event.set()
             return
 
-        # Live: if OCO is still being placed, delegate to _place_oco (S1 fix).
+        # Live: if bracket is still being placed, delegate to _place_oco (S1 fix).
         if placing_oco:
             async with self._position_lock:
                 self._cancel_oco_on_placement = True
-            logger.warning("[Exec] force_close_all: OCO in-flight — deferred cancel scheduled")
+            logger.warning("[Exec] force_close_all: bracket in-flight — deferred cancel scheduled")
             return
 
-        if oco_id is not None and self._client:
-            try:
-                await self._client.v3_delete_order_list(
-                    symbol=settings.SYMBOL,
-                    orderListId=oco_id,
-                )
-                logger.info("[Exec] force_close_all: OCO %d cancelled", oco_id)
-            except Exception as exc:
-                logger.error("[Exec] force_close_all: OCO cancel failed: %s", exc)
+        await self._cancel_bracket_orders()
 
         async with self._position_lock:
             self._emergency_close_in_progress = True

@@ -368,10 +368,12 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Add testnet API keys to `.env`:
+Add demo futures API keys to `.env`:
 ```
-BINANCE_API_KEY=your_testnet_key
-BINANCE_API_SECRET=your_testnet_secret
+BINANCE_DEMO=true
+BINANCE_TESTNET=false
+DEMO_BINANCE_API_KEY=your_demo_key
+DEMO_BINANCE_API_SECRET=your_demo_secret
 ```
 
 ### Starting the system
@@ -402,21 +404,21 @@ If all checks pass, it opens three separate Terminal windows — one for each co
 
 Sends SIGTERM to each process, waits up to 5 seconds, then SIGKILL if still running. Closes the three Terminal windows afterwards.
 
-### Testnet execution test (signal injection)
+### Demo futures execution test (signal injection)
 
-To validate the full execution pipeline with synthetic signals against the Binance testnet:
+To validate the full execution pipeline with synthetic signals against Binance demo futures:
 
 ```bash
 ./start_test.sh
 ```
 
-Sets `DRY_RUN=false`, `MIN_CONFIDENCE=0.1`, `TEST_SIGNAL_INJECT=true`. After ~45 s LOB warmup, synthetic LONG/SHORT `SWEEP_WITH_PROTECTION` signals are injected every 30 s. Monitor:
+Sets `BINANCE_DEMO=true`, `BINANCE_TESTNET=false`, `DRY_RUN=false`, `MIN_CONFIDENCE=0.1`, `TEST_SIGNAL_INJECT=true`. After ~45 s LOB warmup, synthetic LONG/SHORT `SWEEP_WITH_PROTECTION` signals are injected every 30 s. Monitor:
 
 ```bash
 tail -f logs/cryptosentinel.log | grep -E '\[Injector\]|\[Gate[0-6]\]|\[Executor\]'
 ```
 
-> Not for paper trading, backtesting, or production — testnet orders only.
+> Not for paper trading, backtesting, or production — demo futures orders only.
 
 ### Manual startup (alternative)
 
@@ -449,9 +451,11 @@ All settings live in `config.py` and can be overridden via `.env`.
 ### Binance Connection
 | Setting | Default | Description |
 |---|---|---|
-| `BINANCE_API_KEY` | — | Testnet API key (from `.env`) |
-| `BINANCE_API_SECRET` | — | Testnet API secret (from `.env`) |
-| `BINANCE_TESTNET` | `True` | Always use testnet for execution |
+| `BINANCE_API_KEY` | — | Testnet API key (used by `start.sh` / testnet mode) |
+| `BINANCE_API_SECRET` | — | Testnet API secret (used by `start.sh` / testnet mode) |
+| `DEMO_BINANCE_API_KEY` | — | Demo futures API key (used by `start_test.sh`) |
+| `DEMO_BINANCE_API_SECRET` | — | Demo futures API secret (used by `start_test.sh`) |
+| `BINANCE_TESTNET` | `True` | Always use testnet for execution unless `BINANCE_DEMO=true` |
 | `SYMBOL` | `BTCUSDT` | Trading pair |
 | `LOB_RECORDER_WS` | `wss://stream.binance.com:9443` | Real Binance public stream (LOB Recorder only) |
 
