@@ -204,3 +204,60 @@ def test_ws_seed_failure_stays_unsynced():
         asyncio.run(consumer._sync_lob_snapshot())
 
     assert consumer._lob_synced is False
+
+
+def test_ws_seed_rejects_gapful_buffer():
+    """Buffered diffs that don't bridge the snapshot (gap) → seed fails → stays UNSYNCED."""
+    import asyncio
+    from core.ws_consumer import BinanceWebSocketConsumer
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
+    snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
+    consumer._lob_pending = [{"U": 105, "u": 106, "b": [], "a": []}]  # 101–104 missing
+
+    async def _fetch():
+        return snap
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    with patch.object(consumer, "_fetch_rest_snapshot", new=_fetch), \
+         patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+        asyncio.run(consumer._sync_lob_snapshot())
+    assert consumer._lob_synced is False
+
+
+def test_ws_seed_accepts_bridging_buffer():
+    """First diff straddles lastUpdateId+1 and the rest are contiguous → SYNCED."""
+    import asyncio
+    from core.ws_consumer import BinanceWebSocketConsumer
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
+    snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
+    consumer._lob_pending = [
+        {"U": 100, "u": 101, "b": [], "a": []},   # bridge: 100 <= 101 <= 101
+        {"U": 102, "u": 103, "b": [], "a": []},   # contiguous
+    ]
+
+    async def _fetch():
+        return snap
+
+    with patch.object(consumer, "_fetch_rest_snapshot", new=_fetch):
+        asyncio.run(consumer._sync_lob_snapshot())
+    assert consumer._lob_synced is True
+    assert consumer._lob_update_id == 103
+
+
+def test_ws_seed_failure_sets_reseed_flag():
+    """Exhausted REST seed sets _seed_failed so the receive loop reconnects to reseed."""
+    import asyncio, aiohttp
+    from core.ws_consumer import BinanceWebSocketConsumer
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
+
+    async def _fail():
+        raise aiohttp.ClientError("boom")
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    with patch.object(consumer, "_fetch_rest_snapshot", new=_fail), \
+         patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+        asyncio.run(consumer._sync_lob_snapshot())
+    assert consumer._lob_synced is False
+    assert consumer._seed_failed is True
