@@ -109,7 +109,7 @@ The gate pipeline separates signal generation from trade approval. Each gate rej
 | Gate 0: Data Fidelity | Confirms LOB sync and heartbeat health | Avoids trading on stale, disconnected, or degraded market data. |
 | Gate 1: Microstructure | Confirms signal type, consumed wall, protection wall, and prior absorption | Ensures the trade is based on the intended wall-consumption pattern, not a partial setup. |
 | Gate 2: Confidence | Scores the setup using the active scorer | Filters weak or contradictory setups before risking capital. |
-| Gate 3: Capital | Checks daily budget, risk tier, and active exposure | Prevents overtrading, duplicate exposure, and entries during throttled risk states. |
+| Gate 3: Capital | Checks daily budget, risk tier, active exposure, and maximum position size | Prevents overtrading, duplicate exposure, oversized positions, and entries during throttled risk states. |
 | Gate 4: Order Selection | Requires spread to be within normal and configured limits | Avoids entering when transaction costs or liquidity conditions are unfavorable. |
 | Gate 5: Execution Sync | Rejects stale signals and excessive latency | Keeps entries tied to the book state that generated the signal. |
 | Gate 6: Persistence | Monitors the protection wall after fill | Exits or alerts when the post-entry liquidity premise disappears. |

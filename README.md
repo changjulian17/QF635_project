@@ -648,7 +648,8 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 | Backtest fast | vectorbt | 0.25+ | OHLCV Path B (Phase 2) |
 | Optimiser | optuna | 3.6+ | Bayesian param search (Phase 2) |
 | Config | pydantic-settings | 2.3.x | .env management |
-| Dashboard | Dash + dash-bootstrap | 2.17 + 1.6 | All UI pages (Phase 3) |
+| Dashboard | Dash + dash-bootstrap-components | 4.1+ / 2.0+ | All UI pages (Phase 3) |
+| Dashboard WS | dash-extensions | 1.0+ | Real-time WebSocket components (`/live`, `/lob`) |
 | Charts | plotly | 5.22.x | All visualisations |
 | Persistence | SQLite | stdlib | All databases |
 | Logging | Python stdlib logging | 3.13+ | RotatingFileHandler, INFO/DEBUG configurable via `LOG_LEVEL` |

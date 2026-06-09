@@ -102,7 +102,7 @@ sequenceDiagram
 | Gate 0 | Data fidelity | Requires synchronized LOB state and acceptable heartbeat status. |
 | Gate 1 | Microstructure validity | Requires `SWEEP_WITH_PROTECTION`, consumed wall, protection wall, and prior absorption. |
 | Gate 2 | Confidence | Computes features and scores the setup with the active scorer. |
-| Gate 3 | Capital and exposure | Rejects halted/passive risk tiers, exhausted budget, and active microstructure exposure. |
+| Gate 3 | Capital and exposure | Rejects halted/passive risk tiers, exhausted budget, active microstructure exposure, and signals whose estimated position size exceeds `MAX_ORDER_NOTIONAL_PCT` (90%) of equity. |
 | Gate 4 | Order selection | Requires spread to be within session-aware and configured limits. |
 | Gate 5 | Execution sync | Rejects stale signals or excessive latency. |
 | Rate limit | Approval pacing | Rejects signals that arrive too soon after the previous approval. |
