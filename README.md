@@ -479,6 +479,11 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `SWEEP_LEVELS` | `5` | Top-N levels checked for sweep volume — **legacy-engine-only; see TODO** |
 | `SWEEP_THRESHOLD` | `0.80` | Buy/sell vol fraction threshold — **legacy-engine-only; see TODO** |
 | `BREAK_PROTECT_WINDOW_MS` | `2000` | Break+protect window (ms) — **legacy-engine-only; see TODO** |
+| `ICEBERG_PRICE_TOL` | `0.10` | Price tolerance for iceberg detection — **legacy-engine-only; see TODO** |
+| `BOOK_FLIP_SIGMA` | `3.0` | Min z-score for book-flip level detection — **legacy-engine-only; see TODO** |
+| `BOOK_FLIP_MIN_CONSUMED` | `0.30` | Max fraction consumed to infer book-flip cancellation — **legacy-engine-only; see TODO** |
+| `BOOK_FLIP_AGG_RATIO` | `0.50` | Min aggression ratio (fraction of mean qty) to confirm book-flip — **legacy-engine-only; see TODO** |
+| `BREAK_MIN_VOL` | `1.0` | Min absolute buy/sell volume to register a breakout — **legacy-engine-only; see TODO** |
 | `OBI_BREAK_THRESH` | `0.40` | OBI reference level — used by dashboard `/lob` page as a visual reference line only (not a trading gate) |
 | `MICRO_MAX_HOLD_MS` | `60_000` | Max hold before forced exit (Gate 6) |
 | `MICRO_EXIT_SPREAD_HARD_CAP_BPS` | `12.0` | Spread hard cap for Gate 6 post-entry exit trigger (not Gate 4; Gate 4 uses `EntryRules.spread_max_bps` = 8.0) |
@@ -514,8 +519,8 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 5-min cooldown |
 | `RISK_PER_TRADE_PCT` | `0.001` | Equity risked per trade (0.1% — sized for ~10 bps microstructure stops) |
 | `KELLY_FRACTION` | `0.25` | Fractional Kelly applied to sizing |
-| `ATR_MULTIPLIER_SL` | `1.5` | Stop-loss distance in ATR units |
-| `ATR_MULTIPLIER_TP` | `3.0` | Take-profit distance in ATR units |
+| `ATR_MULTIPLIER_SL` | `1.5` | Stop-loss ATR multiplier — **not used in any live calculation** (live SL is protection-wall-based via `PROTECTION_MAX_DISTANCE_BPS`); shown in `/config` dashboard page and used in `config.py` validation only |
+| `ATR_MULTIPLIER_TP` | `3.0` | Take-profit multiple — `OrderManager` sets TP = entry ± `ATR_MULTIPLIER_TP × sl_distance` (where sl_distance is wall-based, not ATR); also used by `backtesting/tick_replay.py` as the R:R multiplier |
 | `SLIPPAGE_RESEARCH_BPS` | `3.0` | Expected slippage (KS-3 baseline) |
 | `SLIPPAGE_MULTIPLIER` | `1.5` | KS-3 fires above `research × multiplier` |
 
@@ -722,6 +727,8 @@ These rules are invariants. Any code that violates them is incorrect.
 - [x] **Test coverage gap — HeartbeatMonitor SUSTAINED_DEGRADED**: `test_ws_consumer.py` now includes `test_heartbeat_sustained_degraded` and `test_heartbeat_recovery_from_sustained` covering the 10 s transition and hysteresis band recovery (12 tests total).
 - [ ] **Test coverage gap — RiskEngine throttle and circuit breakers**: `test_risk_engine.py` has only 11 tests (sync_tier transitions and basic record_trade_result). The 5-tier drawdown circuit breaker, consecutive-loss cooldown timer, budget-loss tier thresholds, and all `_check_circuit_breakers()` branches remain under-covered. This is a liability for a risk-critical module — expand to at least 25 tests covering the full tier ladder and each circuit breaker trigger.
 - [ ] **Dead config — CANDLE_INTERVAL**: `config.py` defines `CANDLE_INTERVAL: str = "1s"` with the comment "legacy — ws_consumer uses this", but `ws_consumer.py` never imports or reads this setting (it uses `TIMEFRAME` for klines). Remove the setting or delete it before more code takes a dependency on it.
+- [ ] **Dead config — UI_REFRESH_INTERVAL**: `config.py` defines `UI_REFRESH_INTERVAL: float = 1.0` but no module outside `config.py` reads or imports this setting (confirmed: grep finds zero consumers). Either wire it into the Dash dashboard refresh callbacks or remove it.
+- [ ] **Dead config — ATR_MULTIPLIER_SL**: `config.py` defines `ATR_MULTIPLIER_SL: float = 1.5` but no production code uses it for calculation — the live path derives stop-loss distance from the protection wall price (`PROTECTION_MAX_DISTANCE_BPS`). It is only displayed on the `/config` dashboard page and used in a `config.py` self-validation assertion (`ATR_MULTIPLIER_TP > ATR_MULTIPLIER_SL`). Consider removing and replacing the assertion with `ATR_MULTIPLIER_TP > 0`.
 - [ ] **Dead config — legacy-engine-only settings**: `SWEEP_THRESHOLD`, `SWEEP_LEVELS`, `BREAK_PROTECT_WINDOW_MS`, `ICEBERG_PRICE_TOL`, `BOOK_FLIP_SIGMA`, `BOOK_FLIP_MIN_CONSUMED`, `BOOK_FLIP_AGG_RATIO`, `BREAK_MIN_VOL`, `RELOAD_SIGMA`, `ICEBERG_WINDOW_MS`, `ICEBERG_MIN_REPLENISH`, `ICEBERG_MIN_QTY`, `PRICE_PRUNE_INTERVAL`, `PRICE_PRUNE_BAND` are defined in `config.py` but consumed exclusively by `engine/microstructure_engine.py` (the legacy engine that is not started in the live path). Note: `OBI_BREAK_THRESH` remains in the list above but IS used — it drives a reference line in `dashboard/pages/lob.py` (visual only, not a trading gate). Removing the legacy engine removes all consumers for the other settings listed; delete them at that point.
 - [x] **STARTING_EQUITY duplication**: Resolved. `main.py` line 67 defines `STARTING_EQUITY = settings.STARTING_EQUITY`, reading from the single `config.py` source. All component initialisation also reads from `settings.STARTING_EQUITY` directly.
 - [ ] **Absorption prerequisite adds false negatives**: `gate_1_microstructure()` hard-gates on `prior_absorption == True`. A wall that appears and is immediately consumed (e.g. within the first 500ms of its first_seen_ts) will always be rejected — absorption can never arm a wall that is gone before it persists. At the 100ms tick rate this blocks genuine fast institutional sweeps of newly-posted deep liquidity. Evaluate demoting Absorption from a Gate 1 hard prerequisite to a Gate 2 scoring bonus (e.g. `absorption_ratio > 0 → +0.10` in `RuleBasedScorer`) to recover these signals without opening a false-positive flood.
