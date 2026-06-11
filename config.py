@@ -101,6 +101,7 @@ class Settings(BaseSettings):
     HEARTBEAT_WARN_MS: int = 200
     HEARTBEAT_CRITICAL_MS: int = 500
     HEARTBEAT_CONSEC_LIMIT: int = 3
+    HEARTBEAT_KS2_ENABLED: bool = True   # set False in demo/dev to suppress KS-2 on poor WS links
     HEARTBEAT_DEGRADED_RATE_THRESH: float = 0.5    # ≥50% of 10-msg window → enter DEGRADED
     HEARTBEAT_DEGRADED_RECOVERY_THRESH: float = 0.3 # <30% of window → exit (hysteresis)
     HEARTBEAT_SUSTAINED_MS: int = 10_000            # ms in DEGRADED before SUSTAINED_DEGRADED

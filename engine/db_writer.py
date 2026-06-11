@@ -56,6 +56,9 @@ def init_db() -> None:
                 ask_levels_json TEXT
             )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ms_bars_ts ON microstructure_bars(ts)"
+        )
         for col, typedef in [
             ("num_trades",       "INTEGER DEFAULT 0"),
             ("num_wins",         "INTEGER DEFAULT 0"),

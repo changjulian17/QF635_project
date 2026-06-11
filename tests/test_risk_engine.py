@@ -144,6 +144,51 @@ def test_killswitch_update_dov_ignores_nonpositive():
     assert ks._hard_limit == pytest.approx(original)
 
 
+# ── GlobalKillswitch.check_heartbeat (KS-2) ──────────────────────────────────
+
+def test_killswitch_ks2_fires_on_consecutive_critical(monkeypatch):
+    from config import settings as s
+    monkeypatch.setattr(s, "HEARTBEAT_KS2_ENABLED", True)
+    monkeypatch.setattr(s, "HEARTBEAT_CONSEC_LIMIT", 3)
+    ks = GlobalKillswitch(dov=10_000.0)
+    assert ks.check_heartbeat("CRITICAL", 600.0) is False   # 1 of 3
+    assert ks.check_heartbeat("CRITICAL", 600.0) is False   # 2 of 3
+    result = ks.check_heartbeat("CRITICAL", 600.0)          # 3 of 3
+    assert result is True
+    assert ks.is_active
+    assert ks.state.trigger == "KS-2_HEARTBEAT"
+
+
+def test_killswitch_ks2_disabled_flag_prevents_fire(monkeypatch):
+    from config import settings as s
+    monkeypatch.setattr(s, "HEARTBEAT_KS2_ENABLED", False)
+    ks = GlobalKillswitch(dov=10_000.0)
+    for _ in range(20):
+        assert ks.check_heartbeat("CRITICAL", 2000.0) is False
+    assert not ks.is_active
+
+
+def test_killswitch_ks2_consec_resets_on_non_critical(monkeypatch):
+    from config import settings as s
+    monkeypatch.setattr(s, "HEARTBEAT_KS2_ENABLED", True)
+    monkeypatch.setattr(s, "HEARTBEAT_CONSEC_LIMIT", 3)
+    ks = GlobalKillswitch(dov=10_000.0)
+    ks.check_heartbeat("CRITICAL", 600.0)   # 1 of 3
+    ks.check_heartbeat("CRITICAL", 600.0)   # 2 of 3
+    ks.check_heartbeat("HEALTHY",  10.0)    # reset
+    assert ks.check_heartbeat("CRITICAL", 600.0) is False   # back to 1 of 3
+    assert not ks.is_active
+
+
+def test_killswitch_ks2_short_circuits_once_active(monkeypatch):
+    from config import settings as s
+    monkeypatch.setattr(s, "HEARTBEAT_KS2_ENABLED", True)
+    monkeypatch.setattr(s, "HEARTBEAT_CONSEC_LIMIT", 1)
+    ks = GlobalKillswitch(dov=10_000.0)
+    ks.check_heartbeat("CRITICAL", 600.0)
+    assert ks.check_heartbeat("HEALTHY", 10.0) is True   # permanently active
+
+
 # ── DailyBudget.rebase ────────────────────────────────────────────────────────
 
 def test_budget_rebase_updates_equity_preserves_pnl():

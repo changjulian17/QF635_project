@@ -19,7 +19,7 @@ dash.register_page(__name__, path="/walls", name="Walls")
 _STALE_THRESHOLD_S = 30
 
 layout = html.Div([
-    dcc.Interval(id="walls-interval", interval=5000),
+    dcc.Interval(id="walls-interval", interval=15000),
     dbc.Row([
         dbc.Col([
             dbc.Label("Window (min)"),

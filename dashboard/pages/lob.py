@@ -42,13 +42,13 @@ _WS_URL = f"ws://127.0.0.1:{settings.DASHBOARD_API_PORT}/ws/lob"
 
 # Server-side rolling buffer of streamed snapshots (shared across clients, which is
 # correct here — the engine pushes identical data to everyone). Sized to the largest
-# selectable window (60 min × 60 s) so the slider can widen without losing history.
-_MAX_BUFFER = 3600
+# selectable window (20 min × 60 s) so the slider can widen without losing history.
+_MAX_BUFFER = 1200
 _BUFFER: list[dict] = []
 
 # Parallel buffer of microstructure events (absorption / sweep) — rendered as markers
 # on the heatmap row. Cap is independent of snapshot count: in heavy market activity
-# a single 60-min window could see hundreds of events.
+# a single 20-min window could see hundreds of events.
 _MAX_EVENTS = 2000
 _EVENTS: list[dict] = []
 
@@ -58,7 +58,7 @@ _EVENTS: list[dict] = []
 _BUCKET_SIZE: float = settings.LOB_HEATMAP_BUCKET
 _BASELINE_BIN_QTYS: np.ndarray = np.array([])
 _BASELINE_TS: float = 0.0
-_BASELINE_TTL: float = 60.0
+_BASELINE_TTL: float = 300.0
 
 
 def _refresh_baseline_if_stale() -> None:
@@ -105,8 +105,8 @@ layout = html.Div([
     dbc.Row([
         dbc.Col([
             dbc.Label("Heatmap window (min)"),
-            dcc.Slider(id="lob-hm-window", min=1, max=60, step=1, value=15,
-                       marks={1: "1m", 15: "15m", 30: "30m", 60: "60m"}),
+            dcc.Slider(id="lob-hm-window", min=1, max=20, step=1, value=15,
+                       marks={1: "1m", 5: "5m", 10: "10m", 20: "20m"}),
         ], width=3),
         dbc.Col([
             dbc.Label("Price range (±$)"),
@@ -179,6 +179,26 @@ def _parse_lob_timestamps(values: pd.Series) -> pd.Series:
     return parsed
 
 
+def _build_ts_labels(ts_series: pd.Series) -> tuple[list[str], list[int]]:
+    """Return (labels, boundary_indices) for a tz-aware timestamp Series.
+
+    Labels use %H:%M:%S except at the first entry of each new SGT calendar day,
+    where the format is "%-d %b\n%H:%M:%S" (e.g. "12 Jun\n00:00:05").
+    boundary_indices contains the position of every such day-change label.
+    """
+    sgt = ts_series.dt.tz_convert(_SGT)
+    dates = sgt.dt.date.tolist()
+    labels: list[str] = []
+    boundaries: list[int] = []
+    for i, (d, t) in enumerate(zip(dates, sgt)):
+        if i == 0 or d != dates[i - 1]:
+            labels.append(t.strftime("%-d %b\n%H:%M:%S"))
+            boundaries.append(i)
+        else:
+            labels.append(t.strftime("%H:%M:%S"))
+    return labels, boundaries
+
+
 def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pctile, events=None):
     """Build the 4-row LOB figure from a list of snapshot dicts (ascending by ts).
 
@@ -248,7 +268,9 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
                 col_ok = True
             valid_cols.append(col_ok)
 
-        ts_labels = hm_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
+        sgt_series = hm_df["ts"].dt.tz_convert(_SGT)
+        ts_labels, _day_boundaries = _build_ts_labels(hm_df["ts"])
+        _boundary_labels = [ts_labels[i] for i in _day_boundaries[1:]]
         mid_prices = hm_df["mid_price"].tolist()
 
         # Drop columns where both bid and ask levels failed — prevents x-axis misalignment
@@ -289,7 +311,7 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
 
     # ── Rows 2-4: OBI / CVD / Spread ───────────────────────────────────────
     if not obi_df.empty:
-        obi_ts = obi_df["ts"].dt.tz_convert(_SGT).dt.strftime("%H:%M:%S").tolist()
+        obi_ts, _ = _build_ts_labels(obi_df["ts"])
         fig.add_trace(go.Scatter(
             x=obi_ts, y=obi_df["obi"].tolist(), mode="lines",
             line=dict(color="cyan", width=1.2), name="OBI",
@@ -403,9 +425,19 @@ def _build_lob_figure(snaps, hm_minutes, half_range, contrast_pctile, trade_pcti
     fig.update_xaxes(showticklabels=False, row=1, col=1)
     fig.update_xaxes(showticklabels=False, row=2, col=1)
     fig.update_xaxes(showticklabels=False, row=3, col=1)
-    fig.update_xaxes(title_text="Time (SGT)", row=4, col=1)
     if not hm_df.empty:
         fig.update_yaxes(range=[price_lo, price_hi], row=1, col=1)
+        unique_dates = sorted({t.date() for t in sgt_series})
+        if len(unique_dates) == 1:
+            date_str = unique_dates[0].strftime("%-d %b %Y")
+        else:
+            d0, d1 = unique_dates[0], unique_dates[-1]
+            date_str = f"{d0.day}–{d1.strftime('%-d %b %Y')}"
+        fig.update_xaxes(title_text=f"Time (SGT)  ·  {date_str}", row=4, col=1)
+        for label in _boundary_labels:
+            fig.add_vline(x=label, line=dict(color="rgba(255,255,255,0.35)", width=1, dash="dot"))
+    else:
+        fig.update_xaxes(title_text="Time (SGT)", row=4, col=1)
 
     if is_stale:
         fig.add_annotation(

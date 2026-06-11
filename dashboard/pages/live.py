@@ -1,4 +1,5 @@
 import json
+import time
 
 import dash
 import plotly.graph_objects as go
@@ -35,6 +36,13 @@ _TAPE: list[dict] = []
 # Latest position event from the user data stream (position_opened / close_event).
 # Cleared to {} on close_event; takes precedence over the 1 Hz MTM snapshot.
 _LAST_POSITION_EVENT: dict = {}
+
+# 30-second TTL cache for the two 24-hour aggregate queries that run at 5-second poll cadence.
+_STATS_CACHE: dict | list | None = None
+_STATS_CACHE_TS: float = 0.0
+_FUNNEL_CACHE: list | None = None
+_FUNNEL_CACHE_TS: float = 0.0
+_LIVE_STATS_TTL: float = 30.0
 
 _TIER_COLORS = {
     "ACTIVE": "success",
@@ -341,7 +349,12 @@ def render_positions(_portfolio_tick, _event_tick):
     Input("live-interval", "n_intervals"),
 )
 def update_session_section(_n):
-    session_result = fetch_session_stats(hours=24)
+    global _STATS_CACHE, _STATS_CACHE_TS
+    now = time.time()
+    if _STATS_CACHE is None or (now - _STATS_CACHE_TS) >= _LIVE_STATS_TTL:
+        _STATS_CACHE = fetch_session_stats(hours=24)
+        _STATS_CACHE_TS = now
+    session_result = _STATS_CACHE
     if isinstance(session_result, DBOffline) or not session_result:
         session_row = [dbc.Col(dbc.Alert("No session data yet.", color="secondary"), width=12)]
     else:
@@ -470,7 +483,12 @@ def render_signal_tape(_tick):
     Input("live-interval", "n_intervals"),     # fallback: 5 s poll if WS is offline
 )
 def refresh_funnel_table(_tick, _n):
-    return _build_funnel_table(fetch_signal_funnel(hours=24))
+    global _FUNNEL_CACHE, _FUNNEL_CACHE_TS
+    now = time.time()
+    if _FUNNEL_CACHE is None or (now - _FUNNEL_CACHE_TS) >= _LIVE_STATS_TTL:
+        _FUNNEL_CACHE = fetch_signal_funnel(hours=24)
+        _FUNNEL_CACHE_TS = now
+    return _build_funnel_table(_FUNNEL_CACHE)
 
 
 @callback(

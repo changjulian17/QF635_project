@@ -28,7 +28,7 @@ class HeartbeatMonitor:
       HEALTHY → DEGRADED when ≥50% of window exceeds WARN_MS (single log on entry)
       DEGRADED → SUSTAINED_DEGRADED after HEARTBEAT_SUSTAINED_MS elapsed at ≥50% rate
       any → HEALTHY when <30% of window exceeds WARN_MS (hysteresis, single log on exit)
-      any → CRITICAL after CONSEC_LIMIT consecutive packets exceed CRITICAL_MS (KS-2)
+      any → CRITICAL after CONSEC_LIMIT consecutive packets exceed CRITICAL_MS
     """
     WARN_MS      = settings.HEARTBEAT_WARN_MS
     CRITICAL_MS  = settings.HEARTBEAT_CRITICAL_MS
@@ -40,6 +40,7 @@ class HeartbeatMonitor:
         self._degraded_since_ms: float | None = None
         self.status: str              = "HEALTHY"
         self.last_delta_ms: float     = 0.0
+        self._last_critical_log_ts: float = 0.0
 
     def record(self, event_time_ms: int) -> str:
         delta_ms           = (time.time() * 1000) - event_time_ms
@@ -53,12 +54,16 @@ class HeartbeatMonitor:
             self._critical_count = 0
 
         if self._critical_count >= self.CONSEC_LIMIT:
+            entering = self.status != "CRITICAL"
             self.status = "CRITICAL"
             self._degraded_since_ms = None
-            logger.critical(
-                "[Heartbeat] CRITICAL: Binance WS latency %d consecutive >%dms. Last=%.0fms",
-                self._critical_count, self.CRITICAL_MS, delta_ms,
-            )
+            now = time.time()
+            if entering or (now - self._last_critical_log_ts) >= 60.0:
+                logger.critical(
+                    "[Heartbeat] CRITICAL: Binance WS latency %d consecutive >%dms. Last=%.0fms",
+                    self._critical_count, self.CRITICAL_MS, delta_ms,
+                )
+                self._last_critical_log_ts = now
             return self.status
 
         # ── RATE-GATE: wait for full window before evaluating ─────────────────
@@ -170,9 +175,9 @@ class BinanceWebSocketConsumer:
                 logger.info("[WS] Connecting (attempt %d): %s", attempt + 1, uri)
                 async with websockets.connect(
                     uri,
-                    ping_interval=20,
-                    ping_timeout=60,
-                    close_timeout=10,
+                    ping_interval=10,
+                    ping_timeout=15,
+                    close_timeout=5,
                 ) as ws:
                     logger.info("[WS] Connected — seeding LOB from REST snapshot…")
                     self._reconnect_delay = 1.0
@@ -226,9 +231,9 @@ class BinanceWebSocketConsumer:
                 break
 
             try:
-                raw_msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=8.0)
             except asyncio.TimeoutError:
-                logger.warning("[WS] No message for 30s — forcing reconnect")
+                logger.warning("[WS] No message for 8s — forcing reconnect")
                 break
 
             try:
@@ -301,6 +306,10 @@ class BinanceWebSocketConsumer:
         finally:
             self._lob_pending.clear()
             self._lob_synced = True
+            if self._bid_book and self._ask_book:
+                self._enqueue_latest_depth_snapshot(
+                    self._reconstruct_depth_msg(int(time.time() * 1000))
+                )
 
     def _apply_depth_diff(self, event: dict) -> None:
         for p, q in event.get("b", []):

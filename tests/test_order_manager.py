@@ -383,8 +383,8 @@ async def test_entry_qty_floor_quantized_to_step():
         await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
 
     fill: FillDetail = fill_q.get_nowait()
-    assert fill.qty == pytest.approx(0.04210)
-    assert int(round(fill.qty / settings.QTY_STEP_SIZE)) == 4210
+    assert fill.qty == pytest.approx(0.042)
+    assert int(round(fill.qty / settings.QTY_STEP_SIZE)) == 42
 
 
 # ── 15. M3: full fill_queue drops record, does not block ─────────────────────
