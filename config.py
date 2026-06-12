@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict, model_validator
 
@@ -10,11 +12,12 @@ class Settings(BaseSettings):
     BINANCE_API_SECRET: str = ""
     BINANCE_TESTNET: bool = True
     BINANCE_DEMO: bool = False
+    TRADING_MODE: Literal["testnet", "demo", "live"] = "testnet"
     DEMO_BINANCE_API_KEY: str = ""
     DEMO_BINANCE_API_SECRET: str = ""
     WS_BASE: str = "wss://stream.binancefuture.com"
     REST_BASE: str = "https://testnet.binancefuture.com"
-    LOB_RECORDER_WS: str = "wss://fstream.binance.com"  # real Binance futures public stream (Rule 4)
+    LOB_RECORDER_WS: str = "wss://stream.binancefuture.com"  # futures testnet stream; fstream.binance.com does not deliver aggTrade on this connection
 
     # Strategy
     SYMBOL: str = "BTCUSDT"
@@ -100,6 +103,7 @@ class Settings(BaseSettings):
     # Heartbeat monitor (§4)
     HEARTBEAT_WARN_MS: int = 200
     HEARTBEAT_CRITICAL_MS: int = 500
+    HEARTBEAT_LOB_CRITICAL_MS: int = 5000   # depth@500ms stream; higher due to aggregation window
     HEARTBEAT_CONSEC_LIMIT: int = 3
     HEARTBEAT_KS2_ENABLED: bool = True   # set False in demo/dev to suppress KS-2 on poor WS links
     HEARTBEAT_DEGRADED_RATE_THRESH: float = 0.5    # ≥50% of 10-msg window → enter DEGRADED
@@ -130,6 +134,67 @@ class Settings(BaseSettings):
     # waiting for a natural Sweep+Protection event (set in .env, never in prod)
     TEST_SIGNAL_INJECT: bool = False
     TEST_INJECT_INTERVAL_MS: int = 30_000   # ms between injected signals
+
+    @model_validator(mode="after")
+    def _apply_mode_presets(self) -> "Settings":
+        """
+        Apply mode-specific defaults for any field not explicitly set by the caller.
+        Explicit env vars / .env entries always win — only unset fields are touched.
+        Runs before _validate_tier_ordering so preset values are visible to validation.
+        """
+        # fmt: off
+        _PRESETS: dict[str, dict[str, object]] = {
+            # ── testnet (start_test.sh) ───────────────────────────────────────────
+            # WS: wss://stream.binancefuture.com (~10ms baseline). Real orders, fake money.
+            "testnet": {
+                "BINANCE_TESTNET":            False,
+                "BINANCE_DEMO":               True,
+                "DRY_RUN":                    False,
+                "MIN_CONFIDENCE":             0.1,
+                "TEST_SIGNAL_INJECT":         True,
+                "TIMEFRAME":                  "1s",
+            },
+            # ── demo (start_demo.sh) ──────────────────────────────────────────────
+            # WS: wss://fstream.binance.com (live server, p50=181ms p95=428ms).
+            # Heartbeat calibrated for ~200ms baseline + periodic 3–5s TCP stalls.
+            "demo": {
+                "WS_BASE":                    "wss://fstream.binance.com",
+                "REST_BASE":                  "https://fapi.binance.com",
+                "BINANCE_TESTNET":            False,
+                "BINANCE_DEMO":               True,
+                "DRY_RUN":                    False,
+                "HEARTBEAT_WARN_MS":          500,
+                "HEARTBEAT_CRITICAL_MS":      3000,
+                "HEARTBEAT_LOB_CRITICAL_MS":  5000,
+                "HEARTBEAT_CONSEC_LIMIT":     5,
+                "HEARTBEAT_KS2_ENABLED":      False,
+                "MIN_CONFIDENCE":             0.1,
+                "TEST_SIGNAL_INJECT":         True,
+                "TIMEFRAME":                  "1s",
+            },
+            # ── live (start.sh) ───────────────────────────────────────────────────
+            # Same server as demo. Real money. Full risk management on.
+            "live": {
+                "WS_BASE":                    "wss://fstream.binance.com",
+                "REST_BASE":                  "https://fapi.binance.com",
+                "BINANCE_TESTNET":            False,
+                "BINANCE_DEMO":               False,
+                "DRY_RUN":                    False,
+                "HEARTBEAT_WARN_MS":          500,
+                "HEARTBEAT_CRITICAL_MS":      3000,
+                "HEARTBEAT_LOB_CRITICAL_MS":  5000,
+                "HEARTBEAT_CONSEC_LIMIT":     5,
+                "HEARTBEAT_KS2_ENABLED":      True,
+                "MIN_CONFIDENCE":             0.58,
+                "TEST_SIGNAL_INJECT":         False,
+                "TIMEFRAME":                  "5m",
+            },
+        }
+        # fmt: on
+        for field, value in _PRESETS.get(self.TRADING_MODE, {}).items():
+            if field not in self.model_fields_set:
+                object.__setattr__(self, field, value)
+        return self
 
     @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":

@@ -8,7 +8,7 @@ Startup sequence (master arch §9):
   4. Register SIGTERM/SIGINT handlers
   5. LOB warm-up guard (0.5 s)
   6. Start TaskGroup with all coroutines:
-       lob_recorder, ws_consumer, depth_fanout, lob_engine, micro_detector,
+       lob_recorder, ws_price_consumer, ws_lob_consumer, depth_fanout, lob_engine, micro_detector,
        feature_candle_loop, strategy_executor, order_manager,
        signal_telemetry, midnight_reset_loop, db_writer, fill_processor,
        portfolio_mtm_loop
@@ -413,6 +413,28 @@ async def _process_fills(
             await portfolio_hub.broadcast(payload)
 
 
+# ── Engine health writer ──────────────────────────────────────────────────────
+
+async def _health_writer(
+    shared_state: SharedState,
+    killswitch: GlobalKillswitch,
+    risk_engine: RiskEngine,
+    db_writer: DBWriter,
+    interval: float = 5.0,
+) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await db_writer.write_engine_health(
+                lob_status=shared_state.lob_status,
+                hb_status=shared_state.heartbeat_status,
+                risk_tier=risk_engine.tier.name,
+                ks_active=killswitch.is_active,
+            )
+        except Exception:
+            pass  # non-critical; dashboard falls back to stale badge gracefully
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -487,13 +509,22 @@ async def main() -> None:
     signal_hub    = RealtimeHub()  # /ws/signals: live gate-decision tape
 
     # Components ──────────────────────────────────────────────────────────────
-    ws_consumer = BinanceWebSocketConsumer(
-        candle_queue=candle_queue,
-        candle_db_queue=candle_db_queue,
+    _sym = settings.SYMBOL.lower()
+    price_consumer = BinanceWebSocketConsumer(
         trade_queue=trade_queue,
-        depth_queue=raw_depth_queue,
         shared_state=shared_state,
         heartbeat_cb=_heartbeat_cb,
+        streams=[f"{_sym}@bookTicker", f"{_sym}@aggTrade"],
+        heartbeat_key="heartbeat_status",
+    )
+    lob_consumer = BinanceWebSocketConsumer(
+        candle_queue=candle_queue,
+        candle_db_queue=candle_db_queue,
+        depth_queue=raw_depth_queue,
+        shared_state=shared_state,
+        streams=[f"{_sym}@depth@500ms", f"{_sym}@kline_{settings.TIMEFRAME}"],
+        heartbeat_key="lob_heartbeat_status",
+        critical_ms=settings.HEARTBEAT_LOB_CRITICAL_MS,
     )
     lob_recorder = LOBRecorder()
     micro_detector = MicrostructureDetector(
@@ -615,7 +646,8 @@ async def main() -> None:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_watch_shutdown(shutdown_event),                                   name="shutdown_watcher")
             tg.create_task(lob_recorder.start(),                                              name="lob_recorder")
-            tg.create_task(ws_consumer.start(),                                               name="ws_consumer")
+            tg.create_task(price_consumer.start(),                                             name="ws_price_consumer")
+            tg.create_task(lob_consumer.start(),                                               name="ws_lob_consumer")
             tg.create_task(_depth_fanout(raw_depth_queue, lob_depth_queue, ms_depth_queue),  name="depth_fanout")
             tg.create_task(_run_lob_engine(lob_engine, lob_depth_queue),                     name="lob_engine")
             tg.create_task(micro_detector.run(),                                              name="micro_detector")
@@ -642,6 +674,10 @@ async def main() -> None:
             tg.create_task(
                 _lob_snapshot_writer(lob_engine, cvd_calculator, db_writer, hub=lob_hub),
                 name="lob_snapshot_writer",
+            )
+            tg.create_task(
+                _health_writer(shared_state, killswitch, risk_engine, db_writer),
+                name="health_writer",
             )
             tg.create_task(
                 _api_server(

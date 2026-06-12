@@ -39,11 +39,17 @@ def _wall_present(price: float, walls: list[dict], tol: float = 0.01) -> bool:
 
 # ── Gate functions ────────────────────────────────────────────────────────────
 
-def gate_0_data_fidelity(lob_status: str, heartbeat_status: str) -> tuple[bool, str]:
+def gate_0_data_fidelity(
+    lob_status: str,
+    heartbeat_status: str,
+    lob_heartbeat_status: str = "HEALTHY",
+) -> tuple[bool, str]:
     if lob_status != "SYNCED":
         return False, f"LOB not SYNCED ({lob_status})"
     if heartbeat_status in ("CRITICAL", "SUSTAINED_DEGRADED"):
-        return False, f"heartbeat {heartbeat_status}"
+        return False, f"price heartbeat {heartbeat_status}"
+    if lob_heartbeat_status in ("CRITICAL", "SUSTAINED_DEGRADED"):
+        return False, f"LOB heartbeat {lob_heartbeat_status}"
     return True, ""
 
 
@@ -373,7 +379,9 @@ class StrategyExecutor:
 
         # Gate 0 — data fidelity
         ok, reason = gate_0_data_fidelity(
-            self._state.lob_status, self._state.heartbeat_status
+            self._state.lob_status,
+            self._state.heartbeat_status,
+            self._state.lob_heartbeat_status,
         )
         logger.info(
             "[Gate0] %s lob=%s hb=%s%s",

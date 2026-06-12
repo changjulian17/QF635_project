@@ -24,6 +24,7 @@ if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
 fi
 log_ok ".env found"
 log_warn "DEMO FUTURES MODE — DRY_RUN=false, real orders will be placed on Binance demo futures"
+export TRADING_MODE=testnet
 
 # --- Pre-flight: .venv ---
 if [[ ! -f "$SCRIPT_DIR/.venv/bin/activate" ]]; then
@@ -67,9 +68,9 @@ open_window() {
 }
 
 echo "Launching DEMO FUTURES components (DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true)..."
-open_window "LOB Recorder"               "'$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine (DEMO FUTURES)"   "BINANCE_DEMO=true BINANCE_TESTNET=false DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true TIMEFRAME=1s '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
-open_window "Dash Dashboard"             "'$PYTHON' dashboard/app.py"
+open_window "LOB Recorder"                  "TRADING_MODE=testnet '$PYTHON' -m core.lob_recorder"
+open_window "Trading Engine (DEMO FUTURES)" "TRADING_MODE=testnet '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Dash Dashboard"                "TRADING_MODE=testnet '$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""

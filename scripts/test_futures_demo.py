@@ -191,76 +191,65 @@ async def run() -> bool:
                     _fail(f"listen key close failed: {exc}")
                     all_passed = False
 
-        # ── 7. Public LOB stream + latency ────────────────────────────────
-        symbol = settings.SYMBOL.lower()
-        lob_uri = (
-            f"{settings.LOB_RECORDER_WS}/stream"
-            f"?streams={symbol}@depth@100ms/{symbol}@aggTrade"
-        )
+        # ── 7. Connection latency characterisation ────────────────────────────
+        _PROBE_N       = 30
+        _WARN_P95_MS   = 500
+        _FAIL_P95_MS   = 2000
+        _FAIL_SPIKE_MS = 3000
+
+        async def _probe_endpoint(base_url: str, n: int = _PROBE_N) -> dict[str, list[float]]:
+            sym = settings.SYMBOL.lower()
+            uri = f"{base_url}/stream?streams={sym}@bookTicker/{sym}@depth@100ms"
+            samples: dict[str, list[float]] = {"bookTicker": [], "depth@100ms": []}
+            async with websockets.connect(uri, ping_interval=None) as _ws:
+                while min(len(v) for v in samples.values()) < n:
+                    raw = await asyncio.wait_for(_ws.recv(), timeout=15.0)
+                    outer = json.loads(raw)
+                    if "data" not in outer or "E" not in outer["data"]:
+                        continue
+                    delta_ms = time.time() * 1000 - outer["data"]["E"]
+                    stream = outer.get("stream", "")
+                    if "bookTicker" in stream and len(samples["bookTicker"]) < n:
+                        samples["bookTicker"].append(delta_ms)
+                    elif "depth" in stream and len(samples["depth@100ms"]) < n:
+                        samples["depth@100ms"].append(delta_ms)
+            return samples
+
+        def _pct(data: list[float], p: int) -> float:
+            return sorted(data)[min(int(len(data) * p / 100), len(data) - 1)]
+
+        def _print_probe_report(label: str, samples: dict[str, list[float]]) -> None:
+            print(f"\n──── Latency probe: {label} {'─' * max(0, 50 - len(label))}")
+            worst_p95 = 0.0
+            has_critical_spike = False
+            for stream, data in samples.items():
+                p50  = _pct(data, 50)
+                p95  = _pct(data, 95)
+                mx   = max(data)
+                s500 = sum(1 for x in data if x > 500)
+                s3k  = sum(1 for x in data if x > _FAIL_SPIKE_MS)
+                print(f"  {stream:<15} {len(data)} samples  "
+                      f"p50={p50:.0f}  p95={p95:.0f}  max={mx:.0f} ms  "
+                      f"spikes>500ms={s500}  spikes>3000ms={s3k}")
+                worst_p95 = max(worst_p95, p95)
+                if s3k > 0:
+                    has_critical_spike = True
+            if worst_p95 < _WARN_P95_MS and not has_critical_spike:
+                print("  ✅ PASS")
+            elif worst_p95 < _FAIL_P95_MS and not has_critical_spike:
+                print("  ⚠️  WARN — p95 elevated; demo trading will work but expect occasional stalls")
+            else:
+                print("  ❌ FAIL — p95 >2000ms or >3000ms spikes; consider a Singapore VPS")
+
+        print(f"\n{'='*60}\nSection 7 — Connection latency characterisation\n{'='*60}")
+        print(f"Collecting {_PROBE_N} samples per stream (≈{_PROBE_N}s)…")
         try:
-            depth_latencies_ms: list[float] = []
-            agg_latencies_ms: list[float] = []
-            async with websockets.connect(
-                lob_uri,
-                ping_interval=20,
-                ping_timeout=60,
-                close_timeout=10,
-            ) as ws:
-                _ok("Public LOB websocket connected")
-                deadline = asyncio.get_running_loop().time() + _LOB_STREAM_PROBE_TIMEOUT_S
-                while True:
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        break
-                    raw_msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
-                    try:
-                        outer = json.loads(raw_msg)
-                        msg = outer.get("data", outer)
-                    except json.JSONDecodeError:
-                        msg = {}
-                    event_type = msg.get("e")
-                    if event_type in {"depthUpdate", "aggTrade"}:
-                        event_ms = msg.get("E")
-                        if isinstance(event_ms, (int, float)):
-                            latency_ms = (time.time() * 1000.0) - float(event_ms)
-                            if event_type == "depthUpdate":
-                                depth_latencies_ms.append(latency_ms)
-                            else:
-                                agg_latencies_ms.append(latency_ms)
-                            _ok(f"LOB stream delivered {event_type} (latency={latency_ms:.1f} ms)")
-                        else:
-                            _ok(f"LOB stream delivered {event_type}")
-                        if event_type == "depthUpdate":
-                            break
-
-                    if depth_latencies_ms:
-                        break
-
-                if not depth_latencies_ms:
-                    _fail(
-                        f"LOB stream probe incomplete within {_LOB_STREAM_PROBE_TIMEOUT_S:.0f}s; "
-                        "missing depthUpdate"
-                    )
-                    all_passed = False
-                else:
-                    avg_latency = sum(depth_latencies_ms) / len(depth_latencies_ms)
-                    max_latency = max(depth_latencies_ms)
-                    _ok(
-                        f"LOB depthUpdate latency avg={avg_latency:.1f} ms  max={max_latency:.1f} ms"
-                    )
-                    if agg_latencies_ms:
-                        agg_avg_latency = sum(agg_latencies_ms) / len(agg_latencies_ms)
-                        agg_max_latency = max(agg_latencies_ms)
-                        _ok(
-                            f"LOB aggTrade latency avg={agg_avg_latency:.1f} ms  max={agg_max_latency:.1f} ms"
-                        )
-                    else:
-                        _ok("LOB aggTrade not observed during probe window")
-        except (ConnectionClosedError, ConnectionClosedOK) as exc:
-            _fail(f"Public LOB websocket closed unexpectedly: {exc}")
-            all_passed = False
+            live_samples = await _probe_endpoint(settings.LOB_RECORDER_WS)
+            _print_probe_report(settings.LOB_RECORDER_WS, live_samples)
+            testnet_samples = await _probe_endpoint("wss://stream.binancefuture.com")
+            _print_probe_report("stream.binancefuture.com (testnet baseline)", testnet_samples)
         except Exception as exc:
-            _fail(f"Public LOB stream probe failed: {exc}")
+            _fail(f"Latency probe failed: {exc}")
             all_passed = False
 
         # ── 8. IOC order (far off-market, will expire unfilled) ───

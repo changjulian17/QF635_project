@@ -79,6 +79,12 @@ def test_gate0_passes_degraded_heartbeat():
     assert ok is True
 
 
+def test_gate0_fails_on_lob_heartbeat_critical():
+    ok, reason = gate_0_data_fidelity("SYNCED", "HEALTHY", "CRITICAL")
+    assert ok is False
+    assert "LOB heartbeat" in reason
+
+
 # ── Gate 1 ────────────────────────────────────────────────────────────────────
 
 def test_gate1_fails_without_sweep():

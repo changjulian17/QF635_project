@@ -241,6 +241,7 @@ class KillswitchState:
 @dataclass
 class SharedState:
     """Shared mutable state between ws_consumer, LOB engine, and risk components."""
-    heartbeat_status: str   = "HEALTHY"   # "HEALTHY" | "DEGRADED" | "CRITICAL"
-    last_delta_ms:    float = 0.0
-    lob_status:       str   = "UNINITIALISED"  # mirrors LOBStateMachineState.value
+    heartbeat_status:     str   = "HEALTHY"   # price stream (bookTicker+aggTrade)
+    lob_heartbeat_status: str   = "HEALTHY"   # LOB stream (depth@100ms+kline)
+    last_delta_ms:        float = 0.0
+    lob_status:           str   = "UNINITIALISED"  # mirrors LOBStateMachineState.value

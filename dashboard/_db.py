@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+import time as _time
 from contextlib import contextmanager
 from typing import Generator, Union
 
@@ -60,6 +61,27 @@ def lob_tick_db() -> Generator[sqlite3.Connection, None, None]:
         yield conn
     finally:
         conn.close()
+
+
+def fetch_engine_health() -> dict | None:
+    try:
+        with main_db() as conn:
+            row = conn.execute(
+                "SELECT lob_status, hb_status, risk_tier, ks_active, updated_ms "
+                "FROM engine_health WHERE id = 1"
+            ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    stale = (_time.time() * 1000 - (row["updated_ms"] or 0)) > 15_000
+    return {
+        "lob_status":        row["lob_status"],
+        "heartbeat_status":  row["hb_status"],
+        "risk_tier":         row["risk_tier"],
+        "killswitch_active": bool(row["ks_active"]),
+        "stale":             stale,
+    }
 
 
 def fetch_agg_trades(

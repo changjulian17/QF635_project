@@ -358,6 +358,36 @@ def test_receive_loop_buffers_agg_trade():
         os.unlink(tmp)
 
 
+def test_receive_loop_buffers_agg_trade_no_e_field():
+    """aggTrade from real futures stream: 'e' absent, event type derived from stream name."""
+    rec, tmp = _recorder_with_tmpdb()
+
+    msg_no_e = json.dumps({
+        "stream": "btcusdt@aggTrade",
+        "data": {
+            # "e" deliberately absent — real fstream.binance.com behaviour
+            "T": int(time.time() * 1000),
+            "p": "105000.0",
+            "q": "0.01",
+            "m": False,
+        },
+    })
+
+    async def _run():
+        rec._running = True
+        await rec._receive_loop(_fake_ws([msg_no_e], rec))
+
+    try:
+        asyncio.run(_run())
+        rows = rec._conn.execute("SELECT COUNT(*) FROM agg_trades").fetchone()[0]
+        assert len(rec._trade_buf) > 0 or rows > 0, (
+            "aggTrade without 'e' field must still be recorded via stream-name fallback"
+        )
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
 def test_depth_uses_exchange_timestamp():
     """Depth snapshots must store the exchange timestamp from msg['E']."""
     rec, tmp = _recorder_with_tmpdb()

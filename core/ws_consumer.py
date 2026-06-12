@@ -31,10 +31,10 @@ class HeartbeatMonitor:
       any → CRITICAL after CONSEC_LIMIT consecutive packets exceed CRITICAL_MS
     """
     WARN_MS      = settings.HEARTBEAT_WARN_MS
-    CRITICAL_MS  = settings.HEARTBEAT_CRITICAL_MS
     CONSEC_LIMIT = settings.HEARTBEAT_CONSEC_LIMIT
 
-    def __init__(self) -> None:
+    def __init__(self, critical_ms: int | None = None) -> None:
+        self.CRITICAL_MS              = critical_ms if critical_ms is not None else settings.HEARTBEAT_CRITICAL_MS
         self._deltas: deque[float]    = deque(maxlen=10)
         self._critical_count: int     = 0
         self._degraded_since_ms: float | None = None
@@ -75,7 +75,7 @@ class HeartbeatMonitor:
         now_ms = time.time() * 1000
 
         if rate >= settings.HEARTBEAT_DEGRADED_RATE_THRESH:
-            if self.status in ("HEALTHY", "CRITICAL"):
+            if self.status == "HEALTHY":
                 self.status = "DEGRADED"
                 self._degraded_since_ms = now_ms
                 logger.warning(
@@ -130,12 +130,15 @@ class BinanceWebSocketConsumer:
 
     def __init__(
         self,
-        candle_queue: asyncio.Queue,
+        candle_queue: asyncio.Queue | None = None,
         candle_db_queue: asyncio.Queue | None = None,
         trade_queue: asyncio.Queue | None = None,
         depth_queue: asyncio.Queue | None = None,
         shared_state: SharedState | None = None,
         heartbeat_cb: Callable[[str, float], Awaitable[None]] | None = None,
+        streams: list[str] | None = None,
+        heartbeat_key: str = "heartbeat_status",
+        critical_ms: int | None = None,
     ) -> None:
         self._candle_queue    = candle_queue
         self._candle_db_queue = candle_db_queue
@@ -143,10 +146,12 @@ class BinanceWebSocketConsumer:
         self._depth_queue     = depth_queue
         self._shared_state    = shared_state or SharedState()
         self._heartbeat_cb    = heartbeat_cb
+        self._streams         = list(streams) if streams is not None else list(self.STREAMS)
+        self._heartbeat_key   = heartbeat_key
         self._running         = False
         self._reconnect_delay = 1.0
         self._max_delay       = 10.0
-        self.heartbeat        = HeartbeatMonitor()
+        self.heartbeat        = HeartbeatMonitor(critical_ms=critical_ms)
         self._frame_counts: dict[str, int] = {}
         self._frame_log_ts: float = 0.0
 
@@ -166,7 +171,7 @@ class BinanceWebSocketConsumer:
         self._running = False
 
     async def _connect_loop(self) -> None:
-        stream_path = "/".join(self.STREAMS)
+        stream_path = "/".join(self._streams)
         uri = f"{settings.WS_BASE}/stream?streams={stream_path}"
         attempt = 0
 
@@ -179,10 +184,11 @@ class BinanceWebSocketConsumer:
                     ping_timeout=15,
                     close_timeout=5,
                 ) as ws:
-                    logger.info("[WS] Connected — seeding LOB from REST snapshot…")
+                    logger.info("[WS] Connected")
                     self._reconnect_delay = 1.0
                     attempt = 0
-                    self._shared_state.lob_status = "UNINITIALISED"
+                    if self._depth_queue is not None:
+                        self._shared_state.lob_status = "UNINITIALISED"
 
                     # Reset local book and start async REST seed concurrently
                     # with the receive loop so diffs are buffered during the fetch.
@@ -191,17 +197,20 @@ class BinanceWebSocketConsumer:
                     self._lob_update_id = 0
                     self._lob_synced    = False
                     self._lob_pending   = []
-                    sync_task = asyncio.create_task(
-                        self._sync_lob_snapshot(), name="ws_lob_sync"
-                    )
+                    sync_task = None
+                    if self._depth_queue is not None:
+                        sync_task = asyncio.create_task(
+                            self._sync_lob_snapshot(), name="ws_lob_sync"
+                        )
                     try:
                         await self._receive_loop(ws)
                     finally:
-                        sync_task.cancel()
-                        try:
-                            await sync_task
-                        except asyncio.CancelledError:
-                            pass
+                        if sync_task is not None:
+                            sync_task.cancel()
+                            try:
+                                await sync_task
+                            except asyncio.CancelledError:
+                                pass
 
             except (ConnectionClosedError, ConnectionClosedOK) as exc:
                 logger.warning("[WS] Connection closed: %s", exc)
@@ -211,8 +220,9 @@ class BinanceWebSocketConsumer:
             if not self._running:
                 break
 
-            self._shared_state.heartbeat_status = "CRITICAL"
-            self._shared_state.lob_status       = "DISCONNECTED"
+            setattr(self._shared_state, self._heartbeat_key, "CRITICAL")
+            if self._depth_queue is not None:
+                self._shared_state.lob_status = "DISCONNECTED"
             attempt += 1
             logger.info("[WS] Reconnecting in %.1fs…", self._reconnect_delay)
             await asyncio.sleep(self._reconnect_delay)
@@ -231,9 +241,9 @@ class BinanceWebSocketConsumer:
                 break
 
             try:
-                raw_msg = await asyncio.wait_for(ws.recv(), timeout=8.0)
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
             except asyncio.TimeoutError:
-                logger.warning("[WS] No message for 8s — forcing reconnect")
+                logger.warning("[WS] No message for 5s — forcing reconnect")
                 break
 
             try:
@@ -244,7 +254,7 @@ class BinanceWebSocketConsumer:
                 # Heartbeat — called on EVERY message (Rule 11)
                 event_ms = msg.get("E", int(time.time() * 1000))
                 status   = self.heartbeat.record(event_ms)
-                self._shared_state.heartbeat_status = status
+                setattr(self._shared_state, self._heartbeat_key, status)
                 self._shared_state.last_delta_ms    = self.heartbeat.last_delta_ms
                 if self._heartbeat_cb is not None:
                     _task = asyncio.create_task(
@@ -255,6 +265,13 @@ class BinanceWebSocketConsumer:
                         lambda t: logger.critical("[WS] heartbeat_cb crashed: %s", t.exception())
                         if not t.cancelled() and t.exception() is not None else None
                     )
+
+                if status == "CRITICAL":
+                    logger.warning(
+                        "[WS] Heartbeat CRITICAL (delta=%.0fms) — forcing reconnect for fresh connection",
+                        self.heartbeat.last_delta_ms,
+                    )
+                    break
 
                 await self._dispatch(stream, msg)
 
@@ -398,7 +415,8 @@ class BinanceWebSocketConsumer:
                     volume=float(kline["v"]),
                     is_closed=True,
                 )
-                await self._candle_queue.put(candle)
+                if self._candle_queue is not None:
+                    await self._candle_queue.put(candle)
                 if self._candle_db_queue is not None:
                     await self._candle_db_queue.put(candle)
                 logger.info(

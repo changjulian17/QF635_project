@@ -47,6 +47,7 @@ if ! "$PYTHON" "$SCRIPT_DIR/scripts/test_connection.py"; then
     exit 1
 fi
 log_ok "Connectivity OK"
+export TRADING_MODE=live
 
 # --- Launch each component in a new Terminal window ---
 # NOTE: macOS only — uses osascript / Terminal.app.
@@ -64,9 +65,9 @@ open_window() {
 }
 
 echo "Launching components..."
-open_window "LOB Recorder"    "'$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine"  "'$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
-open_window "Dash Dashboard"  "'$PYTHON' dashboard/app.py"
+open_window "LOB Recorder"    "TRADING_MODE=live '$PYTHON' -m core.lob_recorder"
+open_window "Trading Engine"  "TRADING_MODE=live '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Dash Dashboard"  "TRADING_MODE=live '$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""

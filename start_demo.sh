@@ -61,14 +61,7 @@ if ! "$PYTHON" "$SCRIPT_DIR/scripts/test_futures_demo.py"; then
     exit 1
 fi
 log_ok "Connectivity OK"
-
-# --- Export demo env overrides ---
-# These override .env defaults; pydantic-settings resolves env vars before the .env file.
-export BINANCE_TESTNET=false
-export BINANCE_DEMO=true
-export DRY_RUN=false
-export WS_BASE="wss://fstream.binance.com"
-export REST_BASE="https://fapi.binance.com"
+export TRADING_MODE=demo
 
 # --- Launch each component in a new Terminal window ---
 open_window() {
@@ -84,9 +77,9 @@ open_window() {
 }
 
 echo "Launching DEMO components (BINANCE_DEMO=true, DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true)..."
-open_window "LOB Recorder"             "'$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine (DEMO)"   "BINANCE_TESTNET=false BINANCE_DEMO=true DRY_RUN=false WS_BASE=wss://fstream.binance.com REST_BASE=https://fapi.binance.com MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true TIMEFRAME=1s HEARTBEAT_CRITICAL_MS=1500 HEARTBEAT_KS2_ENABLED=false '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
-open_window "Dash Dashboard"           "'$PYTHON' dashboard/app.py"
+open_window "LOB Recorder"            "TRADING_MODE=demo '$PYTHON' -m core.lob_recorder"
+open_window "Trading Engine (DEMO)"  "TRADING_MODE=demo '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Dash Dashboard"          "TRADING_MODE=demo '$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""

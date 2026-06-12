@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 from config import settings
@@ -54,6 +55,16 @@ def init_db() -> None:
                 cvd_delta       REAL,
                 bid_levels_json TEXT,
                 ask_levels_json TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS engine_health (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                lob_status TEXT,
+                hb_status  TEXT,
+                risk_tier  TEXT,
+                ks_active  INTEGER,
+                updated_ms INTEGER
             )
         """)
         conn.execute(
@@ -203,6 +214,39 @@ class DBWriter:
                        ORDER BY ts DESC LIMIT ?
                    )""",
                 (settings.LOB_HISTORY,),
+            )
+            conn.commit()
+
+    async def write_engine_health(
+        self,
+        lob_status: str,
+        hb_status: str,
+        risk_tier: str,
+        ks_active: bool,
+    ) -> None:
+        await asyncio.to_thread(
+            self._write_engine_health_sync, lob_status, hb_status, risk_tier, ks_active
+        )
+
+    @staticmethod
+    def _write_engine_health_sync(
+        lob_status: str,
+        hb_status: str,
+        risk_tier: str,
+        ks_active: bool,
+    ) -> None:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT INTO engine_health (id, lob_status, hb_status, risk_tier, ks_active, updated_ms)
+                   VALUES (1, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       lob_status=excluded.lob_status,
+                       hb_status=excluded.hb_status,
+                       risk_tier=excluded.risk_tier,
+                       ks_active=excluded.ks_active,
+                       updated_ms=excluded.updated_ms""",
+                (lob_status, hb_status, risk_tier, 1 if ks_active else 0,
+                 int(time.time() * 1000)),
             )
             conn.commit()
 

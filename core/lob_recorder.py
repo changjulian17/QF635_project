@@ -37,11 +37,6 @@ _MAX_BUFFER_SIZE     = 10_000
 _RETENTION_DAYS      = 7
 _CLEANUP_INTERVAL    = 86_400.0
 
-_STREAMS = (
-    f"{settings.SYMBOL.lower()}@depth@100ms",
-    f"{settings.SYMBOL.lower()}@aggTrade",
-)
-
 
 class LOBRecorder:
     """
@@ -192,8 +187,13 @@ class LOBRecorder:
                 break
             try:
                 outer = json.loads(raw)
+                stream_name = outer.get("stream", "")
                 msg = outer.get("data", outer)
-                event_type = msg.get("e")
+                event_type = msg.get("e") or (
+                    "aggTrade"    if "@aggTrade" in stream_name else
+                    "depthUpdate" if "@depth"   in stream_name else
+                    None
+                )
 
                 if event_type == "depthUpdate":
                     if not self._synced:
@@ -216,6 +216,11 @@ class LOBRecorder:
                         float(msg["q"]),
                         1 if msg["m"] else 0,
                     ))
+
+                else:
+                    logger.debug(
+                        "[LOBRec] Unrecognised event: stream=%s e=%s", stream_name, event_type
+                    )
 
                 await self._maybe_flush()
 

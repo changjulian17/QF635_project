@@ -130,8 +130,8 @@ class UserDataStreamConsumer:
                 logger.info("[UserData] Connecting (attempt %d): %s…", attempt + 1, uri[:60])
                 async with websockets.connect(
                     uri,
-                    ping_interval=20,
-                    ping_timeout=60,
+                    ping_interval=10,
+                    ping_timeout=15,
                     close_timeout=10,
                 ) as ws:
                     logger.info("[UserData] User data stream connected")
