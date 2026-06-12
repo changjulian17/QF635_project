@@ -56,6 +56,16 @@ def init_db() -> None:
                 updated_ms INTEGER
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS engine_health (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                lob_status TEXT,
+                hb_status  TEXT,
+                risk_tier  TEXT,
+                ks_active  INTEGER,
+                updated_ms INTEGER
+            )
+        """)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ms_bars_ts ON microstructure_bars(ts)"
         )
