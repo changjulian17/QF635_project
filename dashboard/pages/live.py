@@ -313,7 +313,6 @@ def on_ws_position_event(message):
 )
 def render_portfolio_section(_tick, _n):
     if not _PORTFOLIO:
-<<<<<<< HEAD
         history = fetch_portfolio_history(limit=1)
         if history and not isinstance(history, DBOffline):
             last = history[-1]
@@ -324,12 +323,6 @@ def render_portfolio_section(_tick, _n):
             }
             return (_build_metrics_row(fallback), _build_balance_row({}))
         return (_placeholder_metrics(), _build_balance_row({}))
-=======
-        return (
-            _placeholder_metrics(),
-            _build_balance_row({}),
-        )
->>>>>>> 4d4f1d0 (feat: enhance WallState with qty_peak tracking and reload ratio adjustments)
     return (
         _build_metrics_row(_PORTFOLIO),
         _build_balance_row(_PORTFOLIO),
