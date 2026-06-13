@@ -297,5 +297,7 @@ def test_tier_scaling_full_vs_minimal_end_to_end():
     assert full_fills == 1, "fill_processor did not consume the FULL-tier fill"
     assert min_fills  == 1, "fill_processor did not consume the MINIMAL-tier fill"
     assert full_qty > 0 and min_qty > 0
-    # MINIMAL tier scalar (0.25) vs FULL (1.0) — same signal/book → qty ratio == 0.25
-    assert min_qty == pytest.approx(0.25 * full_qty, rel=0.05)
+    # MINIMAL tier scalar (0.25) vs FULL (1.0) — same signal/book → qty ratio ≈ 0.25
+    # Absolute tolerance of one lot-size step accounts for floor-quantization rounding.
+    from config import settings as _s
+    assert abs(min_qty - 0.25 * full_qty) <= _s.QTY_STEP_SIZE

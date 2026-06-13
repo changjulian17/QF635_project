@@ -168,9 +168,9 @@ class UserDataStreamConsumer:
                 break
 
             try:
-                raw_msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=90.0)
             except asyncio.TimeoutError:
-                logger.warning("[UserData] No message for 30 s — forcing reconnect")
+                logger.warning("[UserData] No message for 90 s — forcing reconnect")
                 break
 
             try:

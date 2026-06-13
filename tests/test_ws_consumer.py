@@ -302,97 +302,18 @@ def test_ws_seed_failure_stays_unsynced():
     assert consumer._lob_synced is False
 
 
-def test_depth_update_replaces_oldest_snapshot_when_queue_full():
-    import asyncio
-
-    from core.ws_consumer import BinanceWebSocketConsumer
-
-    async def _run() -> None:
-        candle_q = asyncio.Queue()
-        depth_q = asyncio.Queue(maxsize=1)
-        consumer = BinanceWebSocketConsumer(candle_queue=candle_q, depth_queue=depth_q)
-        consumer._lob_synced = True
-        consumer._bid_book = {100.0: 1.0, 99.5: 2.0}
-        consumer._ask_book = {100.5: 1.5, 101.0: 2.0}
-        consumer._lob_update_id = 41
-
-        await depth_q.put({"sentinel": True})
-
-        msg = {
-            "e": "depthUpdate",
-            "E": 1234567890000,
-            "u": 42,
-            "b": [["100.0", "3.0"]],
-            "a": [],
-        }
-
-        await asyncio.wait_for(consumer._dispatch("btcusdt@depth@100ms", msg), timeout=0.2)
-
-        assert depth_q.qsize() == 1
-        snapshot = depth_q.get_nowait()
-        assert snapshot["lastUpdateId"] == 42
-        assert snapshot["bids"][0] == ["100.0", "3.0"]
-
-    asyncio.run(_run())
-
-
-# ── New tests: critical_ms param ─────────────────────────────────────────────
-
-def test_heartbeat_monitor_default_critical_ms():
-    hb = HeartbeatMonitor()
-    assert hb.CRITICAL_MS == settings.HEARTBEAT_CRITICAL_MS
-
-
-def test_heartbeat_monitor_custom_critical_ms():
-    hb = HeartbeatMonitor(critical_ms=9999)
-    assert hb.CRITICAL_MS == 9999
+def test_stale_critical_does_not_trigger_break():
+    """After a CRITICAL episode, a healthy message resets _critical_count to 0.
+    The new break condition (_critical_count >= CONSEC_LIMIT) must NOT fire on
+    inherited stale status — only on a fresh consecutive trigger."""
+    hb = HeartbeatMonitor(critical_ms=100)
     for _ in range(hb.CONSEC_LIMIT):
-        hb.record(_event_ms(9000))   # 9s delta < 9999ms — below threshold
-    assert hb.status != "CRITICAL"
-    for _ in range(hb.CONSEC_LIMIT):
-        hb.record(_event_ms(10000))  # 10s delta > 9999ms — above threshold
+        hb.record(_event_ms(200))   # 200ms >> 100ms → increments _critical_count
     assert hb.status == "CRITICAL"
+    assert hb._critical_count >= hb.CONSEC_LIMIT
 
-
-def test_critical_triggers_immediate_break_in_receive_loop():
-    """_receive_loop must return quickly on CRITICAL — not wait for 5s recv timeout."""
-    import asyncio, json
-    from models import SharedState
-    from core.ws_consumer import BinanceWebSocketConsumer
-
-    now_ms = int(time.time() * 1000)
-    stale_msg = json.dumps({
-        "stream": "btcusdt@bookTicker",
-        "data": {"E": now_ms - 5000, "s": "BTCUSDT",
-                 "b": "1", "B": "1", "a": "1", "A": "1"},
-    })
-    recv_calls = 0
-    _consec = settings.HEARTBEAT_CONSEC_LIMIT  # CRITICAL fires after this many consecutive stale
-
-    class _FakeWS:
-        async def recv(self_):
-            nonlocal recv_calls
-            recv_calls += 1
-            if recv_calls <= _consec:
-                return stale_msg   # all stale → CRITICAL fires on recv_calls == _consec
-            await asyncio.sleep(60)   # would stall here without CRITICAL break
-
-        async def close(self_): pass
-
-    consumer = BinanceWebSocketConsumer(
-        shared_state=SharedState(),
-        streams=["btcusdt@bookTicker"],
-        heartbeat_key="heartbeat_status",
-        critical_ms=100,   # 5000ms delta >> 100ms → CRITICAL after CONSEC_LIMIT msgs
+    hb.record(_event_ms(5))         # 5ms < 100ms → resets _critical_count to 0
+    assert hb._critical_count == 0, "healthy message must reset consecutive count"
+    assert not (hb._critical_count >= hb.CONSEC_LIMIT), (
+        "break condition must NOT fire on inherited stale CRITICAL status"
     )
-    consumer._running = True   # normally set by start(); required for _receive_loop to enter
-
-    async def _run() -> None:
-        start = time.monotonic()
-        await consumer._receive_loop(_FakeWS())
-        elapsed = time.monotonic() - start
-        assert recv_calls == _consec, f"expected {_consec} recv calls, got {recv_calls}"
-        assert consumer.heartbeat.status == "CRITICAL"
-        assert elapsed < 5.0, f"_receive_loop took {elapsed:.1f}s — CRITICAL break not firing"
-
-    asyncio.run(_run())

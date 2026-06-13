@@ -154,7 +154,7 @@ class LOBRecorder:
         Only sets _synced=True after a successful seed — never records snapshots
         built from partial diffs (which would poison backtest data).
         """
-        url = "https://fapi.binance.com/fapi/v1/depth"
+        url = f"{settings.LOB_RECORDER_REST}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
         for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
             try:

@@ -57,13 +57,14 @@ def init_db() -> None:
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS engine_health (
-                id         INTEGER PRIMARY KEY CHECK (id = 1),
-                lob_status TEXT,
-                hb_status  TEXT,
-                risk_tier  TEXT,
-                ks_active  INTEGER,
-                updated_ms INTEGER
+            CREATE TABLE IF NOT EXISTS lob_snapshots (
+                ts               TEXT PRIMARY KEY,
+                mid_price        REAL,
+                spread           REAL,
+                obi              REAL,
+                cvd_delta        REAL,
+                bid_levels_json  TEXT,
+                ask_levels_json  TEXT
             )
         """)
         conn.execute(
