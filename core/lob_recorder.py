@@ -145,7 +145,7 @@ class LOBRecorder:
 
     async def _sync_snapshot(self) -> None:
         """Fetch a REST depth snapshot to seed the local LOB, then apply any buffered diffs."""
-        url = "https://fapi.binance.com/fapi/v1/depth"
+        url = f"{settings.LOB_RECORDER_REST}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
         try:
             async with aiohttp.ClientSession() as session:

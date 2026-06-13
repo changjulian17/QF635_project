@@ -282,3 +282,23 @@ def test_critical_triggers_immediate_break_in_receive_loop():
         assert elapsed < 5.0, f"_receive_loop took {elapsed:.1f}s — CRITICAL break not firing"
 
     asyncio.run(_run())
+
+
+def test_stale_critical_does_not_trigger_break():
+    """After a CRITICAL episode, a healthy message resets _critical_count to 0.
+    The new break condition (_critical_count >= CONSEC_LIMIT) must NOT fire on
+    inherited stale status — only on a fresh consecutive trigger."""
+    hb = HeartbeatMonitor(critical_ms=100)
+    # Drive to CRITICAL
+    for _ in range(hb.CONSEC_LIMIT):
+        hb.record(_event_ms(200))   # 200ms delta >> 100ms → increments _critical_count
+    assert hb.status == "CRITICAL"
+    assert hb._critical_count >= hb.CONSEC_LIMIT
+
+    # Single healthy message (as would arrive on fresh connection after reconnect)
+    hb.record(_event_ms(5))         # 5ms delta < 100ms → resets _critical_count to 0
+    assert hb._critical_count == 0, "healthy message must reset consecutive count"
+    # The new break condition must evaluate False even though status is still CRITICAL
+    assert not (hb._critical_count >= hb.CONSEC_LIMIT), (
+        "break condition must NOT fire on inherited stale CRITICAL status"
+    )

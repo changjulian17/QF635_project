@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     WS_BASE: str = "wss://stream.binancefuture.com"
     REST_BASE: str = "https://testnet.binancefuture.com"
     LOB_RECORDER_WS: str = "wss://stream.binancefuture.com"  # futures testnet stream; fstream.binance.com does not deliver aggTrade on this connection
+    LOB_RECORDER_REST: str = "https://testnet.binancefuture.com"  # REST base matching LOB_RECORDER_WS; must stay in sync
 
     # Strategy
     SYMBOL: str = "BTCUSDT"
@@ -164,9 +165,9 @@ class Settings(BaseSettings):
                 "BINANCE_DEMO":               True,
                 "DRY_RUN":                    False,
                 "HEARTBEAT_WARN_MS":          500,
-                "HEARTBEAT_CRITICAL_MS":      3000,
+                "HEARTBEAT_CRITICAL_MS":      5000,
                 "HEARTBEAT_LOB_CRITICAL_MS":  5000,
-                "HEARTBEAT_CONSEC_LIMIT":     5,
+                "HEARTBEAT_CONSEC_LIMIT":     10,
                 "HEARTBEAT_KS2_ENABLED":      False,
                 "MIN_CONFIDENCE":             0.1,
                 "TEST_SIGNAL_INJECT":         True,

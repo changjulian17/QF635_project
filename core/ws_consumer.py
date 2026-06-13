@@ -266,7 +266,7 @@ class BinanceWebSocketConsumer:
                         if not t.cancelled() and t.exception() is not None else None
                     )
 
-                if status == "CRITICAL":
+                if self.heartbeat._critical_count >= self.heartbeat.CONSEC_LIMIT:
                     logger.warning(
                         "[WS] Heartbeat CRITICAL (delta=%.0fms) — forcing reconnect for fresh connection",
                         self.heartbeat.last_delta_ms,
