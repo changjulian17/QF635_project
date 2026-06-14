@@ -157,7 +157,8 @@ async def test_ioc_expired_returns_none():
         return_value={"orderId": "999", "status": "EXPIRED", "executedQty": "0"}
     )
 
-    with patch.object(settings, "DRY_RUN", False):
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
         result = await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
 
     assert result is None
@@ -708,7 +709,8 @@ async def test_entry_in_flight_clears_after_unfilled_entry():
         return_value={"orderId": "999", "status": "EXPIRED", "executedQty": "0"}
     )
 
-    with patch.object(settings, "DRY_RUN", False):
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
         await om._submit(_make_req("LONG"))
 
     assert not om.has_active_exposure()
@@ -830,3 +832,108 @@ async def test_oco_sl_price_anchored_to_fill_price():
     )
     assert actual_sl < fill_price
     assert abs(actual_sl - 107_000.0) > 1_000
+
+
+@pytest.mark.asyncio
+async def test_no_fill_outcome_recorded_when_ioc_returns_none():
+    """When _submit_aggressive_limit returns None, update_outcome_cb must be called
+    with outcome='NO_FILL' so the signal_records row does not stay open forever."""
+    outcome_calls: list = []
+
+    async def _capture_outcome(signal_id, outcome, pnl, pnl_pct, dur, r_mult):
+        outcome_calls.append((signal_id, outcome))
+
+    om, _, _, _ = _make_manager()
+    om._update_outcome_cb = _capture_outcome
+    req = _make_req("LONG")
+
+    # Both patched methods are async — must use AsyncMock, not plain return_value.
+    with patch.object(om, "_resolve_book", new=AsyncMock(return_value=(95_000.0, 95_010.0))), \
+         patch.object(om, "_submit_aggressive_limit", new=AsyncMock(return_value=None)):
+        await om._submit(req)
+
+    await asyncio.sleep(0)   # yield so create_task-scheduled update_outcome_cb runs
+    assert len(outcome_calls) == 1
+    signal_id, outcome = outcome_calls[0]
+    assert signal_id == req.signal_id
+    assert outcome == "NO_FILL"
+
+
+@pytest.mark.asyncio
+async def test_demo_mode_uses_market_order():
+    """When BINANCE_DEMO=True, entry order must be MARKET (not IOC LIMIT)
+    so the thin demo book does not cause unfilled expiry."""
+    om, _, _, _ = _make_manager()
+    om._client = AsyncMock()
+    om._client.futures_create_order = AsyncMock(return_value={
+        "orderId":     "999",
+        "status":      "FILLED",
+        "executedQty": "0.001",
+        "avgPrice":    "95015.0",
+    })
+    req = _make_req("LONG")
+
+    with patch.object(settings, "BINANCE_DEMO", True), \
+         patch.object(settings, "DRY_RUN", False):
+        await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
+
+    call_kwargs = om._client.futures_create_order.call_args.kwargs
+    assert call_kwargs["type"] == "MARKET", (
+        f"Expected MARKET order on demo, got type={call_kwargs['type']!r}"
+    )
+    assert "price" not in call_kwargs, "MARKET order must not include a price"
+    assert "timeInForce" not in call_kwargs, "MARKET order must not include timeInForce"
+
+
+@pytest.mark.asyncio
+async def test_demo_mode_async_fill_poll():
+    """When demo MARKET order returns executedQty=0 immediately, the engine
+    must poll futures_get_order until FILLED rather than treating it as NO_FILL."""
+    om, _, _, _ = _make_manager()
+    om._client = AsyncMock()
+    om._client.futures_create_order = AsyncMock(return_value={
+        "orderId":     "888",
+        "status":      "NEW",
+        "executedQty": "0.0000",
+        "avgPrice":    "0.00",
+    })
+    om._client.futures_get_order = AsyncMock(return_value={
+        "orderId":     "888",
+        "status":      "FILLED",
+        "executedQty": "0.001",
+        "avgPrice":    "95015.0",
+    })
+    req = _make_req("LONG")
+
+    with patch.object(settings, "BINANCE_DEMO", True), \
+         patch.object(settings, "DRY_RUN", False), \
+         patch("asyncio.sleep", new=AsyncMock()):
+        await om._submit_aggressive_limit(req, "BUY", 95_000.0, 95_010.0)
+
+    om._client.futures_get_order.assert_called()
+    assert om._open_position_side == "BUY", (
+        "Poll should detect async fill and open position, not bail out as NO_FILL"
+    )
+
+
+@pytest.mark.asyncio
+async def test_demo_bracket_omits_reduce_only():
+    """In BINANCE_DEMO mode, TP/SL bracket orders must not include reduceOnly=true
+    because the demo account returns a soft -2022 error (HTTP 200, no orderId)."""
+    om, _, _, _ = _make_manager()
+    om._client = AsyncMock()
+    om._client.futures_create_order = AsyncMock(return_value={
+        "orderId": "101", "status": "NEW", "executedQty": "0",
+    })
+    req = _make_req("LONG")
+
+    with patch.object(settings, "BINANCE_DEMO", True), \
+         patch.object(settings, "DRY_RUN", False):
+        await om._place_oco(req=req, fill_price=95_000.0, fill_qty=0.001, entry_side="BUY")
+
+    assert om._client.futures_create_order.call_count == 2, "Both TP and SL orders must be submitted"
+    for call in om._client.futures_create_order.call_args_list:
+        kw = call.kwargs
+        assert "reduceOnly" not in kw, (
+            f"Demo bracket must not include reduceOnly, got: {kw}"
+        )

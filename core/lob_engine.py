@@ -89,7 +89,10 @@ class LocalOrderBook:
             self._ready = True
             self._snapshot_count += 1
 
-            if self._state != LOBStateMachineState.SYNCED:
+            # Fix: Ensure shared state is in sync with internal state.
+            # If we're internally SYNCED but shared_state was reset (e.g. on reconnect),
+            # we need to re-trigger the transition to set shared_state back to SYNCED.
+            if self._state != LOBStateMachineState.SYNCED or (self._shared_state and self._shared_state.lob_status != LOBStateMachineState.SYNCED.value):
                 self._transition(
                     LOBStateMachineState.SYNCED,
                     f"snapshot applied lastUpdateId={last_update_id}",
@@ -240,6 +243,10 @@ class LocalOrderBook:
     @property
     def is_ready(self) -> bool:
         return self._ready
+
+    def armament(self) -> str:
+        # Compatibility method if needed
+        return ""
 
     def best_bid_ask(self) -> tuple[float, float] | None:
         if not self._ready or not self._bids or not self._asks:

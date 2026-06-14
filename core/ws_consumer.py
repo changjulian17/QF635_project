@@ -4,164 +4,167 @@ import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from typing import Any, List, Optional
 
 import aiohttp
 import numpy as np
 import websockets
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config import settings
-from models import AggTrade, Candle, SharedState
+from models import AggTrade, LOBLevel, LOBSnapshot, SharedState
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONNECTION_SECONDS = 86_000  # reconnect 400 s before Binance's 24 h limit
+# Max connection duration before forced reconnect (24h)
+_MAX_CONNECTION_SECONDS = 24 * 3600
 
 
 class HeartbeatMonitor:
     """
-    Tracks delta between Binance event time (field E) and local system time
-    on every WebSocket message — never sampled, never batched (Rule 11).
-
+    Monitors WebSocket latency by comparing event_time_ms (E) to local time.
+    
     Status transitions (rate computed over rolling 10-message window):
-      HEALTHY → DEGRADED when ≥50% of window exceeds WARN_MS (single log on entry)
-      DEGRADED → SUSTAINED_DEGRADED after HEARTBEAT_SUSTAINED_MS elapsed at ≥50% rate
-      any → HEALTHY when <30% of window exceeds WARN_MS (hysteresis, single log on exit)
-      any → CRITICAL after CONSEC_LIMIT consecutive packets exceed CRITICAL_MS
+      HEALTHY -> DEGRADED when >=50% of window exceeds WARN_MS (single log on entry)
+      DEGRADED -> SUSTAINED_DEGRADED after HEARTBEAT_SUSTAINED_MS elapsed at >=50% rate
+      any -> HEALTHY when <30% of window exceeds WARN_MS (hysteresis, single log on exit)
     """
-    WARN_MS      = settings.HEARTBEAT_WARN_MS
-    CONSEC_LIMIT = settings.HEARTBEAT_CONSEC_LIMIT
 
-    def __init__(self, critical_ms: int | None = None) -> None:
-        self.CRITICAL_MS              = critical_ms if critical_ms is not None else settings.HEARTBEAT_CRITICAL_MS
-        self._deltas: deque[float]    = deque(maxlen=10)
-        self._critical_count: int     = 0
+    def __init__(self, warn_ms: int = None, critical_ms: int | None = None, consec_limit: int = None) -> None:
+        self.WARN_MS = warn_ms if warn_ms is not None else settings.HEARTBEAT_WARN_MS
+        self.CONSEC_LIMIT = consec_limit if consec_limit is not None else settings.HEARTBEAT_CONSEC_LIMIT
+        self.CRITICAL_MS = (
+            critical_ms if critical_ms is not None else settings.HEARTBEAT_CRITICAL_MS
+        )
+        self._deltas: deque[float] = deque(maxlen=10)
+        self._critical_count: int = 0
         self._degraded_since_ms: float | None = None
-        self.status: str              = "HEALTHY"
-        self.last_delta_ms: float     = 0.0
+        self.status: str = "HEALTHY"
+        self.last_delta_ms: float = 0.0
         self._last_critical_log_ts: float = 0.0
-
-    def record(self, event_time_ms: int) -> str:
-        delta_ms           = (time.time() * 1000) - event_time_ms
-        self.last_delta_ms = delta_ms
-        self._deltas.append(delta_ms)
-
-        # ── CRITICAL: consecutive check (unchanged) ──────────────────────────
-        if delta_ms > self.CRITICAL_MS:
-            self._critical_count += 1
-        else:
-            self._critical_count = 0
-
-        if self._critical_count >= self.CONSEC_LIMIT:
-            entering = self.status != "CRITICAL"
-            self.status = "CRITICAL"
-            self._degraded_since_ms = None
-            now = time.time()
-            if entering or (now - self._last_critical_log_ts) >= 60.0:
-                logger.critical(
-                    "[Heartbeat] CRITICAL: Binance WS latency %d consecutive >%dms. Last=%.0fms",
-                    self._critical_count, self.CRITICAL_MS, delta_ms,
-                )
-                self._last_critical_log_ts = now
-            return self.status
-
-        # ── RATE-GATE: wait for full window before evaluating ─────────────────
-        if len(self._deltas) < self._deltas.maxlen:
-            return self.status
-
-        degraded_in_window = sum(1 for d in self._deltas if d > self.WARN_MS)
-        rate   = degraded_in_window / len(self._deltas)
-        now_ms = time.time() * 1000
-
-        if rate >= settings.HEARTBEAT_DEGRADED_RATE_THRESH:
-            if self.status == "HEALTHY":
-                self.status = "DEGRADED"
-                self._degraded_since_ms = now_ms
-                logger.warning(
-                    "[Heartbeat] DEGRADED: Binance WS latency %d/%d messages >%dms avg=%.0fms",
-                    degraded_in_window, len(self._deltas), self.WARN_MS, self.avg_delta_ms,
-                )
-            elif self.status == "DEGRADED" and self._degraded_since_ms is not None:
-                if (now_ms - self._degraded_since_ms) >= settings.HEARTBEAT_SUSTAINED_MS:
-                    self.status = "SUSTAINED_DEGRADED"
-                    logger.warning(
-                        "[Heartbeat] SUSTAINED_DEGRADED: Binance WS latency >%.0fs above %.0f%% degraded rate avg=%.0fms",
-                        settings.HEARTBEAT_SUSTAINED_MS / 1000,
-                        settings.HEARTBEAT_DEGRADED_RATE_THRESH * 100,
-                        self.avg_delta_ms,
-                    )
-            # elif already SUSTAINED_DEGRADED: remain, no repeated log
-
-        elif rate < settings.HEARTBEAT_DEGRADED_RECOVERY_THRESH:
-            if self.status in ("DEGRADED", "SUSTAINED_DEGRADED", "CRITICAL"):
-                logger.info(
-                    "[Heartbeat] RECOVERED: Binance WS latency normal from %s avg=%.0fms",
-                    self.status, self.avg_delta_ms,
-                )
-            self.status = "HEALTHY"
-            self._degraded_since_ms = None
-
-        # else: rate in hysteresis zone — no transition
-
-        return self.status
 
     @property
     def avg_delta_ms(self) -> float:
-        return float(np.mean(self._deltas)) if self._deltas else 0.0
+        if not self._deltas:
+            return 0.0
+        return sum(self._deltas) / len(self._deltas)
 
-    @property
-    def max_delta_ms(self) -> float:
-        return float(max(self._deltas)) if self._deltas else 0.0
+    def record(self, event_time_ms: int | None) -> str:
+        """Update latency stats and return current status."""
+        if not event_time_ms:
+            return self.status
+
+        now_ms = time.time() * 1000
+        delta_ms = now_ms - event_time_ms
+        self.last_delta_ms = delta_ms
+        self._deltas.append(delta_ms)
+
+        # -- CRITICAL: consecutive check --
+        if delta_ms > self.CRITICAL_MS:
+            self._critical_count += 1
+            if self._critical_count >= self.CONSEC_LIMIT:
+                if time.time() - self._last_critical_log_ts > 10:
+                    logger.critical(
+                        "[Heartbeat] CRITICAL: %d consecutive >%dms. Last=%.0fms",
+                        self._critical_count,
+                        self.CRITICAL_MS,
+                        delta_ms,
+                    )
+                    self._last_critical_log_ts = time.time()
+                self.status = "CRITICAL"
+                return self.status
+        else:
+            self._critical_count = 0
+
+        # -- DEGRADED: rate-based check --
+        degraded_count = sum(1 for d in self._deltas if d > self.WARN_MS)
+        degraded_rate = degraded_count / len(self._deltas) if len(self._deltas) > 0 else 0
+
+        if self.status == "HEALTHY":
+            # Only enter DEGRADED if we have a full window or meet the rate threshold
+            if len(self._deltas) == self._deltas.maxlen and degraded_rate >= settings.HEARTBEAT_DEGRADED_RATE_THRESH:
+                self.status = "DEGRADED"
+                self._degraded_since_ms = now_ms
+                logger.warning(
+                    "[Heartbeat] DEGRADED: %d/10 messages >%dms avg=%.0fms",
+                    degraded_count,
+                    self.WARN_MS,
+                    self.avg_delta_ms,
+                )
+        elif self.status == "DEGRADED":
+            if (
+                now_ms - (self._degraded_since_ms or now_ms)
+                > settings.HEARTBEAT_SUSTAINED_MS
+            ):
+                self.status = "SUSTAINED_DEGRADED"
+                logger.warning(
+                    "[Heartbeat] SUSTAINED_DEGRADED: >%ds above %.0f%% degraded rate",
+                    settings.HEARTBEAT_SUSTAINED_MS // 1000,
+                    settings.HEARTBEAT_DEGRADED_RATE_THRESH * 100,
+                )
+            elif (
+                degraded_rate < settings.HEARTBEAT_DEGRADED_RECOVERY_THRESH
+            ):
+                self._recover("DEGRADED")
+        elif self.status == "SUSTAINED_DEGRADED":
+            if degraded_rate < settings.HEARTBEAT_DEGRADED_RECOVERY_THRESH:
+                self._recover("SUSTAINED_DEGRADED")
+        elif self.status == "CRITICAL":
+            # Exit CRITICAL if we see even one fast message
+            if delta_ms < self.WARN_MS:
+                self._recover("CRITICAL")
+
+        return self.status
+
+    def _recover(self, from_status: str) -> None:
+        logger.info(
+            "[Heartbeat] RECOVERED: status normal from %s avg=%.0fms",
+            from_status, self.avg_delta_ms
+        )
+        self.status = "HEALTHY"
+        self._degraded_since_ms = None
 
 
 class BinanceWebSocketConsumer:
-    # Incremental diff-depth stream seeded by a 1000-level REST snapshot.
-    # All levels from the internal book are forwarded to LOBEngine on each tick
-    # — no artificial depth cap — so the full available book is visible downstream.
-    _MAX_PENDING_DIFFS = 500   # cap pending diff buffer during REST snapshot fetch
-
-    STREAMS = [
-        f"{settings.SYMBOL.lower()}@aggTrade",
-        f"{settings.SYMBOL.lower()}@kline_{settings.TIMEFRAME}",
-        f"{settings.SYMBOL.lower()}@depth@100ms",   # incremental diff — seeded by REST snapshot
-        f"{settings.SYMBOL.lower()}@bookTicker",
-    ]
-
+    """
+    Manages a connection to multiple Binance streams.
+    Reconstructs LOB if a depth queue is provided.
+    Monitors heartbeat/latency.
+    """
     def __init__(
         self,
+        streams: list[str] = None,
+        shared_state: SharedState = None,
+        trade_queue: asyncio.Queue | None = None,
         candle_queue: asyncio.Queue | None = None,
         candle_db_queue: asyncio.Queue | None = None,
-        trade_queue: asyncio.Queue | None = None,
         depth_queue: asyncio.Queue | None = None,
-        shared_state: SharedState | None = None,
         heartbeat_cb: Callable[[str, float], Awaitable[None]] | None = None,
-        streams: list[str] | None = None,
         heartbeat_key: str = "heartbeat_status",
+        warn_ms: int | None = None,
         critical_ms: int | None = None,
+        consec_limit: int | None = None,
     ) -> None:
+        self.streams          = streams or []
+        self.heartbeat_key    = heartbeat_key
+        self.heartbeat        = HeartbeatMonitor(
+            warn_ms=warn_ms if warn_ms is not None else settings.HEARTBEAT_WARN_MS, 
+            critical_ms=critical_ms if critical_ms is not None else settings.HEARTBEAT_CRITICAL_MS, 
+            consec_limit=consec_limit if consec_limit is not None else settings.HEARTBEAT_CONSEC_LIMIT
+        )
+        self.heartbeat_cb     = heartbeat_cb
+        self._shared_state    = shared_state or SharedState()
+        self._trade_queue     = trade_queue
         self._candle_queue    = candle_queue
         self._candle_db_queue = candle_db_queue
-        self._trade_queue     = trade_queue
         self._depth_queue     = depth_queue
-        self._shared_state    = shared_state or SharedState()
-        self._heartbeat_cb    = heartbeat_cb
-        self._streams         = list(streams) if streams is not None else list(self.STREAMS)
-        self._heartbeat_key   = heartbeat_key
         self._running         = False
-        self._reconnect_delay = 1.0
-        self._max_delay       = 10.0
-        self.heartbeat        = HeartbeatMonitor(critical_ms=critical_ms)
-        self._frame_counts: dict[str, int] = {}
-        self._frame_log_ts: float = 0.0
 
-        # Local order book for diff-depth reconstruction
-        self._bid_book:       dict[float, float] = {}
-        self._ask_book:       dict[float, float] = {}
-        self._lob_update_id:  int  = 0
-        self._lob_synced:     bool = False
-        self._lob_pending:    list[dict] = []
-        self._depth_drop_count: int = 0
+        # LOB Reconstruction State
+        self._bid_book: dict[float, float] = {}
+        self._ask_book: dict[float, float] = {}
+        self._lob_update_id: int = 0
+        self._lob_synced = False
+        self._lob_pending: list[dict] = []
 
     async def start(self) -> None:
         self._running = True
@@ -171,18 +174,16 @@ class BinanceWebSocketConsumer:
         self._running = False
 
     async def _connect_loop(self) -> None:
-        stream_path = "/".join(self._streams)
-        uri = f"{settings.WS_BASE}/stream?streams={stream_path}"
         attempt = 0
-
         while self._running:
+            uri = f"{settings.WS_BASE}/stream?streams={'/'.join(self.streams)}"
             try:
                 logger.info("[WS] Connecting (attempt %d): %s", attempt + 1, uri)
                 async with websockets.connect(
                     uri,
-                    ping_interval=10,
-                    ping_timeout=15,
-                    close_timeout=5,
+                    ping_interval=settings.WS_PING_INTERVAL_S,
+                    ping_timeout=settings.WS_PING_TIMEOUT_S,
+                    close_timeout=0.1,
                 ) as ws:
                     logger.info("[WS] Connected")
                     self._reconnect_delay = 1.0
@@ -197,123 +198,189 @@ class BinanceWebSocketConsumer:
                     self._lob_update_id = 0
                     self._lob_synced    = False
                     self._lob_pending   = []
+
                     sync_task = None
                     if self._depth_queue is not None:
                         sync_task = asyncio.create_task(
                             self._sync_lob_snapshot(), name="ws_lob_sync"
                         )
+
                     try:
                         await self._receive_loop(ws)
                     finally:
                         if sync_task is not None:
                             sync_task.cancel()
-                            try:
-                                await sync_task
-                            except asyncio.CancelledError:
-                                pass
 
-            except (ConnectionClosedError, ConnectionClosedOK) as exc:
-                logger.warning("[WS] Connection closed: %s", exc)
-            except Exception as exc:
-                logger.error("[WS] Unexpected error: %s", exc, exc_info=True)
+            except (ConnectionRefusedError, OSError, websockets.exceptions.WebSocketException) as exc:
+                if self._depth_queue is not None:
+                    self._shared_state.lob_status = "DISCONNECTED"
 
-            if not self._running:
-                break
+                delay = min(2 ** attempt, 60)
+                logger.error("[WS] Connection failed: %s. Retrying in %ds...", exc, delay)
+                await asyncio.sleep(delay)
+                attempt += 1
 
-            setattr(self._shared_state, self._heartbeat_key, "CRITICAL")
-            if self._depth_queue is not None:
-                self._shared_state.lob_status = "DISCONNECTED"
-            attempt += 1
-            logger.info("[WS] Reconnecting in %.1fs…", self._reconnect_delay)
-            await asyncio.sleep(self._reconnect_delay)
-            self._reconnect_delay = min(self._reconnect_delay * 2, self._max_delay)
-
-    async def _receive_loop(self, ws) -> None:
+    async def _receive_loop(self, ws: Any) -> None:
         conn_start = time.monotonic()
 
-        while True:
-            if not self._running:
-                break
-
+        while self._running:
             if time.monotonic() - conn_start > _MAX_CONNECTION_SECONDS:
                 logger.info("[WS] Approaching 24 h limit — reconnecting proactively.")
                 await ws.close()
                 break
 
             try:
-                raw_msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=settings.WS_RECV_TIMEOUT_S)
             except asyncio.TimeoutError:
-                logger.warning("[WS] No message for 5s — forcing reconnect")
+                logger.warning(
+                    "[WS][%s] No message for %ds — forcing reconnect",
+                    self.heartbeat_key,
+                    settings.WS_RECV_TIMEOUT_S
+                )
+                break
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("[WS] Connection closed by server")
                 break
 
             try:
-                outer      = json.loads(raw_msg)
-                stream     = outer.get("stream", "")
-                msg        = outer.get("data", outer)
-
-                # Heartbeat — called on EVERY message (Rule 11)
-                event_ms = msg.get("E", int(time.time() * 1000))
-                status   = self.heartbeat.record(event_ms)
-                setattr(self._shared_state, self._heartbeat_key, status)
-                self._shared_state.last_delta_ms    = self.heartbeat.last_delta_ms
-                if self._heartbeat_cb is not None:
-                    _task = asyncio.create_task(
-                        self._heartbeat_cb(status, self.heartbeat.last_delta_ms),
-                        name="heartbeat_cb",
-                    )
-                    _task.add_done_callback(
-                        lambda t: logger.critical("[WS] heartbeat_cb crashed: %s", t.exception())
-                        if not t.cancelled() and t.exception() is not None else None
-                    )
-
-                if self.heartbeat._critical_count >= self.heartbeat.CONSEC_LIMIT:
-                    logger.warning(
-                        "[WS] Heartbeat CRITICAL (delta=%.0fms) — forcing reconnect for fresh connection",
-                        self.heartbeat.last_delta_ms,
-                    )
-                    break
-
+                data = json.loads(raw_msg)
+                if "stream" in data and "data" in data:
+                    stream = data["stream"]
+                    msg = data["data"]
+                else:
+                    stream = ""
+                    msg = data
                 await self._dispatch(stream, msg)
+            except json.JSONDecodeError as exc:
+                logger.error("[WS] Failed to decode JSON: %s", exc)
+            
+            # Check for heartbeat-driven reconnect
+            if self.heartbeat.status == "CRITICAL":
+                break
 
-                label = stream.split("@", 1)[-1] if "@" in stream else stream
-                self._frame_counts[label] = self._frame_counts.get(label, 0) + 1
-                now = time.monotonic()
-                if now - self._frame_log_ts >= 10.0:
-                    total  = sum(self._frame_counts.values())
-                    detail = "  ".join(f"{k}:{v}" for k, v in sorted(self._frame_counts.items()))
-                    logger.info("[WS] %d frames/10s  (%s)", total, detail)
-                    self._frame_counts.clear()
-                    self._frame_log_ts = now
+    async def _dispatch(self, stream: str, msg: dict) -> None:
+        # Update heartbeat
+        status = self.heartbeat.record(msg.get("E"))
+        setattr(self._shared_state, self.heartbeat_key, status)
+        self._shared_state.last_delta_ms = self.heartbeat.last_delta_ms
 
-            except (KeyError, ValueError, json.JSONDecodeError) as exc:
-                logger.warning("[WS] Malformed message: %s", exc)
+        if self.heartbeat_cb:
+            await self.heartbeat_cb(status, self.heartbeat.last_delta_ms)
+
+        if self.heartbeat.status == "CRITICAL":
+            # Exit to trigger reconnect
+            return
+
+        # Route message
+        event_type = msg.get("e")
+
+        if "depth" in stream or event_type == "depthUpdate":
+            if not self._lob_synced:
+                self._lob_pending.append(msg)
+                if len(self._lob_pending) > 500:
+                    self._lob_pending.pop(0)
+            else:
+                if self._apply_depth_diff(msg):
+                    self._enqueue_latest_depth_snapshot(msg.get("E", int(time.time() * 1000)))
+                else:
+                    # Gap detected, force reconnect to re-seed book
+                    logger.critical("[WS] Forcing reconnect due to LOB gap.")
+                    self.heartbeat.status = "CRITICAL"
+
+        elif event_type == "kline":
+            if self._candle_queue is not None:
+                await self._candle_queue.put(msg)
+            if self._candle_db_queue is not None:
+                await self._candle_db_queue.put(msg)
+
+        elif event_type == "aggTrade":
+            if self._trade_queue is not None:
+                await self._trade_queue.put(msg)
+
+        elif event_type == "bookTicker":
+            # Best bid/ask for spread calculation; route alongside trades
+            if self._trade_queue is not None:
+                await self._trade_queue.put(msg)
+
+    def _apply_depth_diff(self, diff: dict) -> bool:
+        """
+        Update local book with incremental diffs.
+        Returns True if successful, False if a gap was detected.
+        """
+        # 1. verify U <= last_update_id + 1 <= u
+        first_id = int(diff.get("U", 0))
+        last_id  = int(diff.get("u", 0))
+
+        if not last_id:
+            return True
+
+        if self._lob_update_id > 0 and first_id > 0 and first_id > self._lob_update_id + 1:
+            logger.warning("[WS] LOB GAP DETECTED: expected %d, got %d", self._lob_update_id + 1, first_id)
+            return False
+        
+        if last_id <= self._lob_update_id:
+            return True
+
+        for side, book in [("b", self._bid_book), ("a", self._ask_book)]:
+            for price_str, qty_str in diff.get(side, []):
+                price, qty = float(price_str), float(qty_str)
+                if qty == 0:
+                    book.pop(price, None)
+                else:
+                    book[price] = qty
+        
+        self._lob_update_id = last_id
+        return True
+
+    def _enqueue_latest_depth_snapshot(self, event_ms: int) -> None:
+        if self._depth_queue is not None:
+            # If queue is full, drop the oldest one to make room for the latest
+            if self._depth_queue.full():
+                try:
+                    self._depth_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            
+            msg = self._reconstruct_depth_msg(event_ms)
+            try:
+                self._depth_queue.put_nowait(msg)
+            except asyncio.QueueFull:
+                pass
+
+    def _reconstruct_depth_msg(self, event_ms: int) -> dict:
+        """Create a full snapshot dict from local book."""
+        bids = sorted([[str(p), str(q)] for p, q in self._bid_book.items()], 
+                      key=lambda x: float(x[0]), reverse=True)
+        asks = sorted([[str(p), str(q)] for p, q in self._ask_book.items()], 
+                      key=lambda x: float(x[0]))
+        
+        return {
+            "lastUpdateId": self._lob_update_id,
+            "bids": bids[:1000],
+            "asks": asks[:1000],
+            "E": event_ms
+        }
 
     async def _sync_lob_snapshot(self) -> None:
-        """
-        Fetch a REST depth snapshot to seed the local book, then apply any
-        diffs that arrived during the fetch. Mirrors the LOBRecorder pattern.
-        Falls back to marking synced anyway so data continues to flow on failure.
-        """
-        url = f"{settings.REST_BASE}/fapi/v1/depth"
-        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
+        """Fetch full snapshot from REST and align with buffered diffs."""
+        url = f"{settings.REST_BASE}/fapi/v1/depth?symbol={settings.SYMBOL}&limit=1000"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    resp.raise_for_status()
+                async with session.get(url) as resp:
                     snap = await resp.json()
-
+            
             self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
             self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
             last_uid = int(snap["lastUpdateId"])
 
-            for event in self._lob_pending:
-                if int(event.get("u", 0)) <= last_uid:
+            # Process buffered diffs
+            for diff in self._lob_pending:
+                u_last = int(diff.get("u", 0))
+                if u_last <= last_uid:
                     continue
-                self._apply_depth_diff(event)
-
-            self._lob_update_id = last_uid
+                self._apply_depth_diff(diff)
+            
+            self._lob_update_id = max(self._lob_update_id, last_uid)
             logger.info(
                 "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
                 last_uid, len(self._bid_book), len(self._ask_book),
@@ -324,117 +391,4 @@ class BinanceWebSocketConsumer:
             self._lob_pending.clear()
             self._lob_synced = True
             if self._bid_book and self._ask_book:
-                self._enqueue_latest_depth_snapshot(
-                    self._reconstruct_depth_msg(int(time.time() * 1000))
-                )
-
-    def _apply_depth_diff(self, event: dict) -> None:
-        for p, q in event.get("b", []):
-            price, qty = float(p), float(q)
-            if qty == 0.0:
-                self._bid_book.pop(price, None)
-            else:
-                self._bid_book[price] = qty
-        for p, q in event.get("a", []):
-            price, qty = float(p), float(q)
-            if qty == 0.0:
-                self._ask_book.pop(price, None)
-            else:
-                self._ask_book[price] = qty
-        self._lob_update_id = int(event.get("u", self._lob_update_id))
-
-    def _reconstruct_depth_msg(self, event_ms: int) -> dict:
-        """
-        Build a full-snapshot-style dict from the local book so downstream
-        consumers (LOBEngine, MicrostructureDetector) receive the complete
-        available depth on every tick.
-        """
-        bids = sorted(self._bid_book.items(), reverse=True)
-        asks = sorted(self._ask_book.items())
-        return {
-            "lastUpdateId": self._lob_update_id,
-            "E": event_ms,
-            "bids": [[str(p), str(q)] for p, q in bids],
-            "asks": [[str(p), str(q)] for p, q in asks],
-        }
-
-    def _enqueue_latest_depth_snapshot(self, snapshot: dict) -> None:
-        """Keep the newest depth snapshot moving without blocking the websocket reader."""
-        if self._depth_queue is None:
-            return
-
-        try:
-            self._depth_queue.put_nowait(snapshot)
-            return
-        except asyncio.QueueFull:
-            try:
-                self._depth_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-
-            try:
-                self._depth_queue.put_nowait(snapshot)
-            except asyncio.QueueFull:
-                self._depth_drop_count += 1
-                if self._depth_drop_count == 1 or self._depth_drop_count % 100 == 0:
-                    logger.warning(
-                        "[WS] depth_queue saturated — dropped %d latest snapshots",
-                        self._depth_drop_count,
-                    )
-                return
-
-            self._depth_drop_count += 1
-            if self._depth_drop_count == 1 or self._depth_drop_count % 100 == 0:
-                logger.warning(
-                    "[WS] depth_queue saturated — replaced oldest snapshot (%d drops)",
-                    self._depth_drop_count,
-                )
-
-    async def _dispatch(self, stream: str, msg: dict) -> None:
-        event_type = msg.get("e")
-
-        if event_type == "aggTrade":
-            trade = AggTrade(
-                timestamp=datetime.fromtimestamp(msg["T"] / 1000, tz=timezone.utc),
-                price=float(msg["p"]),
-                qty=float(msg["q"]),
-                is_buyer_maker=bool(msg["m"]),
-            )
-            if self._trade_queue is not None:
-                await self._trade_queue.put(trade)
-
-        elif event_type == "kline":
-            kline = msg["k"]
-            if kline.get("x"):   # closed candle only
-                candle = Candle(
-                    open_time=datetime.fromtimestamp(kline["t"] / 1000, tz=timezone.utc),
-                    open=float(kline["o"]),
-                    high=float(kline["h"]),
-                    low=float(kline["l"]),
-                    close=float(kline["c"]),
-                    volume=float(kline["v"]),
-                    is_closed=True,
-                )
-                if self._candle_queue is not None:
-                    await self._candle_queue.put(candle)
-                if self._candle_db_queue is not None:
-                    await self._candle_db_queue.put(candle)
-                logger.info(
-                    "[WS] Candle close — O=%.2f H=%.2f L=%.2f C=%.2f V=%.3f",
-                    candle.open, candle.high, candle.low, candle.close, candle.volume,
-                )
-
-        elif event_type == "depthUpdate":
-            # Incremental diff — buffer during REST seed, then apply and reconstruct.
-            event_ms = int(msg.get("E") or time.time() * 1000)
-            if not self._lob_synced:
-                if len(self._lob_pending) < self._MAX_PENDING_DIFFS:
-                    self._lob_pending.append(msg)
-            else:
-                self._apply_depth_diff(msg)
-                self._enqueue_latest_depth_snapshot(self._reconstruct_depth_msg(event_ms))
-
-        elif event_type == "bookTicker":
-            # Best bid/ask for spread calculation; route alongside trades
-            if self._trade_queue is not None:
-                await self._trade_queue.put(msg)
+                self._enqueue_latest_depth_snapshot(int(time.time() * 1000))
