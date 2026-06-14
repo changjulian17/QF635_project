@@ -581,6 +581,14 @@ class OrderManager:
             logger.info("[Exec] DRY RUN — TP=%s SL=%s", tp_order, sl_order)
             return
 
+        # Demo accounts route TP/SL through the Algo Conditional API, returning
+        # algoId instead of orderId. Gate6 handles exit within ~300ms via
+        # handle_protection_wall_removed, so bracket placement is not needed.
+        if settings.BINANCE_DEMO:
+            logger.info("[Exec] BINANCE_DEMO — skipping bracket placement (TP=%s SL=%s)",
+                        tp_order, sl_order)
+            return
+
         # S1: flag placement in-flight before the first REST call.
         async with self._position_lock:
             self._placing_oco = True
@@ -668,9 +676,12 @@ class OrderManager:
 
         except Exception as exc:
             # C1: naked position — cancel any partially-placed orders then emergency-close.
+            # Raise _emergency_close_in_progress before the first await so Gate6's
+            # handle_protection_wall_removed cannot fire a concurrent close.
             async with self._position_lock:
-                self._placing_oco             = False
-                self._cancel_oco_on_placement = False
+                self._placing_oco                 = False
+                self._cancel_oco_on_placement     = False
+                self._emergency_close_in_progress = True
             logger.error("[Exec] Bracket placement failed: %s", exc, exc_info=True)
             await self._cancel_bracket_orders()
             closed, close_p = await self._emergency_close(fill_qty, entry_side, reason="OCO_FAILED")
@@ -1012,10 +1023,11 @@ class OrderManager:
         )
 
         async with self._position_lock:
-            qty         = self._open_position_qty
-            side        = self._open_position_side
-            event       = self._open_position_closed_event
-            placing_oco = self._placing_oco
+            qty               = self._open_position_qty
+            side              = self._open_position_side
+            event             = self._open_position_closed_event
+            placing_oco       = self._placing_oco
+            close_in_progress = self._emergency_close_in_progress
             if placing_oco:
                 # Delegate cancel+close to _place_oco (S1 fix).
                 self._cancel_oco_on_placement = True
@@ -1024,6 +1036,10 @@ class OrderManager:
             logger.warning(
                 "[Exec] Bracket placement in progress — deferred cancel-and-close scheduled"
             )
+            return
+
+        if close_in_progress:
+            logger.info("[Exec] Emergency close already in progress — Gate6 close suppressed")
             return
 
         if settings.DRY_RUN:

@@ -329,7 +329,8 @@ async def test_oco_failure_triggers_emergency_close():
         return False, 0.0
     om._emergency_close = spy_emergency
 
-    with patch.object(settings, "DRY_RUN", False):
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
         await om._place_oco(req, fill_price=95_015.0, fill_qty=0.001, entry_side="BUY")
 
     assert len(emergency_close_calls) == 1
@@ -423,7 +424,8 @@ async def test_tp_sl_order_ids_stored_as_int():
         side_effect=[{"orderId": 9876}, {"orderId": 9877}]
     )
 
-    with patch.object(settings, "DRY_RUN", False):
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
         await om._place_oco(req, fill_price=95_015.0, fill_qty=0.001, entry_side="BUY")
 
     assert om._open_tp_order_id == 9876
@@ -529,7 +531,8 @@ async def test_s1_deferred_cancel_executed_after_oco_placed():
 
     om._cancel_oco_on_placement = True
 
-    with patch.object(settings, "DRY_RUN", False):
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
         await om._place_oco(req, fill_price=95_015.0, fill_qty=0.001, entry_side="BUY")
 
     assert emergency_calls == ["WALL_REMOVED_DURING_OCO"]
@@ -564,7 +567,8 @@ async def test_s2_state_reset_after_oco_failed_and_closed():
         return True, 94_990.0
     om._emergency_close = confirmed_close
 
-    with patch.object(settings, "DRY_RUN", False):
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
         await om._place_oco(req, fill_price=95_015.0, fill_qty=0.001, entry_side="BUY")
 
     assert om._open_position_side         is None
@@ -818,7 +822,8 @@ async def test_oco_sl_price_anchored_to_fill_price():
         return {"orderId": len(captured_calls)}
     om._client.futures_create_order = capture_futures_order
 
-    with patch.object(settings, "DRY_RUN", False):
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
         await om._place_oco(req, fill_price=fill_price, fill_qty=0.001, entry_side="BUY")
 
     assert len(captured_calls) >= 2, "Expected two futures_create_order calls (TP + SL)"
@@ -918,8 +923,9 @@ async def test_demo_mode_async_fill_poll():
 
 @pytest.mark.asyncio
 async def test_demo_bracket_omits_reduce_only():
-    """In BINANCE_DEMO mode, TP/SL bracket orders must not include reduceOnly=true
-    because the demo account returns a soft -2022 error (HTTP 200, no orderId)."""
+    """In BINANCE_DEMO mode, _place_oco must return early without submitting any
+    bracket orders — demo accounts route TP/SL through the Algo Conditional API
+    (returning algoId, not orderId) so the standard futures_create_order path fails."""
     om, _, _, _ = _make_manager()
     om._client = AsyncMock()
     om._client.futures_create_order = AsyncMock(return_value={
@@ -931,9 +937,6 @@ async def test_demo_bracket_omits_reduce_only():
          patch.object(settings, "DRY_RUN", False):
         await om._place_oco(req=req, fill_price=95_000.0, fill_qty=0.001, entry_side="BUY")
 
-    assert om._client.futures_create_order.call_count == 2, "Both TP and SL orders must be submitted"
-    for call in om._client.futures_create_order.call_args_list:
-        kw = call.kwargs
-        assert "reduceOnly" not in kw, (
-            f"Demo bracket must not include reduceOnly, got: {kw}"
-        )
+    assert om._client.futures_create_order.call_count == 0, (
+        "BINANCE_DEMO must skip bracket placement entirely (algoId vs orderId incompatibility)"
+    )

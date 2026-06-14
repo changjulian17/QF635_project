@@ -90,6 +90,15 @@ else
     log_ok "Connectivity OK"
 fi
 
+# Rotate previous log to timestamped archive before starting fresh
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+if [[ -f "$LOG_DIR/cryptosentinel.log" ]]; then
+    mv "$LOG_DIR/cryptosentinel.log" \
+       "$LOG_DIR/cryptosentinel_$(date +%Y%m%d_%H%M%S).log"
+    log_ok "Previous log archived"
+fi
+
 # --- Build env prefix for launched processes ---
 # TRADING_MODE=demo gives: MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true, BINANCE_DEMO=true
 # DRY_RUN=true overrides the preset's DRY_RUN=false when explicitly set

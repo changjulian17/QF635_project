@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import statistics
+import time
 from datetime import datetime, timezone
 
 from models import LOBLevel, LOBSnapshot, LOBStateMachineState, SharedState
@@ -47,6 +48,7 @@ class LocalOrderBook:
         self._snapshot_count: int = 0
         self._lock = asyncio.Lock()
         self._last_event_time: datetime | None = None
+        self._test_wall_overrides: list[dict] = []  # populated by inject_test_wall()
 
     # ── Snapshot interface ────────────────────────────────────────────────────
 
@@ -125,6 +127,15 @@ class LocalOrderBook:
 
     # ── Wall identification ───────────────────────────────────────────────────
 
+    def inject_test_wall(self, price: float, side: str, ttl_ms: int = 5_000) -> None:
+        """Register a synthetic wall for test mode (TEST_SIGNAL_INJECT=True).
+        The wall appears in get_current_walls() for ttl_ms milliseconds, giving
+        Gate6's persistence monitor time to detect it before it expires naturally."""
+        expire_ms = int(time.time() * 1000) + ttl_ms
+        self._test_wall_overrides.append(
+            {"price": price, "qty": 999.0, "sigma": 9.9, "side": side, "expire_ms": expire_ms}
+        )
+
     async def get_current_walls(self, sigma: float = 2.5, window: int = 5) -> list[dict]:
         """
         Scan visible book levels and return those that qualify as resting
@@ -139,6 +150,15 @@ class LocalOrderBook:
             )
             walls.extend(
                 self._walls_in_side(sorted(self._asks.items()), "ask", sigma, window)
+            )
+            # Merge test overrides (TTL-filtered); only active when TEST_SIGNAL_INJECT=True
+            now_ms = int(time.time() * 1000)
+            self._test_wall_overrides = [
+                w for w in self._test_wall_overrides if w["expire_ms"] > now_ms
+            ]
+            walls.extend(
+                {"price": w["price"], "qty": w["qty"], "sigma": w["sigma"], "side": w["side"]}
+                for w in self._test_wall_overrides
             )
             return walls
 

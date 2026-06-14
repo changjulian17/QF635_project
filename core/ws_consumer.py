@@ -165,6 +165,7 @@ class BinanceWebSocketConsumer:
         self._lob_update_id: int = 0
         self._lob_synced = False
         self._lob_pending: list[dict] = []
+        self._consecutive_lob_gaps: int = 0
 
     async def start(self) -> None:
         self._running = True
@@ -195,9 +196,10 @@ class BinanceWebSocketConsumer:
                     # with the receive loop so diffs are buffered during the fetch.
                     self._bid_book.clear()
                     self._ask_book.clear()
-                    self._lob_update_id = 0
-                    self._lob_synced    = False
-                    self._lob_pending   = []
+                    self._lob_update_id       = 0
+                    self._lob_synced          = False
+                    self._lob_pending         = []
+                    self._consecutive_lob_gaps = 0
 
                     sync_task = None
                     if self._depth_queue is not None:
@@ -281,11 +283,23 @@ class BinanceWebSocketConsumer:
                     self._lob_pending.pop(0)
             else:
                 if self._apply_depth_diff(msg):
+                    self._consecutive_lob_gaps = 0
                     self._enqueue_latest_depth_snapshot(msg.get("E", int(time.time() * 1000)))
                 else:
-                    # Gap detected, force reconnect to re-seed book
-                    logger.critical("[WS] Forcing reconnect due to LOB gap.")
-                    self.heartbeat.status = "CRITICAL"
+                    self._consecutive_lob_gaps += 1
+                    if self._consecutive_lob_gaps >= settings.LOB_GAP_RECONNECT_MIN_CONSECUTIVE:
+                        logger.critical(
+                            "[WS] Forcing reconnect after %d consecutive LOB gaps.",
+                            self._consecutive_lob_gaps,
+                        )
+                        self._consecutive_lob_gaps = 0
+                        self.heartbeat.status = "CRITICAL"
+                    else:
+                        logger.warning(
+                            "[WS] LOB gap %d/%d — skipping diff.",
+                            self._consecutive_lob_gaps,
+                            settings.LOB_GAP_RECONNECT_MIN_CONSECUTIVE,
+                        )
 
         elif event_type == "kline":
             if self._candle_queue is not None:
@@ -373,12 +387,15 @@ class BinanceWebSocketConsumer:
             self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
             last_uid = int(snap["lastUpdateId"])
 
-            # Process buffered diffs
+            # Process buffered diffs; stop on first internal gap to avoid
+            # leaving _lob_update_id below the gap and triggering an immediate
+            # reconnect on the next live diff.
             for diff in self._lob_pending:
                 u_last = int(diff.get("u", 0))
                 if u_last <= last_uid:
                     continue
-                self._apply_depth_diff(diff)
+                if not self._apply_depth_diff(diff):
+                    break
             
             self._lob_update_id = max(self._lob_update_id, last_uid)
             logger.info(

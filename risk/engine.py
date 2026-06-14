@@ -94,11 +94,13 @@ class RiskEngine:
 
         # Consecutive-loss cooldown
         if self._cooldown_until and now < self._cooldown_until:
+            self._tier = _Tier.PASSIVE
             pf.circuit_breaker = CircuitBreakerStatus.PAUSED
             return CircuitBreakerStatus.PAUSED
 
         if pf.consecutive_losses >= settings.MAX_CONSECUTIVE_LOSSES:
             self._cooldown_until = now + timedelta(seconds=self.COOLDOWN_SECONDS)
+            self._tier = _Tier.PASSIVE
             pf.circuit_breaker = CircuitBreakerStatus.PAUSED
             logger.warning("[Risk] Consecutive losses=%d → PAUSE %ds", pf.consecutive_losses, self.COOLDOWN_SECONDS)
             return CircuitBreakerStatus.PAUSED

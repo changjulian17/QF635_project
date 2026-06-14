@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pytest
 
@@ -240,3 +240,31 @@ def test_record_trade_result_as_budget_update_cb_updates_budget():
 
     assert budget.realised_pnl == pytest.approx(-200.0)
     assert pf.budget_loss_pct  == pytest.approx(budget.loss_pct)
+
+
+def test_sync_tier_passive_on_consecutive_losses():
+    from config import settings
+    pf = make_portfolio(consecutive_losses=settings.MAX_CONSECUTIVE_LOSSES)
+    engine = make_engine(pf)
+
+    tier = engine.sync_tier()
+
+    assert tier == "PASSIVE"
+    assert pf.circuit_breaker == CircuitBreakerStatus.PAUSED
+
+
+def test_sync_tier_restores_full_after_cooldown_expires_with_win():
+    from config import settings
+    pf = make_portfolio(consecutive_losses=settings.MAX_CONSECUTIVE_LOSSES)
+    engine = make_engine(pf)
+
+    engine.sync_tier()  # enters PAUSED → sets _cooldown_until, tier=PASSIVE
+    assert engine.tier == "PASSIVE"
+
+    engine.record_trade_result(+1.0)  # win resets consecutive_losses to 0
+    engine._cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)  # expire cooldown
+
+    tier = engine.sync_tier()
+
+    assert tier == "FULL"
+    assert pf.circuit_breaker == CircuitBreakerStatus.ACTIVE
