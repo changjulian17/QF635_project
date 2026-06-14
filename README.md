@@ -78,7 +78,7 @@ CryptoSentinel/
 │   ├── spec.py                # StrategySpec — immutable YAML-backed strategy descriptor
 │   ├── scorer.py              # XGBoostScorer + ScorerFactory (ML confidence gate, Gate 2)
 │   ├── registry.py            # StrategyRegistry — dual-store lifecycle (YAML + SQLite)
-│   └── builder.py             # StrategyBuilder — 3-stage pipeline: validate → register
+│   └── builder.py             # StrategyBuilder — 3-stage pipeline: load metrics → validate → register
 │
 ├── risk/                      # Risk management
 │   ├── engine.py              # RiskEngine — 5-tier throttling, DOV, circuit breakers
@@ -282,7 +282,7 @@ Single class used identically in live trading and backtesting. Uses Welford onli
 | `vwap_reclaim` | 1 if close crossed above VWAP |
 | `vol_climax` | 1 if `vol_ratio > 3×` |
 | `cvd_positive` | 1 if `cvd_delta > 0` |
-| `wall_detected` ★ | 1 if Wall (>2.5σ) within 5 ticks of mid |
+| `wall_detected` ★ | 1 if any tracked Wall (>2.5σ) is currently present (identified using ±`LOB_WALL_WINDOW` surrounding levels) |
 | `wall_distance_bps` ★ | Distance from mid to nearest Wall |
 | `absorption_ratio` ★ | `wall.qty_current / wall.qty_initial` |
 | `protection_wall_present` ★ | 1 if fresh Wall detected post-sweep ≤3s |
