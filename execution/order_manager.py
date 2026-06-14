@@ -39,7 +39,7 @@ from collections.abc import Awaitable, Callable
 from binance import AsyncClient
 
 from config import settings
-from execution.orders import FuturesSLOrder, FuturesTPOrder, IOCLimitOrder
+from execution.orders import FuturesMarketOrder, FuturesSLOrder, FuturesTPOrder, IOCLimitOrder
 from models import FillDetail, MicroOrderRequest
 from risk.killswitch import GlobalKillswitch
 from risk.sizing import clamp_stop_bps
@@ -233,6 +233,7 @@ class OrderManager:
                 logger.warning(
                     "[Exec] Active exposure — discarding signal %s", req.signal_id[:8]
                 )
+                self._write_entry_failure(req.signal_id, "NO_FILL")
                 continue
             await self._submit(req)
 
@@ -271,6 +272,7 @@ class OrderManager:
                 logger.warning(
                     "[Exec] Active exposure at submit — skipping %s", req.signal_id[:8]
                 )
+                self._write_entry_failure(req.signal_id, "NO_FILL")
                 return
             self._entry_in_flight = True
         try:
@@ -279,11 +281,13 @@ class OrderManager:
                 logger.warning(
                     "[Exec] Could not resolve order book — skipping %s", req.signal_id[:8]
                 )
+                self._write_entry_failure(req.signal_id, "NO_FILL")
                 return
             best_bid, best_ask = book
 
             resp = await self._submit_aggressive_limit(req, req.side, best_bid, best_ask)
             if resp is None:
+                self._write_entry_failure(req.signal_id, "NO_FILL")
                 return
 
             fill_price = _weighted_avg_fill(resp)
@@ -399,12 +403,20 @@ class OrderManager:
             )
             return None
 
-        entry_order = IOCLimitOrder(
-            symbol   = settings.SYMBOL,
-            side     = side,
-            quantity = qty,
-            price    = limit_price,
-        )
+        if settings.BINANCE_DEMO:
+            # Demo book has thin synthetic liquidity — MARKET order guarantees immediate fill.
+            entry_order = FuturesMarketOrder(
+                symbol   = settings.SYMBOL,
+                side     = side,
+                quantity = qty,
+            )
+        else:
+            entry_order = IOCLimitOrder(
+                symbol   = settings.SYMBOL,
+                side     = side,
+                quantity = qty,
+                price    = limit_price,
+            )
 
         if settings.DRY_RUN:
             logger.info(
@@ -425,12 +437,34 @@ class OrderManager:
                 return None
 
             exec_qty = float(resp.get("executedQty", "0"))
+            if exec_qty == 0.0 and settings.BINANCE_DEMO:
+                # Demo fills MARKET orders asynchronously (REST returns NEW immediately).
+                order_id = resp.get("orderId")
+                for _ in range(15):          # 15 × 200 ms = 3 s max
+                    await asyncio.sleep(0.2)
+                    try:
+                        polled = await self._client.futures_get_order(
+                            symbol=settings.SYMBOL, orderId=order_id
+                        )
+                    except Exception as exc:
+                        logger.warning("[Exec] Demo fill-poll error: %s", exc)
+                        break
+                    exec_qty = float(polled.get("executedQty", "0"))
+                    if exec_qty > 0.0:
+                        resp = polled
+                        logger.info(
+                            "[Exec] Demo async fill: %s qty=%s @ %s | signal_id=%s",
+                            side, exec_qty, polled.get("avgPrice"), req.signal_id[:8],
+                        )
+                        break
+
             if exec_qty == 0.0:
                 logger.warning(
                     "[Exec] IOC expired unfilled (status=%s) — signal stale, "
                     "no retry | signal_id=%s",
                     resp.get("status"), req.signal_id[:8],
                 )
+                self._write_entry_failure(req.signal_id, "NO_FILL")
                 return None
 
         fill_price = _weighted_avg_fill(resp)
@@ -547,13 +581,35 @@ class OrderManager:
             logger.info("[Exec] DRY RUN — TP=%s SL=%s", tp_order, sl_order)
             return
 
+        # Demo accounts route TP/SL through the Algo Conditional API, returning
+        # algoId instead of orderId. Gate6 handles exit within ~300ms via
+        # handle_protection_wall_removed, so bracket placement is not needed.
+        if settings.BINANCE_DEMO:
+            logger.info("[Exec] BINANCE_DEMO — skipping bracket placement (TP=%s SL=%s)",
+                        tp_order, sl_order)
+            return
+
         # S1: flag placement in-flight before the first REST call.
         async with self._position_lock:
             self._placing_oco = True
 
         try:
-            tp_resp = await self._client.futures_create_order(**tp_order.to_entry_params())
-            sl_resp = await self._client.futures_create_order(**sl_order.to_entry_params())
+            tp_params = tp_order.to_entry_params()
+            sl_params = sl_order.to_entry_params()
+            if settings.BINANCE_DEMO:
+                # Demo returns HTTP 200 {"code":-2022} (soft error) for reduceOnly=true.
+                tp_params.pop("reduceOnly", None)
+                sl_params.pop("reduceOnly", None)
+
+            tp_resp = await self._client.futures_create_order(**tp_params)
+            sl_resp = await self._client.futures_create_order(**sl_params)
+
+            if "orderId" not in tp_resp or "orderId" not in sl_resp:
+                logger.error(
+                    "[Exec] Bracket order missing orderId — tp=%s sl=%s",
+                    tp_resp, sl_resp,
+                )
+                raise KeyError(f"orderId absent: tp={tp_resp} sl={sl_resp}")
 
             # Atomically: record order IDs, clear flag, snapshot deferred-cancel flag.
             async with self._position_lock:
@@ -656,9 +712,12 @@ class OrderManager:
 
         except Exception as exc:
             # C1: naked position — cancel any partially-placed orders then emergency-close.
+            # Raise _emergency_close_in_progress before the first await so Gate6's
+            # handle_protection_wall_removed cannot fire a concurrent close.
             async with self._position_lock:
-                self._placing_oco             = False
-                self._cancel_oco_on_placement = False
+                self._placing_oco                 = False
+                self._cancel_oco_on_placement     = False
+                self._emergency_close_in_progress = True
             logger.error("[Exec] Bracket placement failed: %s", exc, exc_info=True)
             await self._cancel_bracket_orders()
             closed, close_p = await self._emergency_close(fill_qty, entry_side, reason="OCO_FAILED")
@@ -851,6 +910,18 @@ class OrderManager:
                 ) if not t.cancelled() and t.exception() is not None else None
             )
 
+    def _write_entry_failure(self, signal_id: str, outcome: str) -> None:
+        """Write a terminal non-trade outcome to telemetry. No-op when not wired."""
+        if self._update_outcome_cb is None:
+            return
+        try:
+            asyncio.create_task(
+                self._update_outcome_cb(signal_id, outcome, 0.0, 0.0, 0.0, None)
+            )
+        except RuntimeError:
+            logger.warning("[Exec] No event loop — %s outcome not recorded for %s",
+                           outcome, signal_id[:8])
+
     # ── Outcome recording ─────────────────────────────────────────────────────
 
     def _record_outcome(
@@ -919,15 +990,39 @@ class OrderManager:
                 if close_side == "BUY"
                 else round(round((best_bid - spread * 0.5) / tick) * tick, 1)
             )
-            close_order = IOCLimitOrder(
-                symbol   = settings.SYMBOL,
-                side     = close_side,
-                quantity = qty,
-                price    = close_price,
-            )
+            if settings.BINANCE_DEMO:
+                close_order = FuturesMarketOrder(
+                    symbol   = settings.SYMBOL,
+                    side     = close_side,
+                    quantity = qty,
+                )
+            else:
+                close_order = IOCLimitOrder(
+                    symbol   = settings.SYMBOL,
+                    side     = close_side,
+                    quantity = qty,
+                    price    = close_price,
+                )
             resp = await self._client.futures_create_order(**close_order.to_entry_params())
 
-            if float(resp.get("executedQty", "0")) == 0.0:
+            close_exec_qty = float(resp.get("executedQty", "0"))
+            if close_exec_qty == 0.0 and settings.BINANCE_DEMO:
+                order_id = resp.get("orderId")
+                for _ in range(15):
+                    await asyncio.sleep(0.2)
+                    try:
+                        polled = await self._client.futures_get_order(
+                            symbol=settings.SYMBOL, orderId=order_id
+                        )
+                    except Exception as exc:
+                        logger.warning("[Exec] Demo close-poll error: %s", exc)
+                        break
+                    close_exec_qty = float(polled.get("executedQty", "0"))
+                    if close_exec_qty > 0.0:
+                        resp = polled
+                        break
+
+            if close_exec_qty == 0.0:
                 logger.critical(
                     "[Exec] Emergency close IOC expired unfilled — position still open!"
                 )
@@ -964,10 +1059,11 @@ class OrderManager:
         )
 
         async with self._position_lock:
-            qty         = self._open_position_qty
-            side        = self._open_position_side
-            event       = self._open_position_closed_event
-            placing_oco = self._placing_oco
+            qty               = self._open_position_qty
+            side              = self._open_position_side
+            event             = self._open_position_closed_event
+            placing_oco       = self._placing_oco
+            close_in_progress = self._emergency_close_in_progress
             if placing_oco:
                 # Delegate cancel+close to _place_oco (S1 fix).
                 self._cancel_oco_on_placement = True
@@ -976,6 +1072,10 @@ class OrderManager:
             logger.warning(
                 "[Exec] Bracket placement in progress — deferred cancel-and-close scheduled"
             )
+            return
+
+        if close_in_progress:
+            logger.info("[Exec] Emergency close already in progress — Gate6 close suppressed")
             return
 
         if settings.DRY_RUN:

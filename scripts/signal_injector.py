@@ -53,9 +53,22 @@ async def run(
             _log.warning("[Injector] LOB snapshot empty — skipping")
             continue
 
+        # Gate2 (RuleBasedScorer) awards +0.45 only when OBI aligns with direction.
+        # Skip signals that would fail Gate2 to reduce noise in test runs.
+        fv = feature_computer.compute(cvd_calculator, shared_state)
+        if fv is None:
+            continue
+
         mid       = (snap.bids[0].price + snap.asks[0].price) / 2.0
         now_ms    = int(datetime.now(timezone.utc).timestamp() * 1000)
         direction = "LONG" if count % 2 == 0 else "SHORT"
+
+        if direction == "LONG" and fv.obi_zscore <= 0.25:
+            _log.info("[Injector] Skipping LONG — OBI zscore %.2f not aligned", fv.obi_zscore)
+            continue
+        if direction == "SHORT" and fv.obi_zscore >= -0.25:
+            _log.info("[Injector] Skipping SHORT — OBI zscore %.2f not aligned", fv.obi_zscore)
+            continue
 
         if direction == "LONG":
             # Ask wall swept through (price broke above) + fresh bid support below
@@ -83,6 +96,7 @@ async def run(
             price_move_pct   = price_move,
             mid_price        = mid,
         )
+        lob_engine.inject_test_wall(protection.price, protection.side, ttl_ms=5_000)
         await queue.put(sig)
         count += 1
         _log.info(

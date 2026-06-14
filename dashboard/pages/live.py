@@ -1,6 +1,8 @@
 import json
 import time
-import time
+from datetime import datetime, timezone, timedelta
+
+_SGT = timezone(timedelta(hours=8))
 
 import dash
 import plotly.graph_objects as go
@@ -54,6 +56,15 @@ _TIER_COLORS = {
 }
 
 
+def _to_sgt(ts: str) -> str:
+    if not ts:
+        return ts
+    try:
+        return datetime.fromisoformat(ts).astimezone(_SGT).strftime("%H:%M:%S")
+    except (ValueError, TypeError):
+        return ts[11:19] if len(ts) >= 19 else ts
+
+
 def _gate_color(gate_passed: str) -> str:
     """Bootstrap color for the live-tape badge — green when approved, red when
     rejected early, yellow when killed in the middle of the pipeline."""
@@ -92,11 +103,11 @@ layout = html.Div([
 
     # ── Portfolio metrics ──────────────────────────────────────────────────
     dbc.Row(id="live-metrics-row", className="mb-2 g-3"),
-    html.Small("Account Balances (session open)", className="text-muted ms-1"),
+    html.Small("Account Balances (last 30 days)", className="text-muted ms-1"),
     dbc.Row(id="live-balance-row", className="mb-3 g-3"),
 
     # ── Session stats ──────────────────────────────────────────────────────
-    html.H5("Session Stats (last 24h)", className="mb-2 mt-1"),
+    html.H5("Session Stats (last 30 days)", className="mb-2 mt-1"),
     dbc.Row(id="live-session-row", className="mb-3 g-3"),
 
     # ── Equity curve ──────────────────────────────────────────────────────
@@ -353,7 +364,7 @@ def update_session_section(_n):
     global _STATS_CACHE, _STATS_CACHE_TS
     now = time.time()
     if _STATS_CACHE is None or (now - _STATS_CACHE_TS) >= _LIVE_STATS_TTL:
-        _STATS_CACHE = fetch_session_stats(hours=24)
+        _STATS_CACHE = fetch_session_stats(hours=24 * 30)
         _STATS_CACHE_TS = now
     session_result = _STATS_CACHE
     if isinstance(session_result, DBOffline) or not session_result:
@@ -454,8 +465,14 @@ def _hydrate_tape_from_db(_n):
 @callback(
     Output("live-signal-tape", "children"),
     Input("live-signals-tick", "data"),
+    Input("live-interval", "n_intervals"),
 )
-def render_signal_tape(_tick):
+def render_signal_tape(_tick, _n):
+    global _TAPE
+    if dash.callback_context.triggered_id == "live-interval":
+        rows = fetch_recent_signals(limit=_TAPE_MAX)
+        if rows and not isinstance(rows, DBOffline):
+            _TAPE = rows
     if not _TAPE:
         return html.Div("Waiting for signal events… (start the engine to populate)",
                         className="text-muted")
@@ -463,9 +480,8 @@ def render_signal_tape(_tick):
     for ev in _TAPE:
         gate      = ev.get("gate_passed", "?")
         direction = ev.get("direction") or "—"
-        # ISO timestamp like 2026-06-01T17:10:30.123+00:00 → take HH:MM:SS
         ts        = ev.get("ts", "")
-        ts_short  = ts[11:19] if len(ts) >= 19 else ts
+        ts_short  = _to_sgt(ts)
         reason    = ev.get("rejection_reason") or ""
         confidence = ev.get("confidence")
         conf_str  = f"conf={confidence:.2f} " if isinstance(confidence, (int, float)) and confidence else ""

@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     WS_BASE: str = "wss://stream.binancefuture.com"
     REST_BASE: str = "https://testnet.binancefuture.com"
     LOB_RECORDER_WS: str = "wss://stream.binancefuture.com"  # futures testnet stream; fstream.binance.com does not deliver aggTrade on this connection
-    LOB_RECORDER_REST: str = "https://testnet.binancefuture.com"  # always testnet futures — must match LOB_RECORDER_WS exchange
+    LOB_RECORDER_REST: str = "https://testnet.binancefuture.com"  # REST base matching LOB_RECORDER_WS; must stay in sync
 
     # Strategy
     SYMBOL: str = "BTCUSDT"
@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     MAX_ORDER_NOTIONAL_PCT: float = 0.90  # gate rejects signals whose estimated notional exceeds 90% of equity
     SLIPPAGE_RESEARCH_BPS: float = 3.0  # expected slippage assumption (KS-3 baseline)
     SLIPPAGE_MULTIPLIER: float = 1.5    # KS-3 fires when rolling avg > research × multiplier
+    WS_RECV_TIMEOUT_S: float = 20.0     # Max seconds between WS messages before reconnect
+    WS_PING_TIMEOUT_S: float = 20.0     # Max seconds for WS pong before reconnect
+    WS_PING_INTERVAL_S: float = 20.0    # Seconds between WS pings
 
     # UI
     UI_REFRESH_INTERVAL: float = 1.0
@@ -102,10 +105,13 @@ class Settings(BaseSettings):
     LOB_FRESH_WALL_MS: int = 3_000    # protection wall must appear within this window
     LOB_STALE_WALL_MS: int = 30_000   # prune wall states not seen for this long
 
+    # LOB gap handling
+    LOB_GAP_RECONNECT_MIN_CONSECUTIVE: int = 3  # reconnect only after this many consecutive gaps
+
     # Heartbeat monitor (§4)
     HEARTBEAT_WARN_MS: int = 200
     HEARTBEAT_CRITICAL_MS: int = 500
-    HEARTBEAT_LOB_CRITICAL_MS: int = 5000   # depth@500ms stream; higher due to aggregation window
+    HEARTBEAT_LOB_CRITICAL_MS: int = 30000   # depth@500ms stream; higher due to aggregation window
     HEARTBEAT_CONSEC_LIMIT: int = 3
     HEARTBEAT_KS2_ENABLED: bool = True   # set False in demo/dev to suppress KS-2 on poor WS links
     HEARTBEAT_DEGRADED_RATE_THRESH: float = 0.5    # ≥50% of 10-msg window → enter DEGRADED
@@ -152,9 +158,15 @@ class Settings(BaseSettings):
                 "BINANCE_TESTNET":            False,
                 "BINANCE_DEMO":               True,
                 "DRY_RUN":                    False,
+                "HEARTBEAT_WARN_MS":          5000,
+                "HEARTBEAT_CRITICAL_MS":      30000,
+                "HEARTBEAT_LOB_CRITICAL_MS":  30000,
+                "HEARTBEAT_CONSEC_LIMIT":     20,
+                "WS_RECV_TIMEOUT_S":          30.0,
+                "WS_PING_TIMEOUT_S":          30.0,
                 "MIN_CONFIDENCE":             0.1,
                 "TEST_SIGNAL_INJECT":         True,
-                "TIMEFRAME":                  "1s",
+                "TIMEFRAME":                  "1m",
             },
             # ── demo (start_demo.sh) ──────────────────────────────────────────────
             # WS: wss://fstream.binance.com (live server, p50=181ms p95=428ms).
@@ -165,14 +177,16 @@ class Settings(BaseSettings):
                 "BINANCE_TESTNET":            False,
                 "BINANCE_DEMO":               True,
                 "DRY_RUN":                    False,
-                "HEARTBEAT_WARN_MS":          500,
-                "HEARTBEAT_CRITICAL_MS":      5000,
-                "HEARTBEAT_LOB_CRITICAL_MS":  5000,
-                "HEARTBEAT_CONSEC_LIMIT":     10,
+                "HEARTBEAT_WARN_MS":          5000,
+                "HEARTBEAT_CRITICAL_MS":      30000,
+                "HEARTBEAT_LOB_CRITICAL_MS":  30000,
+                "HEARTBEAT_CONSEC_LIMIT":     20,
                 "HEARTBEAT_KS2_ENABLED":      False,
+                "WS_RECV_TIMEOUT_S":          60.0,
+                "WS_PING_TIMEOUT_S":          60.0,
                 "MIN_CONFIDENCE":             0.1,
                 "TEST_SIGNAL_INJECT":         True,
-                "TIMEFRAME":                  "1s",
+                "TIMEFRAME":                  "1m",
             },
             # ── live (start.sh) ───────────────────────────────────────────────────
             # Same server as demo. Real money. Full risk management on.

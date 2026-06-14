@@ -224,7 +224,7 @@ class SignalTelemetry:
         duration_min: float,
         r_multiple: float | None = None,
     ) -> None:
-        """Called by OrderManager after a position closes."""
+        """Called by OrderManager after a position closes or fails to fill."""
         if not self._conn:
             return
 

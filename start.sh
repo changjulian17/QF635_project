@@ -47,6 +47,16 @@ if ! "$PYTHON" "$SCRIPT_DIR/scripts/test_connection.py"; then
     exit 1
 fi
 log_ok "Connectivity OK"
+
+# Rotate previous log to timestamped archive before starting fresh
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+if [[ -f "$LOG_DIR/cryptosentinel.log" ]]; then
+    mv "$LOG_DIR/cryptosentinel.log" \
+       "$LOG_DIR/cryptosentinel_$(date +%Y%m%d_%H%M%S).log"
+    log_ok "Previous log archived"
+fi
+
 export TRADING_MODE=live
 
 # --- Launch each component in a new Terminal window ---

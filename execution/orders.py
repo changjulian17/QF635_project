@@ -5,9 +5,10 @@ Each subclass wraps the parameters for a specific Binance Futures order type and
 exposes them via to_entry_params(), returning the kwargs dict for the
 matching AsyncClient method:
 
-  IOCLimitOrder  → client.futures_create_order(**order.to_entry_params())
-  FuturesTPOrder → client.futures_create_order(**order.to_entry_params())
-  FuturesSLOrder → client.futures_create_order(**order.to_entry_params())
+  IOCLimitOrder     → client.futures_create_order(**order.to_entry_params())
+  FuturesMarketOrder → client.futures_create_order(**order.to_entry_params())
+  FuturesTPOrder    → client.futures_create_order(**order.to_entry_params())
+  FuturesSLOrder    → client.futures_create_order(**order.to_entry_params())
 
 Adding a new order type requires only a new subclass — OrderManager is not modified.
 """
@@ -47,6 +48,24 @@ class IOCLimitOrder(Order):
             "timeInForce": "IOC",
             "quantity":    self.quantity,
             "price":       str(round(self.price, 1)),
+        }
+
+
+@dataclass
+class FuturesMarketOrder(Order):
+    """
+    Futures market order for demo account entries and emergency closes.
+
+    Executes immediately at best available price. Used when BINANCE_DEMO=True
+    because the demo book has thin synthetic liquidity that causes IOC LIMIT
+    orders to expire unfilled.
+    """
+    def to_entry_params(self) -> dict:
+        return {
+            "symbol":   self.symbol,
+            "side":     self.side,
+            "type":     "MARKET",
+            "quantity": self.quantity,
         }
 
 

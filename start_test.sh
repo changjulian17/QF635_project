@@ -52,6 +52,15 @@ if ! BINANCE_DEMO=true BINANCE_TESTNET=false "$PYTHON" "$SCRIPT_DIR/scripts/test
 fi
 log_ok "Connectivity OK"
 
+# Rotate previous log to timestamped archive before starting fresh
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+if [[ -f "$LOG_DIR/cryptosentinel.log" ]]; then
+    mv "$LOG_DIR/cryptosentinel.log" \
+       "$LOG_DIR/cryptosentinel_$(date +%Y%m%d_%H%M%S).log"
+    log_ok "Previous log archived"
+fi
+
 # --- Launch each component in a new Terminal window ---
 # NOTE: macOS only — uses osascript / Terminal.app.
 # On Linux, start each component manually using the commands printed at the end of this script.

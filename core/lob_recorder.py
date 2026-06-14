@@ -149,11 +149,7 @@ class LOBRecorder:
             self._reconnect_delay = min(self._reconnect_delay * 2, _MAX_RECONNECT_DELAY)
 
     async def _sync_snapshot(self) -> None:
-        """Seed the local LOB from a REST snapshot, retrying on failure.
-
-        Only sets _synced=True after a successful seed — never records snapshots
-        built from partial diffs (which would poison backtest data).
-        """
+        """Fetch a REST depth snapshot to seed the local LOB, then apply any buffered diffs."""
         url = f"{settings.LOB_RECORDER_REST}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
         for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
