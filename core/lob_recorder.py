@@ -29,10 +29,15 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _DEPTH_LEVELS        = 100     # levels per side kept in local book before bucketing
-_BUCKET_WIDTH        = 25.0    # USD — price bucket width for storage compression
+# USD price-bucket width for storage compression. Must stay fine enough to preserve the
+# LOB shape for wall detection: BTCUSDT's top-100 levels span only ~$15, so the old $25
+# width collapsed each snapshot to 1-2 buckets → identify_walls found nothing → 0 backtest
+# trades. $1 keeps ~15-25 buckets/side — enough resolution while still compressing.
+_BUCKET_WIDTH        = 1.0     # USD
 _FLUSH_RECORDS       = 100
 _FLUSH_SECONDS       = 5.0
 _MAX_RECONNECT_DELAY = 60.0
+_SEED_MAX_ATTEMPTS   = 3       # REST seed retries before giving up (stay unsynced, no recording)
 _MAX_BUFFER_SIZE     = 10_000
 _RETENTION_DAYS      = 7
 _CLEANUP_INTERVAL    = 86_400.0
@@ -147,39 +152,44 @@ class LOBRecorder:
         """Fetch a REST depth snapshot to seed the local LOB, then apply any buffered diffs."""
         url = f"{settings.LOB_RECORDER_REST}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    resp.raise_for_status()
-                    snap = await resp.json()
+        for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        resp.raise_for_status()
+                        snap = await resp.json()
 
-            self._bid_book = {
-                float(p): float(q) for p, q in snap["bids"] if float(q) > 0
-            }
-            self._ask_book = {
-                float(p): float(q) for p, q in snap["asks"] if float(q) > 0
-            }
-            last_uid = snap["lastUpdateId"]
+                self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
+                self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
+                last_uid = snap["lastUpdateId"]
+                for event in self._pending_diffs:
+                    if event["u"] <= last_uid:
+                        continue
+                    self._apply_diff(event)
+                self._pending_diffs.clear()
+                self._last_update_id = last_uid
+                self._synced = True
+                logger.info(
+                    "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
+                    last_uid, len(self._bid_book), len(self._ask_book),
+                )
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
+                logger.error(
+                    "[LOBRec] Snapshot seed attempt %d/%d failed: %s",
+                    attempt, _SEED_MAX_ATTEMPTS, exc,
+                )
+                await asyncio.sleep(min(2 ** (attempt - 1), 5))
 
-            # Apply buffered diffs that arrived during the REST call
-            for event in self._pending_diffs:
-                if event["u"] <= last_uid:
-                    continue  # stale — discard
-                self._apply_diff(event)
-
-            self._pending_diffs.clear()
-            self._last_update_id = last_uid
-            self._synced = True
-            logger.info(
-                "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
-                last_uid, len(self._bid_book), len(self._ask_book),
-            )
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.error("[LOBRec] Snapshot sync failed (%s); continuing unsynced.", exc)
-            self._pending_diffs.clear()
-            self._synced = True  # allow data to flow even if REST call failed
+        # All attempts failed — stay unsynced so nothing is recorded until a reseed.
+        self._pending_diffs.clear()
+        self._synced = False
+        logger.critical(
+            "[LOBRec] LOB seed failed after %d attempts — not recording until reseed",
+            _SEED_MAX_ATTEMPTS,
+        )
 
     async def _receive_loop(self, ws) -> None:
         async for raw in ws:

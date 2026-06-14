@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     LOB_OBI_DEPTH: int = 20
     LOB_HISTORY: int = 18000
     LOB_HEATMAP_BUCKET: float = 1.0
+    LOB_HEATMAP_BUCKET: float = 1.0
     LOB_WALL_SIGMA: float = 2.5        # σ threshold for Wall identification (§5)
     LOB_WALL_WINDOW: int = 5           # ticks each side for Wall median/std
     RELOAD_SIGMA: float = 3.0
@@ -217,6 +218,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "BINANCE_TESTNET and BINANCE_DEMO cannot both be True. "
                 "Set BINANCE_TESTNET=false when using demo.binance.com."
+            )
+        if self.BINANCE_DEMO and (not self.DEMO_BINANCE_API_KEY or not self.DEMO_BINANCE_API_SECRET):
+            raise ValueError(
+                "DEMO_BINANCE_API_KEY and DEMO_BINANCE_API_SECRET must be set "
+                "when BINANCE_DEMO=True. Add them to .env."
             )
         if not self.DRY_RUN and not self.BINANCE_DEMO and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
             raise ValueError(

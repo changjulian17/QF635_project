@@ -8,20 +8,24 @@ This document focuses on the current live microstructure path. The legacy chart-
 
 The live algorithm is organized as an asyncio task graph:
 
-1. `BinanceWebSocketConsumer` receives depth, trade, and candle streams.
-2. `_depth_fanout()` sends each reconstructed depth snapshot to both `LocalOrderBook` and `MicrostructureDetector`.
-3. `LocalOrderBook` maintains the shared synced book used for top-of-book reads, wall persistence checks, and dashboard snapshots.
-4. `_feature_candle_loop()` feeds closed candles into `FeatureComputer`.
-5. `MicrostructureDetector` tracks liquidity walls, absorption, and sweep-with-protection events while updating order-book features.
-6. `StrategyExecutor` evaluates each `MicroSignal` through Gates 0-5 and emits a `MicroOrderRequest` when approved.
-7. `OrderManager` resolves the current book, submits an IOC aggressive limit entry, places an OCO bracket after fill in live mode, and records fill/outcome telemetry.
-8. Gate 6 monitors the protection wall after fill and can trigger an early safety exit.
+1. `BinanceWebSocketConsumer` receives depth, trade, and candle streams from the testnet WebSocket.
+2. `UserDataStreamConsumer` maintains the Binance user data stream (listenKey lifecycle) and dispatches `executionReport` events to `OrderManager` for fill tracking.
+3. `_depth_fanout()` sends each reconstructed depth snapshot to both `LocalOrderBook` and `MicrostructureDetector`.
+4. `LocalOrderBook` maintains the shared synced book used for top-of-book reads, wall persistence checks, and dashboard snapshots.
+5. `_feature_candle_loop()` feeds closed candles into `FeatureComputer`.
+6. `MicrostructureDetector` tracks liquidity walls, absorption, and sweep-with-protection events while updating order-book features.
+7. `StrategyExecutor` evaluates each `MicroSignal` through Gates 0-5 and emits a `MicroOrderRequest` when approved.
+8. `OrderManager` resolves the current book, submits an IOC aggressive limit entry, places an OCO bracket after fill in live mode, and records fill/outcome telemetry.
+9. Gate 6 monitors the protection wall after fill and can trigger an early safety exit.
+10. `AlertDispatcher` sends webhook notifications on killswitch events and risk-tier changes (fire-and-forget, errors suppressed).
+11. `RealtimeHub` broadcasts LOB snapshots, portfolio state, and signal events over `/ws/lob`, `/ws/portfolio`, and `/ws/signals` WebSocket endpoints to the Dash dashboard.
 
 ```mermaid
 flowchart TD
     WS[BinanceWebSocketConsumer] --> RAW[raw_depth_queue]
     WS --> TRADES[trade_queue]
     WS --> CANDLES[candle_queue]
+    UDS[UserDataStreamConsumer] --> EXEC_REPORT[executionReport callback]
 
     RAW --> FANOUT[_depth_fanout]
     FANOUT --> LOBQ[lob_depth_queue]
@@ -45,10 +49,17 @@ flowchart TD
     EXEC -->|approved| OMQ[om_queue]
     EXEC -->|rejected/approved telemetry| TELEM[SignalTelemetry]
     OMQ --> OM[OrderManager]
+    EXEC_REPORT --> OM
     OM --> TESTNET[Binance Spot Testnet]
     OM --> FILLS[fill_queue]
     FILLS --> FILLPROC[fill_processor]
     FILLPROC --> TELEM
+
+    LOB --> SNAP[lob_snapshot_writer]
+    SNAP --> HUB[RealtimeHub]
+    HUB --> WS_LOB[/ws/lob]
+    HUB --> WS_PORT[/ws/portfolio]
+    HUB --> WS_SIG[/ws/signals]
 ```
 
 ## Depth Tick To MicroSignal
@@ -73,6 +84,7 @@ Absorption arms a wall but does not submit a trade. Sweep with protection create
 ```mermaid
 sequenceDiagram
     participant WS as BinanceWebSocketConsumer
+    participant UDS as UserDataStreamConsumer
     participant Fanout as depth_fanout
     participant LOB as LocalOrderBook
     participant MS as MicrostructureDetector
@@ -91,6 +103,7 @@ sequenceDiagram
     EXEC->>OM: MicroOrderRequest
     OM->>OM: resolve live top of book
     OM->>OM: submit IOC aggressive limit
+    UDS->>OM: executionReport (fill confirmation)
 ```
 
 ## Gate Evaluation
@@ -162,7 +175,9 @@ This feedback loop keeps the live algorithm aligned with current data quality, r
 
 ## Current Boundaries
 
-The current live microstructure path submits approved `MicroOrderRequest` objects directly from `StrategyExecutor` to `OrderManager`. `RiskEngine` is instantiated for budget/tier state, midnight reset, and tier synchronization into `StrategyExecutor`. The legacy `MicrostructureEngine` (`engine/microstructure_engine.py`) is not started in the live `TaskGroup` — it has no task in `main.py`'s `asyncio.TaskGroup` and the `ms_bar_queue` it would produce to has no active producer.
+The live microstructure path submits approved `MicroOrderRequest` objects directly from `StrategyExecutor` to `OrderManager`. `RiskEngine` is instantiated for budget/tier state, midnight reset, and tier synchronization into `StrategyExecutor`. The legacy `MicrostructureEngine` (`engine/microstructure_engine.py`) is not started in the live `TaskGroup` — it has no task in `main.py`'s `asyncio.TaskGroup` and the `ms_bar_queue` it would produce to has no active producer.
+
+Fill tracking uses both direct REST polling in `OrderManager` and `executionReport` events from `UserDataStreamConsumer`. The user data stream provides a cleaner fill signal for futures; the REST path remains the primary fill detection mechanism for spot testnet.
 
 The algorithm currently detects wall consumption from depth changes and wall reload ratio. It does not yet use a minimum-quantity probe order behind or after a wall as a cleaner consumption trigger; that remains a future design item.
 

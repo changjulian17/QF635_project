@@ -31,6 +31,7 @@ from core.lob_recorder import LOBRecorder
 from core.signal_telemetry import SignalTelemetry
 from core.startup_reconciler import reconcile_on_startup
 from core.user_data_stream import UserDataStreamConsumer
+from core.user_data_stream import UserDataStreamConsumer
 from core.ws_consumer import BinanceWebSocketConsumer
 from engine.db_writer import DBWriter, init_db
 from engine.lob_snapshot_writer import lob_snapshot_writer as _lob_snapshot_writer

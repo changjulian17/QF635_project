@@ -88,12 +88,14 @@ def test_feature_vector_has_all_fields():
 
 
 def test_to_ml_array_length():
+    from strategy.scorer import FEATURE_ORDER
     fc = _warmed_up_fc()
     cvd = CVDCalculator()
     fv = fc.compute(cvd, SharedState())
     assert fv is not None
     arr = fv.to_ml_array()
-    assert len(arr) == 15
+    assert len(arr) == 13                       # pattern_r2 + protection_wall_present dropped
+    assert len(arr) == len(FEATURE_ORDER)       # ML array must stay aligned with FEATURE_ORDER
 
 
 # ── VWAP resets at midnight ───────────────────────────────────────────────────

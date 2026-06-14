@@ -83,7 +83,8 @@ CryptoSentinel/
 ├── risk/                      # Risk management
 │   ├── engine.py              # RiskEngine — 5-tier throttling, DOV, circuit breakers
 │   ├── budget.py              # DailyBudget — shared pool for all open positions
-│   └── killswitch.py          # GlobalKillswitch — Budget / Heartbeat / Slippage triggers
+│   ├── killswitch.py          # GlobalKillswitch — Budget / Heartbeat / Slippage triggers
+│   └── sizing.py              # Position-sizing helpers (clamp_stop_bps)
 │
 ├── execution/                 # Order management
 │   ├── order_manager.py       # IOC aggressive limit orders + OCO brackets
@@ -133,12 +134,15 @@ CryptoSentinel/
 │   └── order_manager.py       # Shim re-exporting execution.order_manager
 │
 ├── scripts/
-│   ├── test_connection.py     # Connectivity + auth check
+│   ├── test_connection.py     # Connectivity + auth check (testnet)
+│   ├── test_spot_connection.py# Connectivity check for demo futures (DEMO_BINANCE_API_KEY)
+│   ├── test_futures_demo.py   # Full round-trip demo futures connectivity test
 │   ├── test_orders.py         # BUY + SELL round-trip test
 │   ├── run_backtest.py        # CLI for tick-level walk-forward backtest (writes to backtest_results.db)
+│   ├── backfill_agg_trades.py # One-time backfill of aggTrade history from Binance USDM Futures REST
 │   └── signal_injector.py     # Synthetic signal injection — dev/testnet only (start_test.sh)
 │
-├── tests/                     # pytest unit + integration tests (451 total)
+├── tests/                     # pytest unit + integration tests (549 total)
 │   │                          # Phase 1 — live trading engine
 │   ├── test_models.py
 │   ├── test_lob_engine.py
@@ -155,6 +159,9 @@ CryptoSentinel/
 │   ├── test_orders.py
 │   ├── test_risk_engine.py
 │   ├── test_startup_reconciler.py
+│   ├── test_sizing.py
+│   ├── test_user_data_stream.py
+│   ├── test_user_data_stream_bootstrap.py
 │   ├── test_integration.py
 │   │                          # Phase 2 — backtesting + strategy lifecycle
 │   ├── test_bt_costs.py
@@ -176,7 +183,9 @@ CryptoSentinel/
 │   ├── test_dashboard_walls.py
 │   ├── test_lob_snapshot_writer.py
 │   ├── test_realtime_hub.py
-│   └── test_rest_api.py
+│   ├── test_rest_api.py
+│   ├── test_portfolio_broadcast.py
+│   └── test_signal_broadcast.py
 │
 ```
 
@@ -316,7 +325,7 @@ Single class used identically in live trading and backtesting. Uses Welford onli
 **Position Sizing:**
 ```
 notional_hint = confidence × KELLY_FRACTION × RISK_PER_TRADE_PCT × tier_scalar
-sl_distance   = signal_price × min(protection_wall_bps, PROTECTION_MAX_DISTANCE_BPS) / 10,000
+sl_distance   = signal_price × clamp(protection_wall_bps, PROTECTION_MIN_DISTANCE_BPS, PROTECTION_MAX_DISTANCE_BPS) / 10,000
 qty           = floor((equity × notional_hint / sl_distance) / QTY_STEP_SIZE) × QTY_STEP_SIZE
 ```
 `notional_hint` is computed in `StrategyExecutor` (Gate 2). Final qty is computed in `OrderManager._place_entry`.
@@ -491,6 +500,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `LOB_FRESH_WALL_MS` | `3_000` | Protection wall must appear within this window |
 | `LOB_STALE_WALL_MS` | `30_000` | Prune wall states not seen for this long |
 | `PROTECTION_MAX_DISTANCE_BPS` | `25.0` | Max protection wall distance from mid |
+| `PROTECTION_MIN_DISTANCE_BPS` | `1.0` | Min protection wall distance from mid — floors the stop so size stays bounded; rejects degenerate near-mid walls |
 | `PRICE_PRUNE_INTERVAL` | `100` | Prune stale price keys every N bars — **legacy-engine-only; see TODO** |
 | `PRICE_PRUNE_BAND` | `0.02` | Keep prices within ±2% of current mid — **legacy-engine-only; see TODO** |
 | `MICRO_PRICE_MOVE_FLOOR_BPS` | `3.0` | Minimum price move to confirm sweep |
@@ -518,7 +528,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `TIER_PASSIVE_PCT` | `0.009` | ≥ 0.9% DOV loss → PASSIVE (no new entries) |
 | `TIER_HALTED_PCT` | `0.01` | ≥ 1.0% DOV loss → HALTED |
 | `MAX_CONSECUTIVE_LOSSES` | `3` | Triggers 5-min cooldown |
-| `RISK_PER_TRADE_PCT` | `0.01` | Equity risked per trade (1%) |
+| `RISK_PER_TRADE_PCT` | `0.001` | Equity risked per trade (0.1%) — sized for ~10 bps microstructure stops |
 | `KELLY_FRACTION` | `0.25` | Fractional Kelly applied to sizing |
 | `ATR_MULTIPLIER_SL` | `1.5` | Stop-loss distance in ATR units |
 | `ATR_MULTIPLIER_TP` | `3.0` | Take-profit distance in ATR units |
@@ -576,47 +586,52 @@ All settings live in `config.py` and can be overridden via `.env`.
 
 ```
 Phase 1 — Live trading engine
-tests/test_risk_engine.py            8 tests  — sync_tier transitions, tier callback, record_trade_result, mark_unrealised, session reset
-tests/test_microstructure_engine.py 30 tests  — legacy microstructure engine
-tests/test_executor.py              40 tests  — all 7 gates, telemetry emission
-tests/test_order_manager.py         30 tests  — IOC entry, OCO bracket, fill handling
-tests/test_lob_engine.py            22 tests  — state machine, gap detection, wall scan
-tests/test_startup_reconciler.py    17 tests  — reconciliation, midnight reset
-tests/test_microstructure.py        22 tests  — wall identification, absorption, sweep
-tests/test_lob_recorder.py          27 tests  — recorder flush, reconnect, stats
-tests/test_features.py              14 tests  — Welford, no-lookahead, VWAP reset
-tests/test_cvd.py                   14 tests  — buy/sell CVD, 5-bar delta, std
-tests/test_db_writer.py              9 tests  — SQLite write, upsert, purge
-tests/test_signal_telemetry.py      10 tests  — flush, batch, timeout, outcome update
-tests/test_orders.py                11 tests  — order domain classes and enums
-tests/test_ws_consumer.py           12 tests  — heartbeat states, rate thresholds, hysteresis
-tests/test_models.py                 6 tests  — PortfolioState, WallState, FeatureVector
-tests/test_integration.py            2 tests  — end-to-end signal → execution pipeline
-
-Phase 3 — REST API + LOB snapshot writer + Dash dashboard
-tests/test_rest_api.py              11 tests  — /api/health, /api/portfolio, /api/killswitch
-tests/test_lob_snapshot_writer.py    9 tests  — snapshot writer, rolling cap, WAL mode
-tests/test_realtime_hub.py           6 tests  — RealtimeHub fan-out, connection drop, /ws/lob endpoint
-tests/test_dashboard_live.py         6 tests  — /live page callback, engine badge, kill switch
-tests/test_dashboard_lob.py          6 tests  — /lob buffer helpers, CVD accumulation, dedup
-tests/test_dashboard_registry.py     4 tests  — /registry page, strategy lifecycle display
-tests/test_dashboard_walls.py        6 tests  — /walls page callback, trace structure, invalid-JSON guard
-tests/test_alerting.py               3 tests  — AlertDispatcher webhook, empty-URL guard
+tests/test_risk_engine.py                18 tests  — sync_tier transitions, tier callback, record_trade_result, mark_unrealised, circuit breakers
+tests/test_microstructure_engine.py      30 tests  — legacy microstructure engine
+tests/test_executor.py                   46 tests  — all 7 gates, telemetry emission, rate-limit pacing
+tests/test_order_manager.py              33 tests  — IOC entry, OCO bracket, fill handling, Gate 6 race
+tests/test_lob_engine.py                 22 tests  — state machine, gap detection, wall scan
+tests/test_startup_reconciler.py         16 tests  — reconciliation, midnight reset
+tests/test_microstructure.py             27 tests  — wall identification, absorption, sweep, qty_peak
+tests/test_lob_recorder.py               28 tests  — recorder flush, reconnect, stats
+tests/test_features.py                   14 tests  — Welford, no-lookahead, VWAP reset
+tests/test_cvd.py                        15 tests  — buy/sell CVD, 5-bar delta, std
+tests/test_db_writer.py                   9 tests  — SQLite write, upsert, purge
+tests/test_signal_telemetry.py           23 tests  — flush, batch, timeout, outcome update
+tests/test_orders.py                     14 tests  — order domain classes and enums
+tests/test_ws_consumer.py                16 tests  — heartbeat states, rate thresholds, hysteresis, sustained-degraded
+tests/test_models.py                      6 tests  — PortfolioState, WallState, FeatureVector
+tests/test_sizing.py                      3 tests  — clamp_stop_bps bounds
+tests/test_user_data_stream.py           14 tests  — listenKey lifecycle, executionReport dispatch, reconnect
+tests/test_user_data_stream_bootstrap.py  6 tests  — bootstrap open positions from executionReport stream
+tests/test_integration.py                 2 tests  — end-to-end signal → execution pipeline
 
 Phase 2 — Backtesting + strategy lifecycle
-tests/test_bt_event_engine.py       24 tests  — event-driven engine: tiers, exits, full run
-tests/test_registry.py              29 tests  — lifecycle gates, YAML roundtrip, promotion
-tests/test_bt_tick_replay.py        16 tests  — tick replay fidelity, streaming, CVD reset
-tests/test_bt_walk_forward.py        9 tests  — window splits, OOS isolation, leaderboard
-tests/test_bt_metrics.py            10 tests  — Sharpe, MDD, PF, composite score
-tests/test_validator.py              7 tests  — null repair, duplicate removal, gap detection
-tests/test_scorer.py                 7 tests  — XGBoost train, AUC, save/load, fallback
-tests/test_fetcher.py                6 tests  — OHLCV fetch, cache, resample
-tests/test_bt_signals.py             7 tests  — signal arrays, no-lookahead, SL/TP NaN
-tests/test_bt_vectorbt.py            6 tests  — Optuna optimisation, sensitivity
-tests/test_bt_costs.py               5 tests  — round-trip cost, maker/taker, zero qty
+tests/test_bt_event_engine.py            24 tests  — event-driven engine: tiers, exits, full run
+tests/test_registry.py                   29 tests  — lifecycle gates, YAML roundtrip, promotion
+tests/test_bt_tick_replay.py             16 tests  — tick replay fidelity, streaming, CVD reset
+tests/test_bt_walk_forward.py             9 tests  — window splits, OOS isolation, leaderboard
+tests/test_bt_metrics.py                 10 tests  — Sharpe, MDD, PF, composite score
+tests/test_validator.py                   7 tests  — null repair, duplicate removal, gap detection
+tests/test_scorer.py                      7 tests  — XGBoost train, AUC, save/load, fallback
+tests/test_fetcher.py                     6 tests  — OHLCV fetch, cache, resample
+tests/test_bt_signals.py                  7 tests  — signal arrays, no-lookahead, SL/TP NaN
+tests/test_bt_vectorbt.py                 6 tests  — Optuna optimisation, sensitivity
+tests/test_bt_costs.py                    5 tests  — round-trip cost, maker/taker, zero qty
+
+Phase 3 — REST API + LOB snapshot writer + Dash dashboard
+tests/test_rest_api.py                   11 tests  — /api/health, /api/portfolio, /api/killswitch, /api/session
+tests/test_lob_snapshot_writer.py         9 tests  — snapshot writer, rolling cap, WAL mode
+tests/test_realtime_hub.py                6 tests  — RealtimeHub fan-out, connection drop, /ws/lob endpoint
+tests/test_dashboard_live.py             10 tests  — /live page callback, engine badge, kill switch, signal funnel
+tests/test_dashboard_lob.py              16 tests  — /lob buffer helpers, CVD accumulation, dedup, heatmap
+tests/test_dashboard_registry.py          4 tests  — /registry page, strategy lifecycle display
+tests/test_dashboard_walls.py             6 tests  — /walls page callback, trace structure, invalid-JSON guard
+tests/test_alerting.py                    3 tests  — AlertDispatcher webhook, empty-URL guard
+tests/test_portfolio_broadcast.py         7 tests  — /ws/portfolio WebSocket fan-out
+tests/test_signal_broadcast.py            9 tests  — /ws/signals WebSocket fan-out
 ──────────────────────────────────────────────────────────────────────────────
-Total                              451 tests
+Total                                   549 tests
 ```
 
 ---

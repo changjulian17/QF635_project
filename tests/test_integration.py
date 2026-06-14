@@ -1,4 +1,5 @@
 """
+import pytest
 Integration tests — Phase 1N: GlobalKillswitch + 7-gate funnel.
 
 Run with:  source .venv/bin/activate && python -m pytest tests/test_integration.py -v
@@ -7,6 +8,8 @@ import asyncio
 import sqlite3
 import time
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from config import settings
 from core.signal_telemetry import SignalTelemetry
@@ -213,3 +216,88 @@ def test_killswitch_blocks_orders_when_active():
         assert fill_q.empty(), "fill_queue must be empty when killswitch is active"
 
     asyncio.run(_run())
+
+
+# ── Test 3: tier scaling flows Executor → OrderManager → fill_processor ────────
+
+def _run_tier(tier: str):
+    """Push one APPROVED signal through the full chain at `tier`; return the
+    resulting open-position qty and the fill_processor's fill-sample count."""
+    from unittest.mock import AsyncMock
+    from main import _process_fills
+    from models import PortfolioState
+
+    async def _run():
+        micro_q, om_q, fill_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
+        tel_q = asyncio.Queue(maxsize=500)
+        state = SharedState(heartbeat_status="HEALTHY", lob_status="SYNCED", last_delta_ms=0.0)
+        budget = DailyBudget.from_equity(10_000.0)
+        portfolio = PortfolioState(equity=10_000.0, starting_equity=10_000.0, peak_equity=10_000.0)
+
+        fv = FeatureVector(
+            lob_status="SYNCED", obi_zscore=1.0, cvd_delta=1.0, vol_ratio=3.0,
+            spread_bps=3.0, cvd_positive=1, rsi_value=55.0,
+        )
+        mock_fc = MagicMock()
+        mock_fc.compute.return_value = fv
+
+        class _StubScorer:
+            def score(self, _fv, _sig):
+                return 0.9   # clears Gate 2 at every tier (MINIMAL needs >= 0.8)
+
+        executor = StrategyExecutor(
+            micro_signal_queue=micro_q, signal_queue=om_q, telemetry_queue=tel_q,
+            feature_computer=mock_fc, shared_state=state, budget=budget,
+            rule_scorer=_StubScorer(),
+        )
+        executor.set_risk_tier(tier)
+
+        om = OrderManager(
+            signal_queue=om_q, fill_queue=fill_q,
+            killswitch=GlobalKillswitch(dov=10_000.0),
+            equity_fn=lambda: 10_000.0,
+            book_fn=lambda: (94_999.99, 95_000.01),
+        )
+        telemetry = MagicMock()
+        telemetry.update_fill = AsyncMock()
+
+        with patch.object(settings, "DRY_RUN", True):
+            tasks = [
+                asyncio.create_task(executor.run()),
+                asyncio.create_task(om._order_loop()),
+                asyncio.create_task(_process_fills(fill_q, portfolio, telemetry)),
+            ]
+            await asyncio.sleep(0)
+            await micro_q.put(MicroSignal(
+                signal_type="SWEEP_WITH_PROTECTION", direction="LONG",
+                timestamp_ms=int(time.time() * 1000),
+                consumed_wall=_wall(95_000.0, "ask"),
+                protection_wall=_wall(94_000.0, "bid"),
+                prior_absorption=True,
+            ))
+            await asyncio.sleep(0.15)
+            qty = om._open_position_qty
+            fills = portfolio.num_fill_samples
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return qty, fills
+
+    return asyncio.run(_run())
+
+
+def test_tier_scaling_full_vs_minimal_end_to_end():
+    full_qty, full_fills = _run_tier("FULL")
+    min_qty,  min_fills  = _run_tier("MINIMAL")
+
+    assert full_fills == 1, "fill_processor did not consume the FULL-tier fill"
+    assert min_fills  == 1, "fill_processor did not consume the MINIMAL-tier fill"
+    assert full_qty > 0 and min_qty > 0
+    # MINIMAL tier scalar (0.25) vs FULL (1.0) — same signal/book → qty ratio ≈ 0.25
+    # Absolute tolerance of one lot-size step accounts for floor-quantization rounding.
+    from config import settings as _s
+    assert abs(min_qty - 0.25 * full_qty) <= _s.QTY_STEP_SIZE
