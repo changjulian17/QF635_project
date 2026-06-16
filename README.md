@@ -323,9 +323,10 @@ qty           = floor((equity × notional_hint / sl_distance) / QTY_STEP_SIZE) �
 ```
 Trigger 1: daily_loss ≥ 1% of DOV          → HALTED
 Trigger 2: drawdown ≥ 5% from peak          → HALTED
-Trigger 3: 3 consecutive losses              → PAUSED (5 min cooldown)
-Trigger 4: daily_loss ≥ 0.5%                → Tier REDUCED
-Trigger 5: daily_loss ≥ 0.75%               → Tier MINIMAL
+Trigger 3: legacy daily_loss_pct ≥ 2%       → HALTED (belt-and-suspenders, DAILY_LOSS_LIMIT_PCT)
+Trigger 4: 3 consecutive losses              → PAUSED (5 min cooldown)
+Trigger 5: daily_loss ≥ 0.5%                → Tier REDUCED
+Trigger 6: daily_loss ≥ 0.75%               → Tier MINIMAL
 ```
 
 ### Global Killswitch (`risk/killswitch.py`)
@@ -658,7 +659,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 | Charts | plotly | 5.22.x | All visualisations |
 | Persistence | SQLite | stdlib | All databases |
 | Logging | Python stdlib logging | 3.13+ | RotatingFileHandler, INFO/DEBUG configurable via `LOG_LEVEL` |
-| Serialisation | PyYAML | 6.0.1 | StrategySpec configs |
+| Serialisation | PyYAML | 6.0+ | StrategySpec configs |
 
 ---
 
