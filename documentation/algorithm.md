@@ -17,6 +17,15 @@ The live algorithm is organized as an asyncio task graph:
 7. `OrderManager` resolves the current book, submits an IOC aggressive limit entry, places an OCO bracket after fill in live mode, and records fill/outcome telemetry.
 8. Gate 6 monitors the protection wall after fill and can trigger an early safety exit.
 
+In addition to the signal-processing coroutines, the live `TaskGroup` runs Phase 3 infrastructure tasks that do not participate in the trade decision path:
+
+- `lob_snapshot_writer` polls `LocalOrderBook` at ~1 Hz, writes to `lob_snapshots` in SQLite, and broadcasts each snapshot to subscribed WebSocket clients via `RealtimeHub` (`/ws/lob`).
+- `_api_server` hosts the aiohttp REST API (`/api/health`, `/api/portfolio`, `/api/session`, `/api/killswitch`) and three WebSocket streams (`/ws/lob`, `/ws/portfolio`, `/ws/signals`) consumed by the Dash dashboard.
+- `_portfolio_mtm_loop` runs every 1 s to check KS-1 budget breach, synchronise the risk tier back into `StrategyExecutor`, and broadcast the portfolio state to `/ws/portfolio` via a second `RealtimeHub`.
+- `midnight_reset_loop` sleeps until UTC midnight + 5 s and resets daily risk counters via `RiskEngine.reset_for_new_session()`.
+- `db_writer` persists candles and portfolio snapshots to SQLite.
+- `fill_processor` logs entry fill slippage from `FillDetail` objects on `fill_queue`.
+
 ```mermaid
 flowchart TD
     WS[BinanceWebSocketConsumer] --> RAW[raw_depth_queue]
@@ -164,6 +173,8 @@ This feedback loop keeps the live algorithm aligned with current data quality, r
 
 The current live microstructure path submits approved `MicroOrderRequest` objects directly from `StrategyExecutor` to `OrderManager`. `RiskEngine` is instantiated for budget/tier state, midnight reset, and tier synchronization into `StrategyExecutor`. The legacy `MicrostructureEngine` (`engine/microstructure_engine.py`) is not started in the live `TaskGroup` — it has no task in `main.py`'s `asyncio.TaskGroup` and the `ms_bar_queue` it would produce to has no active producer.
 
+Phase 3 added real-time streaming to the Dash dashboard via `RealtimeHub` (three independent hubs: `/ws/lob`, `/ws/portfolio`, `/ws/signals`). The `lob_snapshot_writer` and `_portfolio_mtm_loop` coroutines produce to two of these hubs; `SignalTelemetry` produces to the third. The aiohttp REST API and WebSocket endpoints run as `_api_server` inside the same `TaskGroup`. These infrastructure coroutines share the event loop with the trading algorithm but do not sit on the signal-to-order critical path.
+
 The algorithm currently detects wall consumption from depth changes and wall reload ratio. It does not yet use a minimum-quantity probe order behind or after a wall as a cleaner consumption trigger; that remains a future design item.
 
-The document describes the live path. Backtesting, dashboard visualization, registry lifecycle, and model training are documented separately.
+The document describes the live signal-to-order path. Backtesting, dashboard visualization, registry lifecycle, and model training are documented separately.
