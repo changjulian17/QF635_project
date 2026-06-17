@@ -293,3 +293,24 @@ def test_recv_timeout_value_is_expected():
 
     assert captured, "asyncio.wait_for was never called by _receive_loop"
     assert captured[0] == settings.WS_RECV_TIMEOUT_S
+
+
+def test_apply_depth_diff_tolerates_small_gap():
+    """A gap under LOB_GAP_TOLERANCE_UPDATEIDS is applied and _lob_update_id advances."""
+    consumer = BinanceWebSocketConsumer(streams=["btcusdt@depth@500ms"], shared_state=SharedState())
+    consumer._lob_update_id = 100
+
+    diff = {"U": 100 + 50, "u": 100 + 60, "b": [["100.0", "1.0"]], "a": []}
+    assert consumer._apply_depth_diff(diff) is True
+    assert consumer._lob_update_id == 160
+    assert consumer._bid_book[100.0] == 1.0
+
+
+def test_apply_depth_diff_rejects_large_gap():
+    """A gap at/above LOB_GAP_TOLERANCE_UPDATEIDS is rejected and _lob_update_id is unchanged."""
+    consumer = BinanceWebSocketConsumer(streams=["btcusdt@depth@500ms"], shared_state=SharedState())
+    consumer._lob_update_id = 100
+
+    diff = {"U": 100 + 5000, "u": 100 + 5010, "b": [], "a": []}
+    assert consumer._apply_depth_diff(diff) is False
+    assert consumer._lob_update_id == 100

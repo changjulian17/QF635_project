@@ -202,6 +202,36 @@ def fetch_portfolio_history(limit: int = 300) -> Union[list[dict], DBOffline]:
     return [dict(r) for r in reversed(rows)]
 
 
+def fetch_portfolio_window(hours: int, max_points: int = 1500) -> Union[list[dict], DBOffline]:
+    """Equity / PnL / drawdown rows within the last ``hours``, downsampled to ~max_points.
+
+    The ``portfolio`` table is purged at 7-day retention, so ``hours`` is capped at 168
+    (callers should label longer requests accordingly). Downsampling happens in SQL via a
+    stride on ROW_NUMBER so at most ~``max_points`` rows cross the wire even for multi-day
+    windows. Returns rows ascending by ts.
+    """
+    hours = min(int(hours), 24 * 7)
+    with main_db() as conn:
+        try:
+            (cnt,) = conn.execute(
+                "SELECT COUNT(*) FROM portfolio WHERE datetime(ts) >= datetime('now', ?)",
+                (f"-{hours} hours",),
+            ).fetchone()
+            stride = max(1, (cnt or 0) // max_points)
+            rows = conn.execute(
+                """SELECT ts, equity, daily_pnl, drawdown_pct FROM (
+                       SELECT ts, equity, daily_pnl, drawdown_pct,
+                              ROW_NUMBER() OVER (ORDER BY ts) AS rn
+                       FROM portfolio WHERE datetime(ts) >= datetime('now', ?)
+                   ) WHERE rn % ? = 0 ORDER BY ts ASC""",
+                (f"-{hours} hours", stride),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] main offline: %s", e)
+            return DBOffline(str(e))
+    return [dict(r) for r in rows]
+
+
 def fetch_lob_snapshots(limit: int = 3600) -> Union[list[dict], DBOffline]:
     with main_db() as conn:
         try:
@@ -209,6 +239,32 @@ def fetch_lob_snapshots(limit: int = 3600) -> Union[list[dict], DBOffline]:
                 "SELECT ts, mid_price, spread, obi, cvd_delta, bid_levels_json, ask_levels_json "
                 "FROM lob_snapshots ORDER BY ts DESC LIMIT ?",
                 (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] main offline: %s", e)
+            return DBOffline(str(e))
+    return [dict(r) for r in reversed(rows)]
+
+
+def fetch_microstructure_bars(minutes: int = 20, limit: int = 2000) -> Union[list[dict], DBOffline]:
+    """Recent ``microstructure_bars`` rows (oldest-first) for the LOB events panel.
+
+    ``ts`` is stored as a TEXT ISO timestamp, so the time window uses the same
+    ``datetime('now', ?)`` idiom as the other registry queries (not epoch ms).
+    The newest ``limit`` rows inside the window are returned, reversed to ascending.
+    """
+    with main_db() as conn:
+        try:
+            rows = conn.execute(
+                """SELECT ts, mid_price, obi, delta, cvd, buy_volume, sell_volume,
+                          reload_bid, reload_ask, iceberg_bid, iceberg_ask,
+                          sweep_up, sweep_down, book_flip_bid, book_flip_ask,
+                          liq_flip_to_res, liq_flip_to_sup,
+                          break_protect_long, break_protect_short
+                   FROM microstructure_bars
+                   WHERE datetime(ts) >= datetime('now', ?)
+                   ORDER BY ts DESC LIMIT ?""",
+                (f"-{minutes} minutes", limit),
             ).fetchall()
         except sqlite3.OperationalError as e:
             logger.warning("[DB] main offline: %s", e)

@@ -68,6 +68,7 @@ def _make_order_manager(portfolio_hub=None):
     om._open_sl_price               = 0.0
     om._open_tp_price               = 0.0
     om._oco_watcher_task            = None
+    om._tp_sl_monitor_task          = None
     om._placing_oco                 = False
     om._cancel_oco_on_placement     = False
     om._entry_in_flight             = False

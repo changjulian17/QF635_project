@@ -28,9 +28,18 @@ from dashboard._db import (
     fetch_lob_snapshots,
     fetch_agg_trades,
     fetch_agg_trade_bin_qtys,
+    fetch_microstructure_bars,
+    fetch_cvd_series_24h,
+    fetch_candles,
     DBOffline,
 )
-from dashboard._logic import add_event_markers, update_event_buffer, update_lob_buffer
+from dashboard._logic import (
+    add_event_markers,
+    build_walls_figure,
+    microstructure_bars_to_events,
+    update_event_buffer,
+    update_lob_buffer,
+)
 from dashboard._utils import empty_fig as _empty_fig
 
 dash.register_page(__name__, path="/lob", name="LOB")
@@ -51,6 +60,12 @@ _BUFFER: list[dict] = []
 # a single 20-min window could see hundreds of events.
 _MAX_EVENTS = 2000
 _EVENTS: list[dict] = []
+
+# Persisted microstructure events (from the microstructure_bars table), refreshed by
+# the events-panel poll and overlaid as heatmap markers by the WS render. Unlike
+# _EVENTS (absorption/sweep broadcast over the WS), these survive restarts.
+_MS_WINDOW_MIN = 20
+_MS_EVENTS: list[dict] = []
 
 # ── Bubble baseline cache ──────────────────────────────────────────────────
 # Percentile threshold is derived from 24h of bin-aggregated volumes, not the
@@ -101,40 +116,90 @@ layout = html.Div([
         className="mb-3",
     ),
 
-    # ── Controls ───────────────────────────────────────────────────────────
-    dbc.Row([
-        dbc.Col([
-            dbc.Label("Heatmap window (min)"),
-            dcc.Slider(id="lob-hm-window", min=1, max=20, step=1, value=15,
-                       marks={1: "1m", 5: "5m", 10: "10m", 20: "20m"}),
-        ], width=3),
-        dbc.Col([
-            dbc.Label("Price range (±$)"),
-            dcc.Slider(id="lob-price-range", min=100, max=2000, step=100, value=500,
-                       marks={100: "100", 500: "500", 1000: "1000", 2000: "2000"}),
-        ], width=3),
-        dbc.Col([
-            dbc.Label("Contrast (pctile)"),
-            dcc.Slider(id="lob-contrast", min=80, max=99, step=1, value=95,
-                       marks={80: "80", 90: "90", 95: "95", 99: "99"}),
-        ], width=3),
-        dbc.Col([
-            dbc.Label("Bin volume (pctile)"),
-            dcc.Slider(id="lob-trade-pctile", min=70, max=99, step=1, value=80,
-                       marks={70: "70", 80: "80", 90: "90", 99: "99"}),
-        ], width=3),
-    ], className="mb-3"),
+    # ── View tabs: Microstructure (live LOB) · Walls (candles + wall heatmap) ─
+    dbc.Tabs([
+        dbc.Tab(label="Microstructure", tab_id="lob-tab-micro", children=html.Div([
+            # ── Controls ───────────────────────────────────────────────────
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Heatmap window (min)"),
+                    dcc.Slider(id="lob-hm-window", min=1, max=20, step=1, value=15,
+                               marks={1: "1m", 5: "5m", 10: "10m", 20: "20m"}),
+                ], width=3),
+                dbc.Col([
+                    dbc.Label("Price range (±$)"),
+                    dcc.Slider(id="lob-price-range", min=100, max=2000, step=100, value=500,
+                               marks={100: "100", 500: "500", 1000: "1000", 2000: "2000"}),
+                ], width=3),
+                dbc.Col([
+                    dbc.Label("Contrast (pctile)"),
+                    dcc.Slider(id="lob-contrast", min=80, max=99, step=1, value=95,
+                               marks={80: "80", 90: "90", 95: "95", 99: "99"}),
+                ], width=3),
+                dbc.Col([
+                    dbc.Label("Bin volume (pctile)"),
+                    dcc.Slider(id="lob-trade-pctile", min=70, max=99, step=1, value=80,
+                               marks={70: "70", 80: "80", 90: "90", 99: "99"}),
+                ], width=3),
+            ], className="mb-3 mt-3"),
 
-    # ── Refresh button ─────────────────────────────────────────────────────
-    dbc.Row([
-        dbc.Col(
-            dbc.Button("Refresh Now", id="lob-refresh-btn", color="secondary", size="sm"),
-            width="auto",
-        ),
-    ], className="mb-3"),
+            # ── Refresh button ─────────────────────────────────────────────
+            dbc.Row([
+                dbc.Col(
+                    dbc.Button("Refresh Now", id="lob-refresh-btn", color="secondary", size="sm"),
+                    width="auto",
+                ),
+            ], className="mb-3"),
 
-    # ── Chart ──────────────────────────────────────────────────────────────
-    dcc.Graph(id="lob-chart", style={"height": "860px"}),
+            # ── Chart ──────────────────────────────────────────────────────
+            dcc.Graph(id="lob-chart", style={"height": "860px"}),
+
+            # ── Microstructure events panel (from microstructure_bars) ──────
+            html.Hr(),
+            html.H5(f"Microstructure Events (last {_MS_WINDOW_MIN}m)", className="mb-2"),
+            dcc.Interval(id="lob-ms-interval", interval=5000),
+            dbc.Row([
+                dbc.Col([
+                    dcc.Graph(id="lob-cvd24-chart", style={"height": "200px"}),
+                    dcc.Graph(id="lob-volbars-chart", style={"height": "200px"}),
+                ], width=7),
+                dbc.Col([
+                    html.Div("Event tape (newest first)", className="text-muted small mb-1"),
+                    html.Div(id="lob-ms-tape", style={
+                        "maxHeight": "400px", "overflowY": "auto",
+                        "fontFamily": "monospace", "fontSize": "0.8rem",
+                        "backgroundColor": "#1a1d20", "padding": "0.5rem",
+                        "borderRadius": "0.25rem", "border": "1px solid #495057",
+                    }),
+                ], width=5),
+            ]),
+        ])),
+
+        dbc.Tab(label="Walls", tab_id="lob-tab-walls", children=html.Div([
+            dcc.Interval(id="lobw-interval", interval=15000),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Window (min)"),
+                    dcc.Slider(id="lobw-window", min=5, max=60, step=5, value=15,
+                               marks={5: "5m", 15: "15m", 30: "30m", 60: "60m"}),
+                ], width=4),
+                dbc.Col([
+                    dbc.Label("Price range (±$)"),
+                    dcc.Slider(id="lobw-range", min=100, max=2000, step=100, value=500,
+                               marks={100: "100", 500: "500", 1000: "1k", 2000: "2k"}),
+                ], width=4),
+                dbc.Col([
+                    dbc.Label("Contrast (pctile)"),
+                    dcc.Slider(id="lobw-contrast", min=80, max=99, step=1, value=95,
+                               marks={80: "80", 90: "90", 95: "95", 99: "99"}),
+                ], width=4),
+            ], className="mb-3 mt-3"),
+            dcc.Loading(
+                dcc.Graph(id="lobw-chart", style={"height": "860px"}),
+                type="circle",
+            ),
+        ])),
+    ], id="lob-tabs", active_tab="lob-tab-micro"),
 ])
 
 
@@ -549,9 +614,12 @@ def on_ws_message(message):
 def render_lob_chart(_tick, hm_minutes, half_range, contrast_pctile, trade_pctile):
     if not _BUFFER:
         return _empty_fig("Waiting for LOB data… (start the engine for the live stream)")
+    # Combine WS-broadcast events (_EVENTS) with persisted microstructure_bars events
+    # (_MS_EVENTS, refreshed by the events-panel poll). add_event_markers filters both
+    # to the heatmap window and ignores "other" kinds, so the overlay stays clean.
     return _build_lob_figure(
         list(_BUFFER), hm_minutes, half_range, contrast_pctile, trade_pctile,
-        events=list(_EVENTS),
+        events=list(_EVENTS) + list(_MS_EVENTS),
     )
 
 
@@ -575,3 +643,115 @@ def update_conn_status(state):
 def update_clock(_):
     now_sgt = datetime.now(_SGT)
     return f"SGT  {now_sgt.strftime('%Y-%m-%d  %H:%M:%S')}"
+
+
+# ── Microstructure events panel (surfaces the microstructure_bars table) ───────
+
+_SIDE_COLOR = {"bid": "success", "ask": "danger"}
+
+
+def _fmt_sgt(ts) -> str:
+    if not ts:
+        return ""
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(_SGT).strftime("%H:%M:%S")
+    except (ValueError, TypeError):
+        return str(ts)[11:19]
+
+
+def _build_ms_tape(events: list[dict]):
+    if not events:
+        return html.Div("No microstructure events in window.", className="text-muted")
+    rows = []
+    for ev in reversed(events[-80:]):  # newest first, capped
+        price = ev.get("price")
+        price_str = f"{price:,.1f}" if isinstance(price, (int, float)) else "—"
+        rows.append(html.Div([
+            html.Span(_fmt_sgt(ev.get("ts")), className="text-muted me-2"),
+            dbc.Badge(ev.get("label", "?"),
+                      color=_SIDE_COLOR.get(ev.get("side"), "secondary"), className="me-2"),
+            html.Span(price_str, className="text-muted small"),
+        ], className="mb-1"))
+    return rows
+
+
+def _build_volbars_fig(rows: list[dict]) -> go.Figure:
+    if not rows:
+        return _empty_fig("No microstructure bars yet")
+    df = pd.DataFrame(rows)
+    ts = _parse_lob_timestamps(df["ts"]).dt.tz_convert(_SGT)
+    buy = df["buy_volume"].fillna(0).astype(float)
+    sell = -df["sell_volume"].fillna(0).astype(float)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=ts, y=buy, marker_color="rgba(0,200,80,0.8)", name="Buy vol"))
+    fig.add_trace(go.Bar(x=ts, y=sell, marker_color="rgba(220,60,60,0.8)", name="Sell vol"))
+    fig.add_hline(y=0, line=dict(color="white", width=0.5))
+    fig.update_layout(
+        template="plotly_dark", barmode="relative",
+        margin=dict(l=50, r=10, t=28, b=24),
+        title=dict(text=f"Buy / Sell volume (last {_MS_WINDOW_MIN}m)", font=dict(size=12)),
+        showlegend=False,
+    )
+    return fig
+
+
+def _build_cvd24_fig() -> go.Figure:
+    since_ms = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
+    series = fetch_cvd_series_24h(since_ms)
+    if isinstance(series, DBOffline) or not series:
+        return _empty_fig("No 24h CVD (agg_trades) yet")
+    ts = [datetime.fromtimestamp(r["ts_sec_ms"] / 1000, tz=_SGT) for r in series]
+    cvd = np.cumsum([float(r["delta"] or 0.0) for r in series])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=ts, y=cvd, mode="lines",
+        line=dict(color="orange", width=1.2),
+        fill="tozeroy", fillcolor="rgba(255,165,0,0.12)", name="CVD 24h",
+    ))
+    fig.add_hline(y=0, line=dict(color="white", width=0.5))
+    fig.update_layout(
+        template="plotly_dark", margin=dict(l=50, r=10, t=28, b=24),
+        title=dict(text="CVD — 24h (agg trades)", font=dict(size=12)),
+        showlegend=False,
+    )
+    return fig
+
+
+@callback(
+    Output("lob-ms-tape", "children"),
+    Output("lob-volbars-chart", "figure"),
+    Output("lob-cvd24-chart", "figure"),
+    Input("lob-ms-interval", "n_intervals"),
+)
+def update_microstructure_panel(_n):
+    """Poll microstructure_bars → refresh the tape, volume bars, 24h CVD, and the
+    persisted-events buffer (_MS_EVENTS) overlaid as markers by render_lob_chart."""
+    global _MS_EVENTS
+    rows = fetch_microstructure_bars(minutes=_MS_WINDOW_MIN, limit=2000)
+    if isinstance(rows, DBOffline):
+        _MS_EVENTS = []
+        return (html.Div("DB offline — start the engine.", className="text-muted"),
+                _empty_fig("DB offline"), _build_cvd24_fig())
+    rows = rows or []
+    _MS_EVENTS = microstructure_bars_to_events(rows)
+    return _build_ms_tape(_MS_EVENTS), _build_volbars_fig(rows), _build_cvd24_fig()
+
+
+# ── Walls view (folded in from the former /walls page) ─────────────────────────
+
+@callback(
+    Output("lobw-chart", "figure"),
+    Input("lobw-interval", "n_intervals"),
+    Input("lobw-window", "value"),
+    Input("lobw-range", "value"),
+    Input("lobw-contrast", "value"),
+)
+def update_walls_chart(n, window_min, half_range, contrast_pctile):
+    candles = fetch_candles(limit=7200)
+    snapshots = fetch_lob_snapshots(limit=3600)
+    if isinstance(candles, DBOffline) or isinstance(snapshots, DBOffline):
+        return _empty_fig("DB offline — start engine first")
+    return build_walls_figure(
+        candles, snapshots, window_min, half_range, contrast_pctile,
+        stale_threshold_s=_STALE_THRESHOLD_S,
+    )

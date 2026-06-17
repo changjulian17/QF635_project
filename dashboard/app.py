@@ -28,9 +28,7 @@ app = dash.Dash(
 _NAV_ITEMS = [
     dbc.NavItem(dbc.NavLink("Live", href="/", active="exact")),
     dbc.NavItem(dbc.NavLink("LOB", href="/lob", active="exact")),
-    dbc.NavItem(dbc.NavLink("Walls", href="/walls", active="exact")),
-    dbc.NavItem(dbc.NavLink("Backtest", href="/backtest", active="exact")),
-    dbc.NavItem(dbc.NavLink("Registry", href="/registry", active="exact")),
+    dbc.NavItem(dbc.NavLink("Strategies", href="/strategies", active="exact")),
     dbc.NavItem(dbc.NavLink("Config", href="/config", active="exact")),
 ]
 

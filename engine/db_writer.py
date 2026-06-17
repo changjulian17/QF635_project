@@ -48,12 +48,14 @@ def init_db() -> None:
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS engine_health (
-                id         INTEGER PRIMARY KEY CHECK (id = 1),
-                lob_status TEXT,
-                hb_status  TEXT,
-                risk_tier  TEXT,
-                ks_active  INTEGER,
-                updated_ms INTEGER
+                id                  INTEGER PRIMARY KEY CHECK (id = 1),
+                lob_status          TEXT,
+                hb_status           TEXT,
+                risk_tier           TEXT,
+                ks_active           INTEGER,
+                updated_ms          INTEGER,
+                consecutive_losses  INTEGER DEFAULT 0,
+                cooldown_until_ms   INTEGER
             )
         """)
         conn.execute("""
@@ -78,6 +80,14 @@ def init_db() -> None:
         ]:
             try:
                 conn.execute(f"ALTER TABLE portfolio ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        for col, typedef in [
+            ("consecutive_losses", "INTEGER DEFAULT 0"),
+            ("cooldown_until_ms",  "INTEGER"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE engine_health ADD COLUMN {col} {typedef}")
             except sqlite3.OperationalError:
                 pass  # column already exists
         conn.commit()
@@ -223,9 +233,12 @@ class DBWriter:
         hb_status: str,
         risk_tier: str,
         ks_active: bool,
+        consecutive_losses: int = 0,
+        cooldown_until_ms: int | None = None,
     ) -> None:
         await asyncio.to_thread(
-            self._write_engine_health_sync, lob_status, hb_status, risk_tier, ks_active
+            self._write_engine_health_sync, lob_status, hb_status, risk_tier, ks_active,
+            consecutive_losses, cooldown_until_ms,
         )
 
     @staticmethod
@@ -234,19 +247,25 @@ class DBWriter:
         hb_status: str,
         risk_tier: str,
         ks_active: bool,
+        consecutive_losses: int = 0,
+        cooldown_until_ms: int | None = None,
     ) -> None:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                """INSERT INTO engine_health (id, lob_status, hb_status, risk_tier, ks_active, updated_ms)
-                   VALUES (1, ?, ?, ?, ?, ?)
+                """INSERT INTO engine_health
+                   (id, lob_status, hb_status, risk_tier, ks_active, updated_ms,
+                    consecutive_losses, cooldown_until_ms)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        lob_status=excluded.lob_status,
                        hb_status=excluded.hb_status,
                        risk_tier=excluded.risk_tier,
                        ks_active=excluded.ks_active,
-                       updated_ms=excluded.updated_ms""",
+                       updated_ms=excluded.updated_ms,
+                       consecutive_losses=excluded.consecutive_losses,
+                       cooldown_until_ms=excluded.cooldown_until_ms""",
                 (lob_status, hb_status, risk_tier, 1 if ks_active else 0,
-                 int(time.time() * 1000)),
+                 int(time.time() * 1000), consecutive_losses, cooldown_until_ms),
             )
             conn.commit()
 

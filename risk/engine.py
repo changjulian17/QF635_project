@@ -186,3 +186,7 @@ class RiskEngine:
     @property
     def tier(self) -> str:
         return self._tier
+
+    @property
+    def cooldown_until(self) -> datetime | None:
+        return self._cooldown_until

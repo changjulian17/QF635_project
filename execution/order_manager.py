@@ -2,8 +2,8 @@
 Execution layer — IOC aggressive limit orders (Rule 10, master arch §9).
 
 Entry orders are IOC limit orders priced to cross the spread:
-  LONG  → limit = best_ask + (best_ask - best_bid) × 0.5
-  SHORT → limit = best_bid - (best_ask - best_bid) × 0.5
+  LONG  → limit = best_ask + (best_ask - best_bid) × 0.25
+  SHORT → limit = best_bid - (best_ask - best_bid) × 0.25
 
 If the order expires unfilled it is NOT retried — the signal is stale.
 On fill: slippage is recorded to GlobalKillswitch (KS-3) and a FillDetail
@@ -53,6 +53,7 @@ _DRY_RUN_BEST_ASK = 95_010.0
 
 _MAX_CONNECT_ATTEMPTS = 3
 _RECONNECT_DELAY_S    = 5.0
+_IOC_OVERSHOOT_FRACTION = 0.25   # fraction of spread crossed beyond best bid/ask
 
 
 def _weighted_avg_fill(resp: dict) -> float:
@@ -156,6 +157,7 @@ class OrderManager:
         self._open_sl_price:              float               = 0.0   # set by _place_oco; used to compute R-multiple
         self._open_tp_price:              float               = 0.0   # set by _place_oco alongside SL
         self._oco_watcher_task:           asyncio.Task | None = None  # polls OCO until natural fill
+        self._tp_sl_monitor_task:         asyncio.Task | None = None  # BINANCE_DEMO software TP/SL watcher
 
         # ── OCO placement race flags (S1 fix) ────────────────────────────────────
         # _placing_oco:            True while create_oco_order REST call is in-flight.
@@ -299,6 +301,18 @@ class OrderManager:
                 3,
             )
             await self._place_oco(req, fill_price, oco_qty, req.side)
+            if settings.BINANCE_DEMO and self._open_position_qty > 0:
+                self._tp_sl_monitor_task = asyncio.create_task(
+                    self._watch_tp_sl(
+                        position_side=req.side,
+                        fill_qty=oco_qty,
+                        signal_id=req.signal_id,
+                        entry_price=fill_price,
+                        entry_time=self._open_entry_time,
+                        position_closed_event=req.position_closed_event,
+                    ),
+                    name=f"tp_sl_monitor_{req.signal_id[:8]}",
+                )
         finally:
             async with self._position_lock:
                 self._entry_in_flight = False
@@ -366,10 +380,10 @@ class OrderManager:
         spread = best_ask - best_bid
         tick   = settings.PRICE_TICK_SIZE
         if side == "BUY":
-            limit_price  = round(round((best_ask + spread * 0.5) / tick) * tick, 1)
+            limit_price  = round(round((best_ask + spread * _IOC_OVERSHOOT_FRACTION) / tick) * tick, 1)
             signal_price = best_ask
         else:
-            limit_price  = round(round((best_bid - spread * 0.5) / tick) * tick, 1)
+            limit_price  = round(round((best_bid - spread * _IOC_OVERSHOOT_FRACTION) / tick) * tick, 1)
             signal_price = best_bid
 
         protection_wall_price = req.micro_signal.protection_wall.price
@@ -629,13 +643,21 @@ class OrderManager:
                     fill_qty, entry_side, reason="WALL_REMOVED_DURING_OCO"
                 )
                 async with self._position_lock:
-                    entry_t = self._open_entry_time
+                    entry_t  = self._open_entry_time
                     entry_sl = self._open_sl_price
-                    self._reset_open_position()
+                    if closed:
+                        self._reset_open_position()
+                    else:
+                        self._emergency_close_in_progress = False  # release for retry
                 if closed:
                     self._record_outcome(req.signal_id, entry_side, fill_price, close_p, fill_qty, entry_t, entry_sl)
                     if req.position_closed_event:
                         req.position_closed_event.set()
+                else:
+                    logger.critical(
+                        "[Exec] WALL_REMOVED_DURING_OCO close FAILED — position still open; "
+                        "position_closed_event NOT set"
+                    )
             else:
                 logger.info(
                     "[Exec] Bracket placed — TP=%.2f (id=%s) SL=%.2f (id=%s)",
@@ -655,42 +677,6 @@ class OrderManager:
                     ),
                     name=f"oco_watcher_{req.signal_id[:8]}",
                 )
-                if self._portfolio_hub is not None:
-                    _t = asyncio.create_task(
-                        self._portfolio_hub.broadcast({
-                            "type":        "position_opened",
-                            "ts":          time.time(),
-                            "signal_id":   req.signal_id,
-                            "side":        entry_side,
-                            "entry_price": fill_price,
-                            "quantity":    fill_qty,
-                            "stop_loss":   sl_price,
-                            "take_profit": tp_price,
-                        })
-                    )
-                    _t.add_done_callback(
-                        lambda t: logger.error(
-                            "[Exec] position_opened broadcast failed: %s", t.exception()
-                        ) if not t.cancelled() and t.exception() is not None else None
-                    )
-                if self._portfolio_hub is not None:
-                    _t = asyncio.create_task(
-                        self._portfolio_hub.broadcast({
-                            "type":        "position_opened",
-                            "ts":          time.time(),
-                            "signal_id":   req.signal_id,
-                            "side":        entry_side,
-                            "entry_price": fill_price,
-                            "quantity":    fill_qty,
-                            "stop_loss":   sl_price,
-                            "take_profit": tp_price,
-                        })
-                    )
-                    _t.add_done_callback(
-                        lambda t: logger.error(
-                            "[Exec] position_opened broadcast failed: %s", t.exception()
-                        ) if not t.cancelled() and t.exception() is not None else None
-                    )
                 if self._portfolio_hub is not None:
                     _t = asyncio.create_task(
                         self._portfolio_hub.broadcast({
@@ -833,6 +819,76 @@ class OrderManager:
                     exit_price, signal_id[:8],
                 )
             return
+
+    # ── Software TP/SL monitor (BINANCE_DEMO only — no real bracket) ──────────
+
+    async def _watch_tp_sl(
+        self,
+        position_side: str,
+        fill_qty: float,
+        signal_id: str,
+        entry_price: float,
+        entry_time: float,
+        position_closed_event: asyncio.Event,
+        poll_interval_s: float = 0.1,
+    ) -> None:
+        """
+        Polls book_fn for TP/SL touch against the live _open_tp_price/_open_sl_price
+        (read fresh each iteration, not captured at task-creation time). Mirrors
+        _watch_oco_outcome's lifecycle: exits cleanly the instant any other path
+        sets position_closed_event. Only started when settings.BINANCE_DEMO is True —
+        see _place_oco's BINANCE_DEMO early-return: on demo, no bracket is ever
+        placed, so this is the only price-target closer besides Gate6 / MAX_HOLD.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(position_closed_event.wait(), timeout=poll_interval_s)
+                return  # closed via bracket / Gate6 / killswitch — exit quietly
+            except asyncio.TimeoutError:
+                pass
+
+            book = self._book_fn() if self._book_fn else None
+            if book is None:
+                continue
+            best_bid, best_ask = book
+            mid = (best_bid + best_ask) / 2.0
+            tp_price, sl_price = self._open_tp_price, self._open_sl_price
+
+            touched = (
+                (mid >= tp_price or mid <= sl_price) if position_side == "BUY"
+                else (mid <= tp_price or mid >= sl_price)
+            )
+            if not touched:
+                continue
+
+            async with self._position_lock:
+                if self._placing_oco or self._emergency_close_in_progress or position_closed_event.is_set():
+                    continue  # bracket placement or another close path already active/done
+                self._emergency_close_in_progress = True
+
+            await self._cancel_bracket_orders()  # no-op if no bracket was placed (demo)
+            closed, close_p = await self._emergency_close(fill_qty, position_side, reason="TP_SL_TOUCH")
+
+            async with self._position_lock:
+                if self._open_signal_id != signal_id:
+                    continue  # position already reset by a different path while we awaited
+                if not closed:
+                    self._emergency_close_in_progress = False  # release so loop can retry
+                else:
+                    et, sl = self._open_entry_time, self._open_sl_price
+                    self._reset_open_position()
+
+            if closed:
+                self._record_outcome(signal_id, position_side, entry_price, close_p, fill_qty, et, sl)
+                if position_closed_event and not position_closed_event.is_set():
+                    position_closed_event.set()
+                return
+
+            logger.critical(
+                "[Exec] TP/SL emergency close FAILED — position still open, retrying | signal_id=%s",
+                signal_id[:8],
+            )
+            await asyncio.sleep(poll_interval_s * 5)  # brief backoff before retry
 
     # ── User data stream callback ─────────────────────────────────────────────
 
@@ -986,9 +1042,9 @@ class OrderManager:
 
             tick  = settings.PRICE_TICK_SIZE
             close_price = (
-                round(round((best_ask + spread * 0.5) / tick) * tick, 1)
+                round(round((best_ask + spread * _IOC_OVERSHOOT_FRACTION) / tick) * tick, 1)
                 if close_side == "BUY"
-                else round(round((best_bid - spread * 0.5) / tick) * tick, 1)
+                else round(round((best_bid - spread * _IOC_OVERSHOOT_FRACTION) / tick) * tick, 1)
             )
             if settings.BINANCE_DEMO:
                 close_order = FuturesMarketOrder(
@@ -1105,7 +1161,10 @@ class OrderManager:
             ep     = self._open_entry_price
             et     = self._open_entry_time
             sl     = self._open_sl_price
-            self._reset_open_position()
+            if closed:
+                self._reset_open_position()
+            else:
+                self._emergency_close_in_progress = False  # release for _watch_tp_sl retry
 
         if closed:
             self._record_outcome(sig_id, side or "", ep, close_p, qty, et, sl)
@@ -1114,7 +1173,7 @@ class OrderManager:
         else:
             logger.critical(
                 "[Exec] Early exit IOC unfilled — position still open; "
-                "position_closed_event NOT set; manual intervention required"
+                "position_closed_event NOT set; _watch_tp_sl will retry"
             )
 
     async def handle_safety_exit(self, reason: str) -> None:
@@ -1129,6 +1188,9 @@ class OrderManager:
         if self._oco_watcher_task and not self._oco_watcher_task.done():
             self._oco_watcher_task.cancel()
         self._oco_watcher_task            = None
+        if self._tp_sl_monitor_task and not self._tp_sl_monitor_task.done():
+            self._tp_sl_monitor_task.cancel()
+        self._tp_sl_monitor_task          = None
         self._open_position_side          = None
         self._open_position_qty           = 0.0
         self._open_tp_order_id            = None
@@ -1207,3 +1269,19 @@ class OrderManager:
             logger.critical(
                 "[Exec] force_close_all: emergency close unfilled — manual intervention required"
             )
+
+    async def close_orphan_position(self, qty: float, side: str) -> None:
+        """Close a position detected on the exchange that local state has no record of.
+
+        Unlike force_close_all, does NOT set accepting_new_signals=False — the engine
+        should resume normal operation after cleaning up the orphan."""
+        logger.critical("[Exec] Closing orphan position — %s %.6f (no local state)", side, qty)
+        closed, close_p = await self._emergency_close(qty, side, reason="ORPHAN_POSITION")
+        if closed:
+            logger.critical("[Exec] Orphan position closed @ %.2f — trading can resume", close_p)
+        else:
+            logger.critical(
+                "[Exec] Orphan position close FAILED — position still open; "
+                "accepting_new_signals blocked until resolved"
+            )
+            self.accepting_new_signals = False

@@ -11,13 +11,26 @@ import dash_bootstrap_components as dbc
 from dash_extensions import WebSocket
 
 from config import settings
-from dashboard._db import fetch_portfolio_history, fetch_session_stats, fetch_signal_funnel, fetch_recent_signals, DBOffline
+from dashboard._db import (
+    fetch_portfolio_history,
+    fetch_portfolio_window,
+    fetch_session_stats,
+    fetch_signal_funnel,
+    fetch_recent_signals,
+    fetch_pnl_by_pattern,
+    fetch_system_events,
+    DBOffline,
+)
 from dashboard._logic import (
     fire_killswitch as _fire_ks,
     handle_position_event,
     update_portfolio_state,
     update_signal_tape,
     validate_ks_confirm as _validate_ks,
+    WINDOW_HOURS,
+    DEFAULT_WINDOW,
+    window_to_hours,
+    dov_budget_color,
 )
 from dashboard._utils import empty_fig as _empty_fig
 
@@ -40,12 +53,22 @@ _TAPE: list[dict] = []
 # Cleared to {} on close_event; takes precedence over the 1 Hz MTM snapshot.
 _LAST_POSITION_EVENT: dict = {}
 
-# 30-second TTL cache for the two 24-hour aggregate queries that run at 5-second poll cadence.
-_STATS_CACHE: dict | list | None = None
-_STATS_CACHE_TS: float = 0.0
-_FUNNEL_CACHE: list | None = None
-_FUNNEL_CACHE_TS: float = 0.0
+# 30-second TTL caches, keyed by window, for the aggregate queries that run at the
+# 5-second poll cadence. Keyed so switching window refetches rather than showing stale.
+# Window→hours mapping and the retention note live in _logic (WINDOW_HOURS / window_to_hours).
+_STATS_CACHE: dict = {}    # window -> (result, ts)
+_FUNNEL_CACHE: dict = {}   # window -> (result, ts)
+_PNL_CACHE: dict = {}      # window -> (result, ts)
 _LIVE_STATS_TTL: float = 30.0
+
+
+def _cached(cache: dict, key, fetch):
+    """Return cache[key], refetching via ``fetch`` when missing or older than the TTL."""
+    now = time.time()
+    hit = cache.get(key)
+    if hit is None or (now - hit[1]) >= _LIVE_STATS_TTL:
+        cache[key] = (fetch(), now)
+    return cache[key][0]
 
 _TIER_COLORS = {
     "ACTIVE": "success",
@@ -96,23 +119,33 @@ layout = html.Div([
     dcc.Interval(id="live-interval", interval=5000),    # 5s — drives session stats / funnel fallback
     dcc.Interval(id="live-tape-init", interval=500, max_intervals=1),  # fires once to seed tape from DB
 
-    # ── Header: connection badge ────────────────────────────────────────────
+    # ── Header: window selector + connection badge ──────────────────────────
     html.Div([
+        html.Div([
+            html.Small("Window:", className="text-muted me-2"),
+            dbc.RadioItems(
+                id="live-window",
+                options=[{"label": w, "value": w} for w in WINDOW_HOURS],
+                value=DEFAULT_WINDOW,
+                inline=True, inputClassName="me-1", labelClassName="me-3",
+            ),
+        ], className="d-flex align-items-center"),
         html.Span(id="live-conn-status"),
-    ], className="d-flex justify-content-end align-items-center mb-2"),
+    ], className="d-flex justify-content-between align-items-center mb-2"),
 
     # ── Portfolio metrics ──────────────────────────────────────────────────
     dbc.Row(id="live-metrics-row", className="mb-2 g-3"),
-    html.Small("Account Balances (last 30 days)", className="text-muted ms-1"),
+    html.Small("Account Balances", className="text-muted ms-1"),
     dbc.Row(id="live-balance-row", className="mb-3 g-3"),
 
     # ── Session stats ──────────────────────────────────────────────────────
-    html.H5("Session Stats (last 30 days)", className="mb-2 mt-1"),
+    html.H5(id="live-session-header", className="mb-2 mt-1"),
     dbc.Row(id="live-session-row", className="mb-3 g-3"),
 
-    # ── Equity curve ──────────────────────────────────────────────────────
+    # ── Equity curve + PnL attribution ─────────────────────────────────────
     dbc.Row([
-        dbc.Col(dcc.Graph(id="live-equity-chart", style={"height": "220px"}), width=12),
+        dbc.Col(dcc.Graph(id="live-equity-chart", style={"height": "260px"}), width=8),
+        dbc.Col(dcc.Graph(id="live-pnl-attr-chart", style={"height": "260px"}), width=4),
     ], className="mb-4"),
 
     # ── Live signal tape ───────────────────────────────────────────────────
@@ -134,7 +167,7 @@ layout = html.Div([
     # ── Signal funnel ──────────────────────────────────────────────────────
     dbc.Row([
         dbc.Col([
-            html.H5("Signal Funnel (last 24h)", className="mb-2"),
+            html.H5(id="live-funnel-header", className="mb-2"),
             html.Div(id="live-funnel-table"),
         ], width=6),
 
@@ -176,19 +209,33 @@ layout = html.Div([
             ], id="live-ks-modal", is_open=False),
         ], width=4),
     ]),
+
+    # ── System (engine status + event log) ─────────────────────────────────
+    dbc.Accordion([
+        dbc.AccordionItem([
+            html.Div(id="live-system-meta", className="mb-3"),
+            html.H6("System Event Log", className="mt-2 mb-2"),
+            html.Div(id="live-system-event-log"),
+        ], title="System — engine status & event log"),
+    ], start_collapsed=True, className="mt-4"),
 ])
 
 
 # ── Render helpers ─────────────────────────────────────────────────────────
 
+_METRIC_LABELS = ("Equity", "Daily PnL", "Drawdown", "DOV Budget Used", "Avg Slippage", "Risk Tier")
+
+
 def _placeholder_metrics() -> list:
-    return [_metric_card(label, "—") for label in ("Equity", "Daily PnL", "Drawdown", "Risk Tier")]
+    return [_metric_card(label, "—", width=2) for label in _METRIC_LABELS]
 
 
 def _build_metrics_row(portfolio: dict) -> list:
     equity    = portfolio.get("equity")
     daily_pnl = portfolio.get("daily_pnl")
     drawdown  = portfolio.get("drawdown_pct")
+    budget    = portfolio.get("budget_loss_pct")
+    slippage  = portfolio.get("avg_slippage_bps")
     risk_tier = portfolio.get("risk_tier") or "—"
     tier_color = _TIER_COLORS.get(risk_tier, "light")
 
@@ -198,10 +245,20 @@ def _build_metrics_row(portfolio: dict) -> list:
     pnl_color  = "success" if isinstance(daily_pnl, (int, float)) and daily_pnl >= 0 else "danger"
     dd_color   = "success" if isinstance(drawdown,  (int, float)) and drawdown < 0.02 else "warning"
 
+    limit_pct = settings.TIER_HALTED_PCT  # 1% DOV hard limit
+    if isinstance(budget, (int, float)):
+        dov_str   = f"{budget * 100:.2f}% / {limit_pct * 100:.2f}%"
+        dov_color = dov_budget_color(budget, settings.TIER_REDUCED_PCT, settings.TIER_PASSIVE_PCT)
+    else:
+        dov_str, dov_color = "—", "light"
+    slip_str = f"{slippage:.1f} bps" if isinstance(slippage, (int, float)) else "—"
+
     return [
-        _metric_card("Equity", equity_str),
-        _metric_card("Daily PnL", pnl_str, pnl_color),
-        _metric_card("Drawdown", dd_str, dd_color),
+        _metric_card("Equity", equity_str, width=2),
+        _metric_card("Daily PnL", pnl_str, pnl_color, width=2),
+        _metric_card("Drawdown", dd_str, dd_color, width=2),
+        _metric_card("DOV Budget Used", dov_str, dov_color, width=2),
+        _metric_card("Avg Slippage", slip_str, width=2),
         dbc.Col(
             dbc.Card([
                 dbc.CardBody([
@@ -209,7 +266,7 @@ def _build_metrics_row(portfolio: dict) -> list:
                     dbc.Badge(risk_tier, color=tier_color, className="fs-6"),
                 ])
             ], color="dark", outline=True),
-            width=3,
+            width=2,
         ),
     ]
 
@@ -258,7 +315,7 @@ def _build_funnel_table(funnel_result):
     if isinstance(funnel_result, DBOffline):
         return dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
     if not funnel_result:
-        return html.P("No signal data in last 24h.", className="text-muted")
+        return html.P("No signal data in window.", className="text-muted")
     total = sum(r["cnt"] for r in funnel_result) or 1
     return dbc.Table([
         html.Thead(html.Tr([html.Th("Gate"), html.Th("Count"), html.Th("% of Total")])),
@@ -353,20 +410,20 @@ def render_positions(_portfolio_tick, _event_tick):
     return _build_positions_table(_PORTFOLIO)
 
 
-# ── Session stats + equity curve (5 s interval; 24 h aggregates) ───────────
+# ── Session stats + equity curve (window-driven; cached per window) ────────
 
 @callback(
     Output("live-session-row", "children"),
+    Output("live-session-header", "children"),
     Output("live-equity-chart", "figure"),
     Input("live-interval", "n_intervals"),
+    Input("live-window", "value"),
 )
-def update_session_section(_n):
-    global _STATS_CACHE, _STATS_CACHE_TS
-    now = time.time()
-    if _STATS_CACHE is None or (now - _STATS_CACHE_TS) >= _LIVE_STATS_TTL:
-        _STATS_CACHE = fetch_session_stats(hours=24 * 30)
-        _STATS_CACHE_TS = now
-    session_result = _STATS_CACHE
+def update_session_section(_n, window):
+    window = window or DEFAULT_WINDOW
+    hours = window_to_hours(window)
+    header = f"Session Stats — last {window}"
+    session_result = _cached(_STATS_CACHE, window, lambda: fetch_session_stats(hours=hours))
     if isinstance(session_result, DBOffline) or not session_result:
         session_row = [dbc.Col(dbc.Alert("No session data yet.", color="secondary"), width=12)]
     else:
@@ -391,8 +448,9 @@ def update_session_section(_n):
             _metric_card("Avg Slippage", f"{avg_slip:.1f} bps" if avg_slip is not None else "—"),
         ]
 
-    # ── Equity curve ──────────────────────────────────────────────────────
-    history = fetch_portfolio_history(limit=720)
+    # ── Equity curve (retention-capped to 7d — portfolio table is purged at 7d) ─
+    eq_capped = hours > 24 * 7
+    history = fetch_portfolio_window(hours)
     if isinstance(history, DBOffline) or not history:
         equity_fig = _empty_fig("No portfolio history — start main.py to begin recording.")
     else:
@@ -404,7 +462,7 @@ def update_session_section(_n):
             x=ts_vals, y=eq_vals, mode="lines",
             line=dict(color="cyan", width=1.5),
             fill="tozeroy", fillcolor="rgba(0,200,200,0.15)",
-            hovertemplate="%{x|%H:%M:%S}<br>$%{y:,.2f}<extra></extra>",
+            hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
         ))
         equity_fig.add_hline(
             y=baseline,
@@ -413,8 +471,9 @@ def update_session_section(_n):
             annotation_position="top left",
             annotation_font=dict(size=10, color="rgba(255,255,255,0.5)"),
         )
+        eq_title = "Equity Curve — last 7d (retention cap)" if eq_capped else f"Equity Curve — last {window}"
         equity_fig.update_layout(
-            title=dict(text="Equity Curve", font=dict(size=13)),
+            title=dict(text=eq_title, font=dict(size=13)),
             template="plotly_dark",
             margin=dict(l=70, r=20, t=35, b=30),
             yaxis=dict(title="Equity (USDT)", tickformat="$,.0f"),
@@ -422,7 +481,39 @@ def update_session_section(_n):
             showlegend=False,
         )
 
-    return session_row, equity_fig
+    return session_row, header, equity_fig
+
+
+# ── PnL attribution by pattern (window-driven; cached per window) ──────────
+
+@callback(
+    Output("live-pnl-attr-chart", "figure"),
+    Input("live-interval", "n_intervals"),
+    Input("live-window", "value"),
+)
+def update_pnl_attribution(_n, window):
+    window = window or DEFAULT_WINDOW
+    hours = window_to_hours(window)
+    result = _cached(_PNL_CACHE, window, lambda: fetch_pnl_by_pattern(hours=hours))
+    if isinstance(result, DBOffline) or not result:
+        return _empty_fig("No closed-trade PnL yet")
+    pairs = sorted(result.items(), key=lambda kv: (kv[1] or 0.0))
+    patterns = [p for p, _ in pairs]
+    pnls     = [v or 0.0 for _, v in pairs]
+    colors   = ["rgba(0,200,80,0.85)" if v >= 0 else "rgba(220,60,60,0.85)" for v in pnls]
+    fig = go.Figure(go.Bar(
+        x=pnls, y=patterns, orientation="h", marker_color=colors,
+        hovertemplate="%{y}: $%{x:,.2f}<extra></extra>",
+    ))
+    fig.add_vline(x=0, line=dict(color="white", width=0.5))
+    fig.update_layout(
+        title=dict(text=f"PnL by Pattern — last {window}", font=dict(size=13)),
+        template="plotly_dark",
+        margin=dict(l=10, r=20, t=35, b=30),
+        xaxis=dict(title="PnL (USDT)", tickformat="$,.0f"),
+        showlegend=False,
+    )
+    return fig
 
 
 # ── Signal tape + funnel (push-driven from /ws/signals) ────────────────────
@@ -496,16 +587,16 @@ def render_signal_tape(_tick, _n):
 
 @callback(
     Output("live-funnel-table", "children"),
-    Input("live-signals-tick", "data"),       # push: refresh on each new event
-    Input("live-interval", "n_intervals"),     # fallback: 5 s poll if WS is offline
+    Output("live-funnel-header", "children"),
+    Input("live-signals-tick", "data"),        # push: refresh on each new event
+    Input("live-interval", "n_intervals"),      # fallback: 5 s poll if WS is offline
+    Input("live-window", "value"),
 )
-def refresh_funnel_table(_tick, _n):
-    global _FUNNEL_CACHE, _FUNNEL_CACHE_TS
-    now = time.time()
-    if _FUNNEL_CACHE is None or (now - _FUNNEL_CACHE_TS) >= _LIVE_STATS_TTL:
-        _FUNNEL_CACHE = fetch_signal_funnel(hours=24)
-        _FUNNEL_CACHE_TS = now
-    return _build_funnel_table(_FUNNEL_CACHE)
+def refresh_funnel_table(_tick, _n, window):
+    window = window or DEFAULT_WINDOW
+    hours = window_to_hours(window)
+    result = _cached(_FUNNEL_CACHE, window, lambda: fetch_signal_funnel(hours=hours))
+    return _build_funnel_table(result), f"Signal Funnel — last {window}"
 
 
 @callback(
@@ -591,3 +682,67 @@ def toggle_ks_modal(open_clicks, cancel_clicks, confirm_clicks, confirm_text, is
 )
 def validate_ks_confirm(value):
     return _validate_ks(value)
+
+
+# ── System panel: engine status chips + event log (folded in from /config) ─────
+
+def _build_engine_meta(engine_state: dict | None) -> html.Div:
+    if engine_state is None:
+        return dbc.Alert("Engine offline — start main.py first.", color="secondary", className="mb-0")
+
+    def _chip(label, value, color="secondary"):
+        return dbc.Col(dbc.Card([
+            dbc.CardBody([
+                html.P(label, className="text-muted mb-1 small"),
+                html.H5(dbc.Badge(value, color=color), className="mb-0"),
+            ], className="py-2 px-3"),
+        ], color="dark", outline=True), width="auto")
+
+    ks_active = engine_state.get("killswitch_active", False)
+    lob  = engine_state.get("lob_status", "—")
+    hb   = engine_state.get("heartbeat_status", "—")
+    tier = engine_state.get("risk_tier", "—")
+
+    return dbc.Row([
+        _chip("Engine", "KILLSWITCH" if ks_active else "ONLINE",
+              "danger" if ks_active else "success"),
+        _chip("LOB Status", lob,
+              "success" if lob == "SYNCED" else "warning"),
+        _chip("Heartbeat", hb,
+              "success" if hb == "OK" else ("warning" if hb == "WARN" else "danger")),
+        _chip("Risk Tier", tier,
+              "success" if tier in ("ACTIVE",) else ("warning" if tier in ("REDUCED", "MINIMAL") else "danger")),
+        _chip("Mode", "DRY RUN" if settings.DRY_RUN else "LIVE",
+              "warning" if settings.DRY_RUN else "danger"),
+    ], className="g-2")
+
+
+def _build_event_log(events) -> html.Div:
+    if isinstance(events, DBOffline):
+        return dbc.Alert("Registry DB offline — start main.py first.", color="secondary")
+    if not events:
+        return html.P("No system events recorded yet.", className="text-muted")
+    return dbc.Table([
+        html.Thead(html.Tr([html.Th("Timestamp"), html.Th("Event Type"), html.Th("Payload")])),
+        html.Tbody([
+            html.Tr([
+                html.Td((e.get("occurred_at") or "")[:19]),
+                html.Td(e.get("event_type", "—")),
+                html.Td(
+                    str(e.get("payload_json", ""))[:120],
+                    style={"fontFamily": "monospace", "fontSize": "0.8em"},
+                ),
+            ])
+            for e in events
+        ]),
+    ], striped=True, bordered=True, hover=True, size="sm")
+
+
+@callback(
+    Output("live-system-meta", "children"),
+    Output("live-system-event-log", "children"),
+    Input("engine-state-store", "data"),
+    Input("live-interval", "n_intervals"),
+)
+def update_system_panel(engine_state, _n):
+    return _build_engine_meta(engine_state), _build_event_log(fetch_system_events(limit=50))

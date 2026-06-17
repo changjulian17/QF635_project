@@ -337,6 +337,67 @@ async def check_issue9_cb_pause_blocks_gate3() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Check 10: Item 1 — LOB gap tolerance (frozen _lob_update_id reconnect storm)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def check_issue10_lob_gap_tolerance() -> bool:
+    """
+    Functional proof: feed _apply_depth_diff two diffs directly.
+      1. A small gap (under LOB_GAP_TOLERANCE_UPDATEIDS) — must be tolerated:
+         returns True and _lob_update_id advances to the new last_id.
+      2. A large gap (genuine corruption) — must still be rejected: returns
+         False and _lob_update_id is left unchanged (counts toward debounce).
+
+    PASS: small gap tolerated + advances state; large gap still rejected.
+    FAIL: either small gap is rejected (reconnect storm) or large gap is
+          silently tolerated (corruption masked).
+    """
+    from config import settings as cfg
+    from models import SharedState
+    from core.ws_consumer import BinanceWebSocketConsumer
+
+    consumer = BinanceWebSocketConsumer(
+        shared_state=SharedState(),
+        streams=["btcusdt@depth@500ms"],
+    )
+    consumer._lob_update_id = 1000
+
+    small_gap = cfg.LOB_GAP_TOLERANCE_UPDATEIDS - 1
+    small_diff = {"U": 1000 + small_gap + 1, "u": 1000 + small_gap + 50, "b": [], "a": []}
+    small_ok = consumer._apply_depth_diff(small_diff)
+    advanced = consumer._lob_update_id == small_diff["u"]
+
+    if not small_ok or not advanced:
+        return _result(
+            "Issue 10 — LOB gap tolerance", False,
+            f"Small gap ({small_gap} IDs, under tolerance={cfg.LOB_GAP_TOLERANCE_UPDATEIDS}) "
+            f"returned {small_ok} (expected True) and _lob_update_id={consumer._lob_update_id} "
+            f"(expected {small_diff['u']}) — frozen update-id reconnect storm still present"
+        )
+
+    pre_large_id = consumer._lob_update_id
+    large_gap = cfg.LOB_GAP_TOLERANCE_UPDATEIDS + 4000
+    large_diff = {"U": pre_large_id + large_gap + 1, "u": pre_large_id + large_gap + 50, "b": [], "a": []}
+    large_ok = consumer._apply_depth_diff(large_diff)
+    unchanged = consumer._lob_update_id == pre_large_id
+
+    if large_ok or not unchanged:
+        return _result(
+            "Issue 10 — LOB gap tolerance", False,
+            f"Large gap ({large_gap} IDs, over tolerance) returned {large_ok} "
+            f"(expected False) and _lob_update_id={consumer._lob_update_id} "
+            f"(expected unchanged={pre_large_id}) — genuine corruption no longer detected"
+        )
+
+    return _result(
+        "Issue 10 — LOB gap tolerance", True,
+        f"Small gap ({small_gap} IDs) tolerated and advanced state; "
+        f"large gap ({large_gap} IDs) still rejected — reconnect storm fixed "
+        "without masking genuine corruption"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -361,6 +422,9 @@ async def main() -> int:
 
     print("\nCheck 9 — Issue 9: CB PAUSE tier propagation to Gate3")
     results.append(await check_issue9_cb_pause_blocks_gate3())
+
+    print("\nCheck 10 — Item 1: LOB gap tolerance (frozen update-id reconnect storm)")
+    results.append(await check_issue10_lob_gap_tolerance())
 
     passed = sum(results)
     total  = len(results)

@@ -186,12 +186,15 @@ def test_gate5_fails_on_stale_signal():
     assert "stale" in reason.lower()
 
 
-def test_gate5_fails_on_high_latency():
+def test_gate5_fails_on_high_latency(monkeypatch):
+    from config import settings as s
+    monkeypatch.setattr(s, "HEARTBEAT_CRITICAL_MS", 500)
     ok, reason = gate_5_execution_sync(
         signal_timestamp_ms=int(time.time() * 1000),
         last_delta_ms=600.0,
     )
     assert ok is False
+    assert "latency" in reason.lower()
 
 
 def test_gate5_passes_fresh_signal():
@@ -310,6 +313,45 @@ def test_gate6_watch_starts_monitor_after_fill():
     asyncio.run(_run())
 
 
+def test_evaluate_cancels_prior_gate6_task_before_starting_new():
+    """A stale Gate6 task from a prior signal must be cancelled before a new one starts —
+    there must never be a window with two live monitors for different signals."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        class _MockLOB:
+            async def get_current_walls(self, sigma=2.5):
+                return [{"price": 30000.0}]   # wall present — stale task would run forever
+
+        class _MockOM:
+            async def handle_protection_wall_removed(self, side):
+                pass
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+            lob_engine=_MockLOB(),
+            order_manager=_MockOM(),
+            gate6_check_interval_ms=5,
+        )
+
+        stale = asyncio.create_task(asyncio.sleep(10))
+        ex._gate6_tasks.add(stale)
+
+        await ex._evaluate(_signal())
+
+        assert stale.cancelled(), "stale Gate6 task must be cancelled before a new one starts"
+        assert stale not in ex._gate6_tasks, "stale task must be removed from the tracking set"
+
+    asyncio.run(_run())
+
+
 def test_gate6_monitor_stops_on_position_closed():
     """Monitor must exit cleanly without firing the wall alert when position closes normally."""
     async def _run():
@@ -338,6 +380,74 @@ def test_gate6_monitor_stops_on_position_closed():
 
         assert task.done(), "monitor should have stopped after position closed"
         assert not _MockOM.alerted, "should not alert order_manager on normal position exit"
+
+    asyncio.run(_run())
+
+
+def test_gate6_requires_consecutive_absence():
+    """A single wall-absent check must not fire — only GATE6_WALL_ABSENT_CONSEC consecutive misses."""
+    async def _run():
+        calls = {"n": 0}
+
+        class _MockLOB:
+            async def get_current_walls(self, sigma=2.5):
+                calls["n"] += 1
+                # absent on the first check, present on every subsequent check —
+                # a flicker that must not accumulate toward the threshold.
+                return [] if calls["n"] == 1 else [{"price": 30000.0}]
+
+        class _MockOM:
+            alerted = False
+            async def handle_protection_wall_removed(self, side):
+                _MockOM.alerted = True
+
+        closed_event = asyncio.Event()
+        task = asyncio.create_task(
+            PersistenceMonitor().monitor(
+                protection_wall_price=30000.0,
+                position_side="LONG",
+                lob_engine=_MockLOB(),
+                order_manager=_MockOM(),
+                position_closed_event=closed_event,
+                check_interval_ms=5,
+            )
+        )
+        await asyncio.sleep(0.05)   # several polling cycles
+        closed_event.set()
+        await asyncio.sleep(0.02)
+
+        assert not _MockOM.alerted, "single absent check must not trigger wall-removed alert"
+        task.cancel()
+
+    asyncio.run(_run())
+
+
+def test_gate6_fires_after_consecutive_absence():
+    """GATE6_WALL_ABSENT_CONSEC consecutive misses must fire the alert exactly once."""
+    async def _run():
+        class _MockLOB:
+            async def get_current_walls(self, sigma=2.5):
+                return []   # always absent
+
+        class _MockOM:
+            alert_count = 0
+            async def handle_protection_wall_removed(self, side):
+                _MockOM.alert_count += 1
+
+        closed_event = asyncio.Event()
+        await PersistenceMonitor().monitor(
+            protection_wall_price=30000.0,
+            position_side="LONG",
+            lob_engine=_MockLOB(),
+            order_manager=_MockOM(),
+            position_closed_event=closed_event,
+            check_interval_ms=5,
+        )
+
+        assert _MockOM.alert_count == 1, (
+            f"expected exactly one alert after {settings.GATE6_WALL_ABSENT_CONSEC} "
+            f"consecutive misses, got {_MockOM.alert_count}"
+        )
 
     asyncio.run(_run())
 

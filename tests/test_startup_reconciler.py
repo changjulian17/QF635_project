@@ -4,12 +4,15 @@ import json
 import os
 import sqlite3
 import tempfile
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import engine.db_writer as db_writer_module
 from core.startup_reconciler import _write_event, reconcile_on_startup
 from models import Direction, PortfolioState, Position
+from risk.engine import RiskEngine
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -371,3 +374,157 @@ def test_s5_dry_run_event_written(tmp_path):
     assert len(rows) == 1
     payload = json.loads(rows[0][0])
     assert "errors" in payload
+
+
+# ── reconcile_on_startup — S6: restore consecutive-loss cooldown ────────────
+
+def _seed_engine_health(db_path, consecutive_losses, cooldown_until_ms):
+    conn = sqlite3.connect(db_path)
+    conn.execute("""CREATE TABLE IF NOT EXISTS engine_health (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        lob_status TEXT, hb_status TEXT, risk_tier TEXT, ks_active INTEGER,
+        updated_ms INTEGER, consecutive_losses INTEGER DEFAULT 0,
+        cooldown_until_ms INTEGER
+    )""")
+    conn.execute(
+        "INSERT INTO engine_health VALUES (1, 'SYNCED', 'OK', 'PASSIVE', 0, 0, ?, ?)",
+        (consecutive_losses, cooldown_until_ms),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_s6_restores_active_cooldown_blocks_gate3(tmp_path, monkeypatch):
+    registry_db = str(tmp_path / "registry.db")
+    health_db = str(tmp_path / "cryptosentinel.db")
+    monkeypatch.setattr(db_writer_module, "DB_PATH", health_db)
+
+    cooldown_until_ms = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp() * 1000)
+    _seed_engine_health(health_db, consecutive_losses=3, cooldown_until_ms=cooldown_until_ms)
+
+    client = _make_client()
+    portfolio = _make_portfolio()
+    risk_engine = RiskEngine(portfolio)
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.REGISTRY_DB = registry_db
+        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    assert portfolio.consecutive_losses == 3
+    assert risk_engine.sync_tier() == "PASSIVE"
+
+
+def test_s6_restores_expired_cooldown_still_paused_until_a_win(tmp_path, monkeypatch):
+    registry_db = str(tmp_path / "registry.db")
+    health_db = str(tmp_path / "cryptosentinel.db")
+    monkeypatch.setattr(db_writer_module, "DB_PATH", health_db)
+
+    cooldown_until_ms = int((datetime.now(timezone.utc) - timedelta(seconds=60)).timestamp() * 1000)
+    _seed_engine_health(health_db, consecutive_losses=3, cooldown_until_ms=cooldown_until_ms)
+
+    client = _make_client()
+    portfolio = _make_portfolio()
+    risk_engine = RiskEngine(portfolio)
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.REGISTRY_DB = registry_db
+        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    # Expired cooldown does not forgive an active loss streak — re-enters PASSIVE
+    # with a freshly-extended cooldown (mirrors risk/engine.py:101-106).
+    assert risk_engine.sync_tier() == "PASSIVE"
+
+    risk_engine.record_trade_result(1.0)  # win resets consecutive_losses to 0
+    risk_engine._cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)  # let cooldown lapse
+    assert risk_engine.sync_tier() == "FULL"
+
+
+def test_s6_missing_engine_health_row_defaults_to_full(tmp_path, monkeypatch):
+    registry_db = str(tmp_path / "registry.db")
+    health_db = str(tmp_path / "cryptosentinel.db")
+    monkeypatch.setattr(db_writer_module, "DB_PATH", health_db)
+    # Fresh DB — no engine_health row at all.
+
+    client = _make_client()
+    portfolio = _make_portfolio()
+    risk_engine = RiskEngine(portfolio)
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN = False
+        mock_settings.REGISTRY_DB = registry_db
+        asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    assert portfolio.consecutive_losses == 0
+    assert risk_engine.cooldown_until is None
+    assert risk_engine.sync_tier() == "FULL"
+
+
+# ── reconcile_on_startup — S7: orphan position detection ─────────────────────
+
+def test_s7_detects_orphan_position(tmp_path, monkeypatch):
+    """S7 calls futures_account() and sets has_orphan_position when positionAmt != 0."""
+    registry_db = str(tmp_path / "registry.db")
+    health_db   = str(tmp_path / "cryptosentinel.db")
+    monkeypatch.setattr(db_writer_module, "DB_PATH", health_db)
+
+    client = _make_client()
+    client.futures_account = AsyncMock(return_value={
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": "0.012"}]
+    })
+    portfolio   = _make_portfolio()
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN      = False
+        mock_settings.REGISTRY_DB  = registry_db
+        mock_settings.QTY_STEP_SIZE = 0.001
+        result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    assert result["has_orphan_position"] is True
+    assert abs(result["orphan_position_qty"] - 0.012) < 1e-9
+
+
+def test_s7_no_orphan_when_flat(tmp_path, monkeypatch):
+    """S7 sets has_orphan_position=False when positionAmt is zero."""
+    registry_db = str(tmp_path / "registry.db")
+    health_db   = str(tmp_path / "cryptosentinel.db")
+    monkeypatch.setattr(db_writer_module, "DB_PATH", health_db)
+
+    client = _make_client()
+    client.futures_account = AsyncMock(return_value={
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": "0.000"}]
+    })
+    portfolio   = _make_portfolio()
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN       = False
+        mock_settings.REGISTRY_DB   = registry_db
+        mock_settings.QTY_STEP_SIZE = 0.001
+        result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    assert result["has_orphan_position"] is False
+    assert "orphan_position_qty" not in result
+
+
+def test_s7_api_failure_does_not_block_startup(tmp_path, monkeypatch):
+    """S7 API failure is captured in errors; reconcile completes with has_orphan_position=False."""
+    registry_db = str(tmp_path / "registry.db")
+    health_db   = str(tmp_path / "cryptosentinel.db")
+    monkeypatch.setattr(db_writer_module, "DB_PATH", health_db)
+
+    client = _make_client()
+    client.futures_account = AsyncMock(side_effect=RuntimeError("network error"))
+    portfolio   = _make_portfolio()
+    risk_engine = _make_risk_engine()
+
+    with patch("core.startup_reconciler.settings") as mock_settings:
+        mock_settings.DRY_RUN       = False
+        mock_settings.REGISTRY_DB   = registry_db
+        mock_settings.QTY_STEP_SIZE = 0.001
+        result = asyncio.run(reconcile_on_startup(client, portfolio, risk_engine))
+
+    assert result["has_orphan_position"] is False
+    assert any("orphan_position_check" in e for e in result["errors"])

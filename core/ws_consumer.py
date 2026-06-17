@@ -329,9 +329,15 @@ class BinanceWebSocketConsumer:
             return True
 
         if self._lob_update_id > 0 and first_id > 0 and first_id > self._lob_update_id + 1:
-            logger.warning("[WS] LOB GAP DETECTED: expected %d, got %d", self._lob_update_id + 1, first_id)
-            return False
-        
+            gap = first_id - (self._lob_update_id + 1)
+            if gap < settings.LOB_GAP_TOLERANCE_UPDATEIDS:
+                logger.debug("[WS] LOB small gap (%d IDs) — applying and advancing", gap)
+                # fall through — diff is applied below, _lob_update_id advances normally
+            else:
+                logger.warning("[WS] LOB GAP DETECTED: expected %d, got %d (gap=%d)",
+                               self._lob_update_id + 1, first_id, gap)
+                return False
+
         if last_id <= self._lob_update_id:
             return True
 

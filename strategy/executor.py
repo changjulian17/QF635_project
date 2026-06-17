@@ -174,6 +174,7 @@ class PersistenceMonitor:
     ) -> None:
         interval = check_interval_ms / 1000.0
         started_ms = int(time.time() * 1000)
+        wall_absent_count = 0
         while True:
             # Race the poll interval against position-closed. If the position exits
             # normally (TP/SL), stop quietly without firing the wall-removed alert.
@@ -222,13 +223,22 @@ class PersistenceMonitor:
 
             walls = await lob_engine.get_current_walls(sigma=settings.LOB_WALL_SIGMA)
             if not _wall_present(protection_wall_price, walls):
-                logger.warning(
-                    "[Gate6] Protection wall at %.2f removed — alerting order manager",
-                    protection_wall_price,
-                )
-                if hasattr(order_manager, "handle_protection_wall_removed"):
-                    await order_manager.handle_protection_wall_removed(position_side)
-                return
+                wall_absent_count += 1
+                if wall_absent_count < settings.GATE6_WALL_ABSENT_CONSEC:
+                    logger.debug(
+                        "[Gate6] Wall absent %d/%d checks — waiting for confirmation",
+                        wall_absent_count, settings.GATE6_WALL_ABSENT_CONSEC,
+                    )
+                else:
+                    logger.warning(
+                        "[Gate6] Protection wall at %.2f removed (confirmed over %d checks)",
+                        protection_wall_price, wall_absent_count,
+                    )
+                    if hasattr(order_manager, "handle_protection_wall_removed"):
+                        await order_manager.handle_protection_wall_removed(position_side)
+                    return
+            else:
+                wall_absent_count = 0   # explicit reset — flicker must not accumulate
 
 
 # ── Null CVD fallback ─────────────────────────────────────────────────────────
@@ -358,7 +368,13 @@ class StrategyExecutor:
     async def run(self) -> None:
         while True:
             signal: MicroSignal = await self._micro_q.get()
-            await self._evaluate(signal)
+            try:
+                await self._evaluate(signal)
+            except Exception as exc:
+                logger.critical(
+                    "[Executor] Unhandled exception in _evaluate — signal dropped: %s",
+                    exc, exc_info=True,
+                )
 
     async def _evaluate(self, signal: MicroSignal) -> None:
         rec = SignalRecord(
@@ -572,6 +588,12 @@ class StrategyExecutor:
         # Gate 6 — watch for fill confirmation, then start persistence monitor.
         # Guard at call site: no task is created when Gate 6 deps are absent.
         if self._lob_engine and self._order_manager and signal.protection_wall:
+            if self._gate6_tasks:
+                stale = list(self._gate6_tasks)
+                for t in stale:
+                    t.cancel()
+                await asyncio.gather(*stale, return_exceptions=True)
+                self._gate6_tasks.clear()
             watch = asyncio.create_task(
                 self._gate6_watch(
                     fill_event=order_req.fill_event,

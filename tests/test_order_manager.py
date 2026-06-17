@@ -114,11 +114,11 @@ async def test_futures_fill_avg_price_used_for_fill_price():
 
 @pytest.mark.asyncio
 async def test_long_limit_price_formula():
-    """LONG: limit_price = best_ask + 0.5 × spread, stored in FillDetail.limit_price."""
+    """LONG: limit_price = best_ask + 0.25 × spread, stored in FillDetail.limit_price."""
     om, _, fill_q, _ = _make_manager()
     req = _make_req("LONG")
     best_bid, best_ask = 95_000.0, 95_010.0
-    expected_limit = round(best_ask + (best_ask - best_bid) * 0.5, 2)  # 95_015.0
+    expected_limit = round(best_ask + (best_ask - best_bid) * 0.25, 2)  # 95_012.5
 
     with patch.object(settings, "DRY_RUN", True):
         await om._submit_aggressive_limit(req, "BUY", best_bid, best_ask)
@@ -131,17 +131,44 @@ async def test_long_limit_price_formula():
 
 @pytest.mark.asyncio
 async def test_short_limit_price_formula():
-    """SHORT: limit_price = best_bid - 0.5 × spread."""
+    """SHORT: limit_price = best_bid - 0.25 × spread."""
     om, _, fill_q, _ = _make_manager()
     req = _make_req("SHORT")
     best_bid, best_ask = 95_000.0, 95_010.0
-    expected_limit = round(best_bid - (best_ask - best_bid) * 0.5, 2)  # 94_995.0
+    expected_limit = round(best_bid - (best_ask - best_bid) * 0.25, 2)  # 94_997.5
 
     with patch.object(settings, "DRY_RUN", True):
         await om._submit_aggressive_limit(req, "SELL", best_bid, best_ask)
 
     fill: FillDetail = fill_q.get_nowait()
     assert fill.limit_price == pytest.approx(expected_limit)
+
+
+# ── 2b. _emergency_close uses the same 0.25 overshoot fraction ───────────────
+
+@pytest.mark.asyncio
+async def test_emergency_close_long_close_price_formula():
+    """Closing a LONG (SELL) crosses down: close_price = best_bid - 0.25 × spread."""
+    om, _, _, _ = _make_manager()
+    best_bid, best_ask = 95_000.0, 95_010.0
+    expected_close = round(best_bid - (best_ask - best_bid) * 0.25, 2)  # 94_997.5
+
+    om._client = AsyncMock()
+    om._client.futures_order_book = AsyncMock(
+        return_value={"bids": [[str(best_bid), "1.0"]], "asks": [[str(best_ask), "1.0"]]}
+    )
+    om._client.futures_create_order = AsyncMock(
+        return_value={"orderId": "1", "status": "FILLED", "executedQty": "0.001"}
+    )
+
+    with patch.object(settings, "DRY_RUN", False), \
+         patch.object(settings, "BINANCE_DEMO", False):
+        closed, close_price = await om._emergency_close(0.001, entry_side="BUY", reason="TEST")
+
+    assert closed is True
+    assert close_price == pytest.approx(expected_close)
+    _, kwargs = om._client.futures_create_order.call_args
+    assert kwargs["price"] == str(round(expected_close, 1))
 
 
 # ── 3. IOC expired → None, no side-effects ───────────────────────────────────
@@ -940,3 +967,131 @@ async def test_demo_bracket_omits_reduce_only():
     assert om._client.futures_create_order.call_count == 0, (
         "BINANCE_DEMO must skip bracket placement entirely (algoId vs orderId incompatibility)"
     )
+
+
+# ── Software TP/SL monitor (BINANCE_DEMO) ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_tp_sl_monitor_closes_on_tp_touch():
+    """Mid price touching the TP target triggers an emergency close with TP_SL_TOUCH."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))  # mid=96015 >= tp
+    closed_event = asyncio.Event()
+    om._open_signal_id        = "sig-tp"
+    om._open_tp_price         = 96_000.0
+    om._open_sl_price         = 94_000.0
+    om._cancel_bracket_orders = AsyncMock()
+
+    close_calls: list = []
+    async def spy_close(qty, side, reason):
+        close_calls.append((qty, side, reason))
+        return True, 96_015.0
+    om._emergency_close = spy_close
+
+    outcomes: list = []
+    om._record_outcome = lambda *a, **kw: outcomes.append(a)
+
+    await om._watch_tp_sl(
+        position_side="BUY", fill_qty=0.001, signal_id="sig-tp",
+        entry_price=95_000.0, entry_time=time.monotonic(),
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    )
+
+    assert len(close_calls) == 1
+    assert close_calls[0][2] == "TP_SL_TOUCH"
+    assert closed_event.is_set()
+    assert len(outcomes) == 1
+
+
+@pytest.mark.asyncio
+async def test_tp_sl_monitor_exits_cleanly_on_external_close():
+    """If position_closed_event is already set (Gate6/bracket closed first), no close fires."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))  # touched price
+    closed_event = asyncio.Event()
+    closed_event.set()
+    om._open_tp_price = 96_000.0
+    om._open_sl_price = 94_000.0
+
+    close_calls: list = []
+    async def spy_close(qty, side, reason):
+        close_calls.append((qty, side, reason))
+        return True, 96_015.0
+    om._emergency_close = spy_close
+
+    await om._watch_tp_sl(
+        position_side="BUY", fill_qty=0.001, signal_id="sig-ext",
+        entry_price=95_000.0, entry_time=time.monotonic(),
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    )
+
+    assert not close_calls
+
+
+@pytest.mark.asyncio
+async def test_tp_sl_monitor_defers_while_placing_oco():
+    """While a bracket placement is in flight, the monitor must not start its own close."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))  # touched price
+    closed_event = asyncio.Event()
+    om._open_tp_price = 96_000.0
+    om._open_sl_price = 94_000.0
+    om._placing_oco   = True
+
+    close_calls: list = []
+    async def spy_close(qty, side, reason):
+        close_calls.append((qty, side, reason))
+        return True, 96_015.0
+    om._emergency_close = spy_close
+
+    task = asyncio.create_task(om._watch_tp_sl(
+        position_side="BUY", fill_qty=0.001, signal_id="sig-defer",
+        entry_price=95_000.0, entry_time=time.monotonic(),
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    ))
+    await asyncio.sleep(0.05)   # let it poll several times while the flag is True
+    assert not close_calls
+    assert not closed_event.is_set()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_tp_sl_monitor_skips_when_emergency_close_in_progress():
+    """If another path already started an emergency close, the monitor must not start a second one."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))  # touched price
+    closed_event = asyncio.Event()
+    om._open_tp_price                 = 96_000.0
+    om._open_sl_price                 = 94_000.0
+    om._emergency_close_in_progress   = True
+
+    close_calls: list = []
+    async def spy_close(qty, side, reason):
+        close_calls.append((qty, side, reason))
+        return True, 96_015.0
+    om._emergency_close = spy_close
+
+    task = asyncio.create_task(om._watch_tp_sl(
+        position_side="BUY", fill_qty=0.001, signal_id="sig-skip",
+        entry_price=95_000.0, entry_time=time.monotonic(),
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    ))
+    await asyncio.sleep(0.05)
+    assert not close_calls
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_tp_sl_monitor_not_started_when_not_demo():
+    """The software TP/SL monitor must only run when BINANCE_DEMO=True."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
+    req = _make_req("LONG")
+
+    with patch.object(settings, "DRY_RUN", True), \
+         patch.object(settings, "BINANCE_DEMO", False):
+        await om._submit(req)
+
+    assert om._open_position_qty > 0
+    assert om._tp_sl_monitor_task is None

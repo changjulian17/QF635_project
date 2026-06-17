@@ -104,9 +104,11 @@ class Settings(BaseSettings):
     MICRO_EXIT_SPREAD_HARD_CAP_BPS: float = 12.0
     LOB_FRESH_WALL_MS: int = 3_000    # protection wall must appear within this window
     LOB_STALE_WALL_MS: int = 30_000   # prune wall states not seen for this long
+    GATE6_WALL_ABSENT_CONSEC: int = 2  # require N consecutive misses before firing wall-removed
 
     # LOB gap handling
     LOB_GAP_RECONNECT_MIN_CONSECUTIVE: int = 3  # reconnect only after this many consecutive gaps
+    LOB_GAP_TOLERANCE_UPDATEIDS: int = 1000     # tolerate batching gaps under this size without reconnect
 
     # Heartbeat monitor (§4)
     HEARTBEAT_WARN_MS: int = 200

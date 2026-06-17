@@ -431,6 +431,11 @@ async def _health_writer(
                 hb_status=shared_state.heartbeat_status,
                 risk_tier=risk_engine.tier.name,
                 ks_active=killswitch.is_active,
+                consecutive_losses=risk_engine.portfolio.consecutive_losses,
+                cooldown_until_ms=(
+                    int(risk_engine.cooldown_until.timestamp() * 1000)
+                    if risk_engine.cooldown_until else None
+                ),
             )
         except Exception:
             pass  # non-critical; dashboard falls back to stale badge gracefully
@@ -610,8 +615,14 @@ async def main() -> None:
 
     # 3. Reconcile on startup — BEFORE starting any coroutines ────────────────
     if client is not None:
-        await reconcile_on_startup(client, portfolio, risk_engine, symbol=SYMBOL)
+        reconcile_result = await reconcile_on_startup(client, portfolio, risk_engine, symbol=SYMBOL)
         await _backfill_feature_candles(client, feature_computer)
+        if reconcile_result.get("has_orphan_position"):
+            pos_amt = reconcile_result["orphan_position_qty"]
+            await order_manager.close_orphan_position(
+                qty=abs(pos_amt),
+                side="BUY" if pos_amt > 0 else "SELL",
+            )
     else:
         logger.info("[Main] Skipping reconciliation — no Binance client")
 
@@ -621,6 +632,11 @@ async def main() -> None:
     actual_equity = portfolio.equity
     if actual_equity > 0:
         killswitch.update_dov(actual_equity)
+        if killswitch.check_budget(portfolio.daily_pnl, 0.0):
+            logger.critical(
+                "[Main] KS-1 re-fired at startup — daily budget already blown (pnl=%.2f)",
+                portfolio.daily_pnl,
+            )
         budget.rebase(actual_equity)
         logger.info(
             "[Main] Risk limits rebased to actual equity=%.2f "

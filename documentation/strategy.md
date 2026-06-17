@@ -1,6 +1,6 @@
 # Strategy Documentation
 
-CryptoSentinel v3.0 is a level-specific market microstructure strategy for BTCUSDT on Binance Spot Testnet. It is built around one core idea: price moves when aggressive order flow consumes persistent resting liquidity at specific order-book levels, and the highest-quality entries occur when that consumption is followed by fresh protective liquidity behind the breakout.
+CryptoSentinel v3.1 is a level-specific market microstructure strategy for the BTCUSDT USD-M perpetual on Binance Futures. It is built around one core idea: price moves when aggressive order flow consumes persistent resting liquidity at specific order-book levels, and the highest-quality entries occur when that consumption is followed by fresh protective liquidity behind the breakout.
 
 This document reflects the current project implementation. It should be treated as a living reference and updated as the strategy, model, and execution stack evolve.
 
@@ -97,7 +97,7 @@ flowchart LR
     EXEC --> RISK[Risk / budget checks]
     RISK --> OREQ[MicroOrderRequest]
     OREQ --> OM[OrderManager]
-    OM --> BN[Binance Spot Testnet]
+    OM --> BN[Binance USD-M Futures]
 ```
 
 ## Gate Rationale

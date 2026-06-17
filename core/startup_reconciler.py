@@ -46,6 +46,7 @@ async def reconcile_on_startup(
         "actual_equity":        0.0,
         "reconciled_positions": 0,
         "restored_pnl":         0.0,
+        "has_orphan_position":  False,
         "errors":               [],
     }
 
@@ -97,6 +98,33 @@ async def reconcile_on_startup(
         result["errors"].append(f"restore_pnl: {exc}")
         logger.warning("[Reconcile] Could not restore PnL: %s", exc)
 
+    # S6 — restore consecutive-loss cooldown state from engine_health
+    try:
+        import engine.db_writer as db_writer_module
+
+        conn = sqlite3.connect(db_writer_module.DB_PATH)
+        row = conn.execute(
+            "SELECT consecutive_losses, cooldown_until_ms FROM engine_health WHERE id = 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            consecutive_losses, cooldown_until_ms = row
+            portfolio.consecutive_losses = consecutive_losses or 0
+            risk_engine._cooldown_until = (
+                datetime.fromtimestamp(cooldown_until_ms / 1000, tz=timezone.utc)
+                if cooldown_until_ms else None
+            )
+            result["restored_consecutive_losses"] = portfolio.consecutive_losses
+            logger.info(
+                "[Reconcile] Restored consecutive_losses=%d cooldown_until=%s",
+                portfolio.consecutive_losses, risk_engine._cooldown_until,
+            )
+        else:
+            logger.warning("[Reconcile] No engine_health row found — consecutive-loss state defaults to 0")
+    except Exception as exc:
+        result["errors"].append(f"restore_cooldown: {exc}")
+        logger.warning("[Reconcile] Could not restore consecutive-loss cooldown: %s", exc)
+
     # Set equity from real account.
     # result["actual_equity"] defaults to 0.0 if S2 failed, so this never raises.
     # result["restored_pnl"] defaults to 0.0 if S4 failed.
@@ -131,6 +159,29 @@ async def reconcile_on_startup(
                 order.get("side"), order.get("symbol"),
                 order.get("origQty"), order.get("price"),
             )
+
+    # S7 — detect orphan exchange position (BINANCE_DEMO never places brackets,
+    # so S3's open_orders check always sees empty — a live position is invisible to it).
+    try:
+        account_detail = await asyncio.wait_for(client.futures_account(), timeout=30.0)
+        btc_pos = next(
+            (p for p in account_detail.get("positions", []) if p["symbol"] == symbol),
+            None,
+        )
+        pos_amt = float(btc_pos.get("positionAmt", "0")) if btc_pos else 0.0
+        if abs(pos_amt) >= settings.QTY_STEP_SIZE:
+            result["orphan_position_qty"] = pos_amt
+            result["has_orphan_position"] = True
+            logger.critical(
+                "[Reconcile] ORPHAN POSITION DETECTED: positionAmt=%.6f — "
+                "will close before trading resumes", pos_amt
+            )
+        else:
+            result["has_orphan_position"] = False
+    except Exception as exc:
+        result["errors"].append(f"orphan_position_check: {exc}")
+        result["has_orphan_position"] = False
+        logger.warning("[Reconcile] Could not check for orphan position: %s", exc)
 
     # S5 — write STARTUP_RECONCILIATION event
     _write_event("STARTUP_RECONCILIATION", result)

@@ -1,6 +1,8 @@
 # Trading Algorithm Documentation
 
-CryptoSentinel v3.0 runs a live, event-driven microstructure algorithm for BTCUSDT on Binance Spot Testnet. The algorithm starts from reconstructed limit-order-book ticks, detects level-specific wall interaction, evaluates each candidate through the execution gates, and submits an IOC aggressive limit order only after the live book, confidence, capital, spread, and latency checks pass.
+CryptoSentinel v3.1 runs a live, event-driven microstructure algorithm for the BTCUSDT USD-M perpetual on Binance Futures. The algorithm starts from reconstructed limit-order-book ticks, detects level-specific wall interaction, evaluates each candidate through the execution gates, and submits an IOC aggressive limit order only after the live book, confidence, capital, spread, and latency checks pass.
+
+The execution venue (futures testnet, demo.binance.com, or live Binance Futures) is selected by a single `TRADING_MODE` setting, which applies a preset of WebSocket/REST endpoints and heartbeat thresholds at startup.
 
 This document focuses on the current live microstructure path. The legacy chart-pattern execution pipeline is disabled in live startup; candle data now feeds `FeatureComputer` directly for model context.
 
@@ -8,23 +10,23 @@ This document focuses on the current live microstructure path. The legacy chart-
 
 The live algorithm is organized as an asyncio task graph:
 
-1. `BinanceWebSocketConsumer` receives depth, trade, and candle streams from the testnet WebSocket.
+1. Two `BinanceWebSocketConsumer` instances receive market data: a **price consumer** (`bookTicker` + `aggTrade`) and a **LOB consumer** (`depth@500ms` + `kline_{TIMEFRAME}`). Splitting the streams isolates the high-rate depth feed and lets the heartbeat monitor apply a separate `HEARTBEAT_LOB_CRITICAL_MS` budget to it.
 2. `UserDataStreamConsumer` maintains the Binance user data stream (listenKey lifecycle) and dispatches `executionReport` events to `OrderManager` for fill tracking.
 3. `_depth_fanout()` sends each reconstructed depth snapshot to both `LocalOrderBook` and `MicrostructureDetector`.
 4. `LocalOrderBook` maintains the shared synced book used for top-of-book reads, wall persistence checks, and dashboard snapshots.
 5. `_feature_candle_loop()` feeds closed candles into `FeatureComputer`.
 6. `MicrostructureDetector` tracks liquidity walls, absorption, and sweep-with-protection events while updating order-book features.
 7. `StrategyExecutor` evaluates each `MicroSignal` through Gates 0-5 and emits a `MicroOrderRequest` when approved.
-8. `OrderManager` resolves the current book, submits an IOC aggressive limit entry, places an OCO bracket after fill in live mode, and records fill/outcome telemetry.
+8. `OrderManager` resolves the current book, submits an IOC aggressive limit entry on Binance USD-M Futures, places a reduce-only TP/SL bracket after fill in live mode, and records fill/outcome telemetry.
 9. Gate 6 monitors the protection wall after fill and can trigger an early safety exit.
 10. `AlertDispatcher` sends webhook notifications on killswitch events and risk-tier changes (fire-and-forget, errors suppressed).
 11. `RealtimeHub` broadcasts LOB snapshots, portfolio state, and signal events over `/ws/lob`, `/ws/portfolio`, and `/ws/signals` WebSocket endpoints to the Dash dashboard.
 
 ```mermaid
 flowchart TD
-    WS[BinanceWebSocketConsumer] --> RAW[raw_depth_queue]
-    WS --> TRADES[trade_queue]
-    WS --> CANDLES[candle_queue]
+    LOBWS[LOB consumer<br/>depth@500ms + kline] --> RAW[raw_depth_queue]
+    LOBWS --> CANDLES[candle_queue]
+    PRICEWS[Price consumer<br/>bookTicker + aggTrade] --> TRADES[trade_queue]
     UDS[UserDataStreamConsumer] --> EXEC_REPORT[executionReport callback]
 
     RAW --> FANOUT[_depth_fanout]
@@ -50,7 +52,7 @@ flowchart TD
     EXEC -->|rejected/approved telemetry| TELEM[SignalTelemetry]
     OMQ --> OM[OrderManager]
     EXEC_REPORT --> OM
-    OM --> TESTNET[Binance Spot Testnet]
+    OM --> FUTURES[Binance USD-M Futures]
     OM --> FILLS[fill_queue]
     FILLS --> FILLPROC[fill_processor]
     FILLPROC --> TELEM
@@ -83,7 +85,7 @@ Absorption arms a wall but does not submit a trade. Sweep with protection create
 
 ```mermaid
 sequenceDiagram
-    participant WS as BinanceWebSocketConsumer
+    participant WS as WS consumers (price + LOB)
     participant UDS as UserDataStreamConsumer
     participant Fanout as depth_fanout
     participant LOB as LocalOrderBook
@@ -130,7 +132,7 @@ The approved request includes the original `MicroSignal`, side (`BUY` for long, 
 
 - Reject new requests during shutdown.
 - Discard requests when the global killswitch is active.
-- Discard requests when an entry, OCO placement, open position, or emergency close is already active.
+- Discard requests when an entry, bracket placement, open position, or emergency close is already active.
 - Re-check signal staleness immediately before submission.
 - Resolve the best bid/ask from the injected local-book callback when available, falling back to REST or dry-run synthetic prices when configured.
 
@@ -147,19 +149,19 @@ On fill, the order manager:
 3. Emits a `FillDetail` to `fill_queue`.
 4. Sets the request's `fill_event`, which allows Gate 6 monitoring to start.
 5. Stores open-position state under a position lock.
-6. Places an OCO bracket when not in dry-run mode.
+6. Places a reduce-only TP/SL bracket when not in dry-run mode (`FuturesTPOrder` TAKE_PROFIT + `FuturesSLOrder` STOP_MARKET).
 
 ## Post-Submission Lifecycle
 
 After an entry fill, the algorithm immediately moves into position protection and monitoring.
 
-The OCO bracket uses the protection wall as the stop reference and computes a take-profit level from the entry-to-stop distance. The stop-limit leg is intentionally placed through the stop trigger so it is more likely to execute rather than rest passively after triggering.
+The TP/SL bracket uses the protection wall as the stop reference and computes a take-profit level from the entry-to-stop distance. The stop leg is placed as a reduce-only STOP_MARKET so it is more likely to execute rather than rest passively after triggering. On demo futures, a soft `-2022` reduce-only rejection falls back to placing the bracket without the reduce-only flag.
 
 Gate 6 starts only after `fill_event` is set. It polls the live LOB for the protection wall and also checks safety conditions such as maximum hold time, degraded heartbeat/latency, and unsafe exit spread. If the protection wall disappears or a safety condition fires, Gate 6 calls the order manager to cancel protection and perform an aggressive safety exit.
 
-The order manager handles OCO and Gate 6 races explicitly. If Gate 6 fires while the OCO placement REST call is still in flight, the close is deferred until placement completes, then the just-placed OCO is cancelled and the position is closed. This avoids duplicate close attempts.
+The order manager handles bracket-placement and Gate 6 races explicitly via the `_placing_oco` / `_cancel_oco_on_placement` flags. If Gate 6 fires while the bracket placement REST call is still in flight, the close is deferred until placement completes, then the just-placed bracket is cancelled and the position is closed. This avoids duplicate close attempts.
 
-Outcomes are recorded when a position closes naturally through OCO or through a confirmed safety/emergency close. The order manager updates realized budget PnL and schedules telemetry outcome updates with WIN/LOSS/FLAT, PnL, duration, and R-multiple when available.
+Outcomes are recorded when a position closes naturally through the TP/SL bracket or through a confirmed safety/emergency close. The order manager updates realized budget PnL and schedules telemetry outcome updates with WIN/LOSS/FLAT, PnL, duration, and R-multiple when available.
 
 ## Telemetry And State Feedback
 
@@ -177,7 +179,7 @@ This feedback loop keeps the live algorithm aligned with current data quality, r
 
 The live microstructure path submits approved `MicroOrderRequest` objects directly from `StrategyExecutor` to `OrderManager`. `RiskEngine` is instantiated for budget/tier state, midnight reset, and tier synchronization into `StrategyExecutor`. The legacy `MicrostructureEngine` (`engine/microstructure_engine.py`) is not started in the live `TaskGroup` — it has no task in `main.py`'s `asyncio.TaskGroup` and the `ms_bar_queue` it would produce to has no active producer.
 
-Fill tracking uses both direct REST polling in `OrderManager` and `executionReport` events from `UserDataStreamConsumer`. The user data stream provides a cleaner fill signal for futures; the REST path remains the primary fill detection mechanism for spot testnet.
+Fill tracking uses both direct REST polling in `OrderManager` and `executionReport` events from `UserDataStreamConsumer`. The user data stream provides a cleaner fill signal; the REST path remains the primary fill-detection mechanism on Binance USD-M Futures.
 
 The algorithm currently detects wall consumption from depth changes and wall reload ratio. It does not yet use a minimum-quantity probe order behind or after a wall as a cleaner consumption trigger; that remains a future design item.
 
