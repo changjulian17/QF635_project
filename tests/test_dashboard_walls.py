@@ -1,42 +1,17 @@
-"""Tests for /walls page callback: offline, empty, trace structure, invalid-JSON guard.
+"""Tests for the walls figure builder (now folded into the /lob page's Walls tab).
 
-Dash is not installed in the test environment. We stub it at the module level so
-walls.py can be imported. The @callback decorator is replaced with an identity
-wrapper so update_walls_chart remains callable as a plain function.
+The figure logic was extracted into the Dash-free ``dashboard._logic.build_walls_figure``
+helper, so these tests import it directly — no ``dash`` stub needed (and therefore no
+``sys.modules`` pollution of other test modules).
 """
 import json
 import os
 import sys
 from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock, patch
-
-import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-# ── Dash stub ─────────────────────────────────────────────────────────────────
-# Must be installed before walls.py is first imported.
-
-def _identity_decorator(*args, **kwargs):
-    """Replacement for dash.callback — returns a no-op decorator that keeps the fn."""
-    def decorator(fn):
-        return fn
-    return decorator
-
-
-_dash_stub = MagicMock()
-_dash_stub.callback = _identity_decorator
-_dash_stub.register_page = MagicMock()
-
-# Forced assignment wins even after dash.testing.plugin has pre-loaded real dash
-# via its pytest11 entry point (setdefault would silently no-op).
-sys.modules["dash"] = _dash_stub
-sys.modules["dash.dcc"] = MagicMock()
-sys.modules["dash.html"] = MagicMock()
-sys.modules["dash_bootstrap_components"] = MagicMock()
-
-from dashboard.pages.walls import update_walls_chart  # noqa: E402
+from dashboard._logic import build_walls_figure  # noqa: E402
 
 
 # ── Test data helpers ─────────────────────────────────────────────────────────
@@ -74,52 +49,20 @@ def _make_snapshots(
     ]
 
 
-# ── 1. DB offline ─────────────────────────────────────────────────────────────
-
-def test_walls_candles_db_offline():
-    """DBOffline from fetch_candles → 'DB offline' annotation, no crash."""
-    from dashboard._db import DBOffline
-
-    with patch("dashboard.pages.walls.fetch_candles", return_value=DBOffline("no db")), \
-         patch("dashboard.pages.walls.fetch_lob_snapshots", return_value=[]):
-        fig = update_walls_chart(0, 15, 500, 95)
-
-    texts = [a["text"] for a in fig.layout.annotations]
-    assert any("DB offline" in t for t in texts)
-
-
-def test_walls_snapshots_db_offline():
-    """DBOffline from fetch_lob_snapshots → same 'DB offline' message."""
-    from dashboard._db import DBOffline
-
-    with patch("dashboard.pages.walls.fetch_candles", return_value=[]), \
-         patch("dashboard.pages.walls.fetch_lob_snapshots", return_value=DBOffline("no db")):
-        fig = update_walls_chart(0, 15, 500, 95)
-
-    texts = [a["text"] for a in fig.layout.annotations]
-    assert any("DB offline" in t for t in texts)
-
-
-# ── 2. Empty data ─────────────────────────────────────────────────────────────
+# ── 1. Empty data ─────────────────────────────────────────────────────────────
 
 def test_walls_empty_data():
-    """Empty fetch results → 'Waiting for data' annotation."""
-    with patch("dashboard.pages.walls.fetch_candles", return_value=[]), \
-         patch("dashboard.pages.walls.fetch_lob_snapshots", return_value=[]):
-        fig = update_walls_chart(0, 15, 500, 95)
-
+    """Empty inputs → 'Waiting for data' annotation, no crash."""
+    fig = build_walls_figure([], [], 15, 500, 95)
     texts = [a["text"] for a in fig.layout.annotations]
     assert any("Waiting" in t for t in texts)
 
 
-# ── 3. Happy path ─────────────────────────────────────────────────────────────
+# ── 2. Happy path ─────────────────────────────────────────────────────────────
 
 def test_walls_happy_path_trace_count():
     """Valid data → exactly 6 traces in the correct order."""
-    with patch("dashboard.pages.walls.fetch_candles", return_value=_make_candles(120)), \
-         patch("dashboard.pages.walls.fetch_lob_snapshots", return_value=_make_snapshots(120)):
-        fig = update_walls_chart(0, 15, 500, 95)
-
+    fig = build_walls_figure(_make_candles(120), _make_snapshots(120), 15, 500, 95)
     # Row 1: Candlestick + VWAP  |  Row 2: Bid heatmap + Ask heatmap + Wall heatmap + Mid scatter
     assert len(fig.data) == 6
     assert fig.data[0].type == "candlestick"
@@ -132,22 +75,17 @@ def test_walls_happy_path_trace_count():
 
 def test_walls_happy_path_layout():
     """Valid data → dark template, correct height, rangeslider off."""
-    with patch("dashboard.pages.walls.fetch_candles", return_value=_make_candles(120)), \
-         patch("dashboard.pages.walls.fetch_lob_snapshots", return_value=_make_snapshots(120)):
-        fig = update_walls_chart(0, 15, 500, 95)
-
+    fig = build_walls_figure(_make_candles(120), _make_snapshots(120), 15, 500, 95)
     assert fig.layout.height == 860
     assert fig.layout.xaxis.rangeslider.visible is False
 
 
-# ── 4. valid_cols mask — all-corrupt JSON ─────────────────────────────────────
+# ── 3. valid_cols mask — all-corrupt JSON ─────────────────────────────────────
 
 def test_walls_all_invalid_json_returns_insufficient_data():
     """All-corrupt JSON → valid_cols all-False → sdf empty → 'Insufficient data'."""
-    with patch("dashboard.pages.walls.fetch_candles", return_value=_make_candles(120)), \
-         patch("dashboard.pages.walls.fetch_lob_snapshots",
-               return_value=_make_snapshots(120, valid_json=False)):
-        fig = update_walls_chart(0, 15, 500, 95)
-
+    fig = build_walls_figure(
+        _make_candles(120), _make_snapshots(120, valid_json=False), 15, 500, 95
+    )
     texts = [a["text"] for a in fig.layout.annotations]
     assert any("Insufficient" in t for t in texts)
