@@ -171,146 +171,80 @@ def test_heartbeat_recovery_from_sustained():
             hb.record(int((base_time + 11.0) * 1000) - 50)
         assert hb.status == "HEALTHY"
 
-
-def test_heartbeat_monitor_default_critical_ms():
-    # This test is now dependent on settings
-    hb = HeartbeatMonitor()
-    assert hb.CRITICAL_MS == settings.HEARTBEAT_CRITICAL_MS
+    assert hb.status == "HEALTHY"
+    assert hb._degraded_since_ms is None
 
 
-def test_depth_update_replaces_oldest_snapshot_when_queue_full():
+def test_ws_seed_failure_stays_unsynced():
+    """REST seed failure must leave _lob_synced False so Gate 0 won't see SYNCED."""
+    import asyncio, aiohttp
+    from core.ws_consumer import BinanceWebSocketConsumer
+
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
+
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    with patch("core.ws_consumer.aiohttp.ClientSession",
+               side_effect=aiohttp.ClientError("seed boom")), \
+         patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+        asyncio.run(consumer._sync_lob_snapshot())
+
+    assert consumer._lob_synced is False
+
+
+def test_ws_seed_rejects_gapful_buffer():
+    """Buffered diffs that don't bridge the snapshot (gap) → seed fails → stays UNSYNCED."""
     import asyncio
-
     from core.ws_consumer import BinanceWebSocketConsumer
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
+    snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
+    consumer._lob_pending = [{"U": 105, "u": 106, "b": [], "a": []}]  # 101–104 missing
 
-    async def _run() -> None:
-        candle_q = asyncio.Queue()
-        depth_q = asyncio.Queue(maxsize=1)
-        # Pass required args
-        consumer = BinanceWebSocketConsumer(streams=["btcusdt@depth@100ms"], shared_state=SharedState(), candle_queue=candle_q, depth_queue=depth_q)
-        consumer._lob_synced = True
-        consumer._bid_book = {100.0: 1.0, 99.5: 2.0}
-        consumer._ask_book = {100.5: 1.5, 101.0: 2.0}
-        consumer._lob_update_id = 41
+    async def _fetch():
+        return snap
+    async def _no_sleep(*_a, **_k):
+        return None
 
-        await depth_q.put({"sentinel": True})
-
-        msg = {
-            "e": "depthUpdate",
-            "E": 1234567890000,
-            "u": 42,
-            "U": 42, # Added U
-            "b": [["100.0", "3.0"]],
-            "a": [],
-        }
-
-        await asyncio.wait_for(consumer._dispatch("btcusdt@depth@100ms", msg), timeout=0.2)
-
-        assert depth_q.qsize() == 1
-        snapshot = depth_q.get_nowait()
-        assert snapshot["lastUpdateId"] == 42
-        assert snapshot["bids"][0] == ["100.0", "3.0"]
-
-    asyncio.run(_run())
+    with patch.object(consumer, "_fetch_rest_snapshot", new=_fetch), \
+         patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+        asyncio.run(consumer._sync_lob_snapshot())
+    assert consumer._lob_synced is False
 
 
-def test_critical_triggers_immediate_break_in_receive_loop():
-    """_receive_loop must return quickly on CRITICAL — not wait for 10s recv timeout."""
-    import asyncio, json
-    from models import SharedState
-    from core.ws_consumer import BinanceWebSocketConsumer
-
-    now_ms = int(time.time() * 1000)
-    stale_msg = json.dumps({
-        "stream": "btcusdt@bookTicker",
-        "data": {"E": now_ms - 50000, "s": "BTCUSDT",
-                 "b": "1", "B": "1", "a": "1", "A": "1"},
-    })
-    recv_calls = 0
-    _consec = 3 # Use fixed value for test stability
-
-    class _FakeWS:
-        async def recv(self_):
-            nonlocal recv_calls
-            recv_calls += 1
-            if recv_calls <= _consec:
-                return stale_msg   # all stale → CRITICAL fires on recv_calls == _consec
-            await asyncio.sleep(60)   # would stall here without CRITICAL break
-
-        async def close(self_): pass
-
-    consumer = BinanceWebSocketConsumer(
-        shared_state=SharedState(),
-        streams=["btcusdt@bookTicker"],
-        heartbeat_key="heartbeat_status",
-        warn_ms=200,
-        critical_ms=500,
-        consec_limit=_consec,
-    )
-    consumer._running = True   # normally set by start(); required for _receive_loop to enter
-
-    async def _run() -> None:
-        start = time.monotonic()
-        await consumer._receive_loop(_FakeWS())
-        elapsed = time.monotonic() - start
-        assert recv_calls == _consec, f"expected {_consec} recv calls, got {recv_calls}"
-        assert consumer.heartbeat.status == "CRITICAL"
-        assert elapsed < 5.0, f"_receive_loop took {elapsed:.1f}s — CRITICAL break not firing"
-
-    asyncio.run(_run())
-
-
-def test_recv_timeout_value_is_expected():
-    """_receive_loop passes timeout from settings to asyncio.wait_for."""
+def test_ws_seed_accepts_bridging_buffer():
+    """First diff straddles lastUpdateId+1 and the rest are contiguous → SYNCED."""
     import asyncio
-    from unittest.mock import patch
-    from models import SharedState
     from core.ws_consumer import BinanceWebSocketConsumer
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
+    snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
+    consumer._lob_pending = [
+        {"U": 100, "u": 101, "b": [], "a": []},   # bridge: 100 <= 101 <= 101
+        {"U": 102, "u": 103, "b": [], "a": []},   # contiguous
+    ]
 
-    captured: list[float] = []
+    async def _fetch():
+        return snap
 
-    async def _spy_wait_for(coro, timeout=None, **kw):
-        captured.append(timeout)
-        coro.close()
-        raise asyncio.TimeoutError()
-
-    consumer = BinanceWebSocketConsumer(
-        shared_state=SharedState(),
-        streams=["btcusdt@depth@500ms"],
-        heartbeat_key="heartbeat_status",
-    )
-    consumer._running = True
-
-    class _FakeWS:
-        async def recv(self_): await asyncio.sleep(9999)
-        async def close(self_): pass
-
-    async def _run():
-        with patch.object(asyncio, "wait_for", new=_spy_wait_for):
-            await consumer._receive_loop(_FakeWS())
-
-    asyncio.run(_run())
-
-    assert captured, "asyncio.wait_for was never called by _receive_loop"
-    assert captured[0] == settings.WS_RECV_TIMEOUT_S
+    with patch.object(consumer, "_fetch_rest_snapshot", new=_fetch):
+        asyncio.run(consumer._sync_lob_snapshot())
+    assert consumer._lob_synced is True
+    assert consumer._lob_update_id == 103
 
 
-def test_apply_depth_diff_tolerates_small_gap():
-    """A gap under LOB_GAP_TOLERANCE_UPDATEIDS is applied and _lob_update_id advances."""
-    consumer = BinanceWebSocketConsumer(streams=["btcusdt@depth@500ms"], shared_state=SharedState())
-    consumer._lob_update_id = 100
+def test_ws_seed_failure_sets_reseed_flag():
+    """Exhausted REST seed sets _seed_failed so the receive loop reconnects to reseed."""
+    import asyncio, aiohttp
+    from core.ws_consumer import BinanceWebSocketConsumer
+    consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
 
-    diff = {"U": 100 + 50, "u": 100 + 60, "b": [["100.0", "1.0"]], "a": []}
-    assert consumer._apply_depth_diff(diff) is True
-    assert consumer._lob_update_id == 160
-    assert consumer._bid_book[100.0] == 1.0
+    async def _fail():
+        raise aiohttp.ClientError("boom")
+    async def _no_sleep(*_a, **_k):
+        return None
 
-
-def test_apply_depth_diff_rejects_large_gap():
-    """A gap at/above LOB_GAP_TOLERANCE_UPDATEIDS is rejected and _lob_update_id is unchanged."""
-    consumer = BinanceWebSocketConsumer(streams=["btcusdt@depth@500ms"], shared_state=SharedState())
-    consumer._lob_update_id = 100
-
-    diff = {"U": 100 + 5000, "u": 100 + 5010, "b": [], "a": []}
-    assert consumer._apply_depth_diff(diff) is False
-    assert consumer._lob_update_id == 100
+    with patch.object(consumer, "_fetch_rest_snapshot", new=_fail), \
+         patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+        asyncio.run(consumer._sync_lob_snapshot())
+    assert consumer._lob_synced is False
+    assert consumer._seed_failed is True

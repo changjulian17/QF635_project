@@ -11,12 +11,13 @@ import numpy as np
 import websockets
 
 from config import settings
-from models import AggTrade, LOBLevel, LOBSnapshot, SharedState
+from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
+from models import AggTrade, Candle, SharedState
 
 logger = logging.getLogger(__name__)
 
-# Max connection duration before forced reconnect (24h)
-_MAX_CONNECTION_SECONDS = 24 * 3600
+_MAX_CONNECTION_SECONDS = 86_000  # reconnect 400 s before Binance's 24 h limit
+_SEED_MAX_ATTEMPTS      = 3        # REST seed retries before staying UNSYNCED
 
 
 class HeartbeatMonitor:
@@ -158,14 +159,19 @@ class BinanceWebSocketConsumer:
         self._candle_db_queue = candle_db_queue
         self._depth_queue     = depth_queue
         self._running         = False
+        self._reconnect_delay = 1.0
+        self._max_delay       = 60.0
+        self.heartbeat        = HeartbeatMonitor()
+        self._frame_counts: dict[str, int] = {}
+        self._frame_log_ts: float = 0.0
 
-        # LOB Reconstruction State
-        self._bid_book: dict[float, float] = {}
-        self._ask_book: dict[float, float] = {}
-        self._lob_update_id: int = 0
-        self._lob_synced = False
-        self._lob_pending: list[dict] = []
-        self._consecutive_lob_gaps: int = 0
+        # Local order book for diff-depth reconstruction
+        self._bid_book:       dict[float, float] = {}
+        self._ask_book:       dict[float, float] = {}
+        self._lob_update_id:  int  = 0
+        self._lob_synced:     bool = False
+        self._seed_failed:    bool = False
+        self._lob_pending:    list[dict] = []
 
     async def start(self) -> None:
         self._running = True
@@ -196,17 +202,13 @@ class BinanceWebSocketConsumer:
                     # with the receive loop so diffs are buffered during the fetch.
                     self._bid_book.clear()
                     self._ask_book.clear()
-                    self._lob_update_id       = 0
-                    self._lob_synced          = False
-                    self._lob_pending         = []
-                    self._consecutive_lob_gaps = 0
-
-                    sync_task = None
-                    if self._depth_queue is not None:
-                        sync_task = asyncio.create_task(
-                            self._sync_lob_snapshot(), name="ws_lob_sync"
-                        )
-
+                    self._lob_update_id = 0
+                    self._lob_synced    = False
+                    self._seed_failed   = False
+                    self._lob_pending   = []
+                    sync_task = asyncio.create_task(
+                        self._sync_lob_snapshot(), name="ws_lob_sync"
+                    )
                     try:
                         await self._receive_loop(ws)
                     finally:
@@ -225,7 +227,11 @@ class BinanceWebSocketConsumer:
     async def _receive_loop(self, ws: Any) -> None:
         conn_start = time.monotonic()
 
-        while self._running:
+            if self._seed_failed:   # final seed attempt failed → reconnect to reseed
+                logger.warning("[WS] seed failed — reconnecting to reseed")
+                await ws.close()
+                break
+
             if time.monotonic() - conn_start > _MAX_CONNECTION_SECONDS:
                 logger.info("[WS] Approaching 24 h limit — reconnecting proactively.")
                 await ws.close()
@@ -269,149 +275,147 @@ class BinanceWebSocketConsumer:
         if self.heartbeat_cb:
             await self.heartbeat_cb(status, self.heartbeat.last_delta_ms)
 
-        if self.heartbeat.status == "CRITICAL":
-            # Exit to trigger reconnect
-            return
+    async def _fetch_rest_snapshot(self) -> dict:
+        """Fetch a REST depth snapshot (extracted for testability)."""
+        url = f"{settings.REST_BASE}/api/v3/depth"
+        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.json()
 
-        # Route message
+    async def _sync_lob_snapshot(self) -> None:
+        """Seed the local book from a REST snapshot, retrying on failure.
+
+        Only sets _lob_synced=True after a successful seed, so Gate 0 never sees
+        SYNCED on a partial book reconstructed from diffs alone.
+        """
+        for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
+            try:
+                snap = await self._fetch_rest_snapshot()
+
+                self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
+                self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
+                last_uid = int(snap["lastUpdateId"])
+                # Apply buffered diffs only if they form a gapless bridge from the
+                # snapshot — first must straddle lastUpdateId+1, rest must be contiguous.
+                prev_u, first = last_uid, True
+                for event in self._lob_pending:
+                    u = int(event.get("u", 0))
+                    if u <= last_uid:
+                        continue
+                    U = int(event.get("U", 0))
+                    if first:
+                        if not seed_bridge_ok(U, u, last_uid):
+                            raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
+                        first = False
+                    elif not is_contiguous(prev_u, U):
+                        raise SeedDiscontinuity(f"gap U={U} != prev_u+1={prev_u + 1}")
+                    self._apply_depth_diff(event)
+                    prev_u = u
+                self._lob_pending.clear()
+                self._lob_update_id = prev_u
+                self._lob_synced = True
+                logger.info(
+                    "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
+                    prev_u, len(self._bid_book), len(self._ask_book),
+                )
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
+                    KeyError, ValueError, SeedDiscontinuity) as exc:
+                logger.error(
+                    "[WS] LOB seed attempt %d/%d failed: %s", attempt, _SEED_MAX_ATTEMPTS, exc,
+                )
+                await asyncio.sleep(min(2 ** (attempt - 1), 5))
+
+        # All attempts failed — flag for reconnect/reseed; stay unsynced meanwhile
+        # so Gate 0 won't trade on a partial book.
+        self._lob_pending.clear()
+        self._lob_synced = False
+        self._seed_failed = True
+        logger.critical(
+            "[WS] LOB seed failed after %d attempts — reconnecting to reseed (Gate 0 blocks meanwhile)",
+            _SEED_MAX_ATTEMPTS,
+        )
+
+    def _apply_depth_diff(self, event: dict) -> None:
+        for p, q in event.get("b", []):
+            price, qty = float(p), float(q)
+            if qty == 0.0:
+                self._bid_book.pop(price, None)
+            else:
+                self._bid_book[price] = qty
+        for p, q in event.get("a", []):
+            price, qty = float(p), float(q)
+            if qty == 0.0:
+                self._ask_book.pop(price, None)
+            else:
+                self._ask_book[price] = qty
+        self._lob_update_id = int(event.get("u", self._lob_update_id))
+
+    def _reconstruct_depth_msg(self, event_ms: int) -> dict:
+        """
+        Build a full-snapshot-style dict from the local book (top _DEPTH_LEVELS
+        per side) so downstream consumers (LOBEngine, MicrostructureDetector)
+        receive the same message format as the old depth20 stream, but with
+        100 levels instead of 20.
+        """
+        bids = sorted(self._bid_book.items(), reverse=True)[: self._DEPTH_LEVELS]
+        asks = sorted(self._ask_book.items())[: self._DEPTH_LEVELS]
+        return {
+            "lastUpdateId": self._lob_update_id,
+            "E": event_ms,
+            "bids": [[str(p), str(q)] for p, q in bids],
+            "asks": [[str(p), str(q)] for p, q in asks],
+        }
+
+    async def _dispatch(self, stream: str, msg: dict) -> None:
         event_type = msg.get("e")
 
-        if "depth" in stream or event_type == "depthUpdate":
-            if not self._lob_synced:
-                self._lob_pending.append(msg)
-                if len(self._lob_pending) > 500:
-                    self._lob_pending.pop(0)
-            else:
-                if self._apply_depth_diff(msg):
-                    self._consecutive_lob_gaps = 0
-                    self._enqueue_latest_depth_snapshot(msg.get("E", int(time.time() * 1000)))
-                else:
-                    self._consecutive_lob_gaps += 1
-                    if self._consecutive_lob_gaps >= settings.LOB_GAP_RECONNECT_MIN_CONSECUTIVE:
-                        logger.critical(
-                            "[WS] Forcing reconnect after %d consecutive LOB gaps.",
-                            self._consecutive_lob_gaps,
-                        )
-                        self._consecutive_lob_gaps = 0
-                        self.heartbeat.status = "CRITICAL"
-                    else:
-                        logger.warning(
-                            "[WS] LOB gap %d/%d — skipping diff.",
-                            self._consecutive_lob_gaps,
-                            settings.LOB_GAP_RECONNECT_MIN_CONSECUTIVE,
-                        )
+        if event_type == "aggTrade":
+            trade = AggTrade(
+                timestamp=datetime.fromtimestamp(msg["T"] / 1000, tz=timezone.utc),
+                price=float(msg["p"]),
+                qty=float(msg["q"]),
+                is_buyer_maker=bool(msg["m"]),
+            )
+            if self._trade_queue is not None:
+                await self._trade_queue.put(trade)
 
         elif event_type == "kline":
-            if self._candle_queue is not None:
-                await self._candle_queue.put(msg)
-            if self._candle_db_queue is not None:
-                await self._candle_db_queue.put(msg)
+            kline = msg["k"]
+            if kline.get("x"):   # closed candle only
+                candle = Candle(
+                    open_time=datetime.fromtimestamp(kline["t"] / 1000, tz=timezone.utc),
+                    open=float(kline["o"]),
+                    high=float(kline["h"]),
+                    low=float(kline["l"]),
+                    close=float(kline["c"]),
+                    volume=float(kline["v"]),
+                    is_closed=True,
+                )
+                await self._candle_queue.put(candle)
+                if self._candle_db_queue is not None:
+                    await self._candle_db_queue.put(candle)
+                logger.info(
+                    "[WS] Candle close — O=%.2f H=%.2f L=%.2f C=%.2f V=%.3f",
+                    candle.open, candle.high, candle.low, candle.close, candle.volume,
+                )
 
-        elif event_type == "aggTrade":
-            if self._trade_queue is not None:
-                await self._trade_queue.put(msg)
+        elif event_type == "depthUpdate":
+            # Incremental diff — buffer during REST seed, then apply and reconstruct.
+            event_ms = int(msg.get("E") or time.time() * 1000)
+            if not self._lob_synced:
+                if len(self._lob_pending) < self._MAX_PENDING_DIFFS:
+                    self._lob_pending.append(msg)
+            else:
+                self._apply_depth_diff(msg)
+                if self._depth_queue is not None:
+                    await self._depth_queue.put(self._reconstruct_depth_msg(event_ms))
 
         elif event_type == "bookTicker":
             # Best bid/ask for spread calculation; route alongside trades
             if self._trade_queue is not None:
                 await self._trade_queue.put(msg)
-
-    def _apply_depth_diff(self, diff: dict) -> bool:
-        """
-        Update local book with incremental diffs.
-        Returns True if successful, False if a gap was detected.
-        """
-        # 1. verify U <= last_update_id + 1 <= u
-        first_id = int(diff.get("U", 0))
-        last_id  = int(diff.get("u", 0))
-
-        if not last_id:
-            return True
-
-        if self._lob_update_id > 0 and first_id > 0 and first_id > self._lob_update_id + 1:
-            gap = first_id - (self._lob_update_id + 1)
-            if gap < settings.LOB_GAP_TOLERANCE_UPDATEIDS:
-                logger.debug("[WS] LOB small gap (%d IDs) — applying and advancing", gap)
-                # fall through — diff is applied below, _lob_update_id advances normally
-            else:
-                logger.warning("[WS] LOB GAP DETECTED: expected %d, got %d (gap=%d)",
-                               self._lob_update_id + 1, first_id, gap)
-                return False
-
-        if last_id <= self._lob_update_id:
-            return True
-
-        for side, book in [("b", self._bid_book), ("a", self._ask_book)]:
-            for price_str, qty_str in diff.get(side, []):
-                price, qty = float(price_str), float(qty_str)
-                if qty == 0:
-                    book.pop(price, None)
-                else:
-                    book[price] = qty
-        
-        self._lob_update_id = last_id
-        return True
-
-    def _enqueue_latest_depth_snapshot(self, event_ms: int) -> None:
-        if self._depth_queue is not None:
-            # If queue is full, drop the oldest one to make room for the latest
-            if self._depth_queue.full():
-                try:
-                    self._depth_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            
-            msg = self._reconstruct_depth_msg(event_ms)
-            try:
-                self._depth_queue.put_nowait(msg)
-            except asyncio.QueueFull:
-                pass
-
-    def _reconstruct_depth_msg(self, event_ms: int) -> dict:
-        """Create a full snapshot dict from local book."""
-        bids = sorted([[str(p), str(q)] for p, q in self._bid_book.items()], 
-                      key=lambda x: float(x[0]), reverse=True)
-        asks = sorted([[str(p), str(q)] for p, q in self._ask_book.items()], 
-                      key=lambda x: float(x[0]))
-        
-        return {
-            "lastUpdateId": self._lob_update_id,
-            "bids": bids[:1000],
-            "asks": asks[:1000],
-            "E": event_ms
-        }
-
-    async def _sync_lob_snapshot(self) -> None:
-        """Fetch full snapshot from REST and align with buffered diffs."""
-        url = f"{settings.REST_BASE}/fapi/v1/depth?symbol={settings.SYMBOL}&limit=1000"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    snap = await resp.json()
-            
-            self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
-            self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
-            last_uid = int(snap["lastUpdateId"])
-
-            # Process buffered diffs; stop on first internal gap to avoid
-            # leaving _lob_update_id below the gap and triggering an immediate
-            # reconnect on the next live diff.
-            for diff in self._lob_pending:
-                u_last = int(diff.get("u", 0))
-                if u_last <= last_uid:
-                    continue
-                if not self._apply_depth_diff(diff):
-                    break
-            
-            self._lob_update_id = max(self._lob_update_id, last_uid)
-            logger.info(
-                "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
-                last_uid, len(self._bid_book), len(self._ask_book),
-            )
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.error("[WS] LOB REST seed failed (%s) — continuing with buffered diffs.", exc)
-        finally:
-            self._lob_pending.clear()
-            self._lob_synced = True
-            if self._bid_book and self._ask_book:
-                self._enqueue_latest_depth_snapshot(int(time.time() * 1000))

@@ -254,18 +254,34 @@ class OrderManager:
         """Return True when a microstructure entry/position/close is active."""
         return self._has_active_exposure_locked()
 
-    def get_open_position(self) -> dict | None:
-        """Return in-memory open position for display. None if no position open."""
-        if self._open_position_side is None:
+    def unrealised_pnl(self) -> float:
+        """Mark-to-market PnL of the open position (0.0 if none / no book).
+
+        Fed to DailyBudget via the MTM loop so KS-1 and risk tiering see open-position
+        losses before they're realised. Marked against the injected book's mid.
+        """
+        if self._open_position_side is None or self._open_position_qty <= 0 or self._book_fn is None:
+            return 0.0
+        book = self._book_fn()
+        if not book:
+            return 0.0
+        mid = (book[0] + book[1]) / 2.0
+        if self._open_position_side == "BUY":
+            return (mid - self._open_entry_price) * self._open_position_qty
+        return (self._open_entry_price - mid) * self._open_position_qty
+
+    def get_dry_run_position(self) -> dict | None:
+        """Return in-memory open position for DRY_RUN display. None if no open position."""
+        if not settings.DRY_RUN or self._open_position_side is None:
             return None
         return {
             "symbol":         settings.SYMBOL,
             "side":           self._open_position_side,
             "entry_price":    self._open_entry_price,
             "quantity":       self._open_position_qty,
-            "stop_loss":      self._open_sl_price  or None,
-            "take_profit":    self._open_tp_price  or None,
-            "unrealised_pnl": None,
+            "stop_loss":      self._open_sl_price,
+            "take_profit":    None,
+            "unrealised_pnl": self.unrealised_pnl(),
         }
 
     async def _submit(self, req: MicroOrderRequest) -> None:

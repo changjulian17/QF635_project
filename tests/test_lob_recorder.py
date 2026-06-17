@@ -619,3 +619,94 @@ def test_seed_failure_does_not_mark_synced():
     finally:
         rec._conn.close()
         os.unlink(tmp)
+
+
+def test_recorder_seed_rejects_gapful_buffer():
+    """Gapful buffered diffs → seed fails → recorder stays unsynced (no partial-book rows)."""
+    rec, tmp = _recorder_with_tmpdb()
+    snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
+    rec._pending_diffs = [{"U": 105, "u": 106, "b": [], "a": []}]  # 101–104 missing
+
+    async def _fetch():
+        return snap
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    try:
+        with patch.object(rec, "_fetch_rest_snapshot", new=_fetch), \
+             patch("core.lob_recorder.asyncio.sleep", new=_no_sleep):
+            asyncio.run(rec._sync_snapshot())
+        assert rec._synced is False
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_recorder_seed_accepts_bridging_buffer():
+    rec, tmp = _recorder_with_tmpdb()
+    snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
+    rec._pending_diffs = [
+        {"U": 100, "u": 101, "b": [], "a": []},
+        {"U": 102, "u": 103, "b": [], "a": []},
+    ]
+
+    async def _fetch():
+        return snap
+
+    try:
+        with patch.object(rec, "_fetch_rest_snapshot", new=_fetch):
+            asyncio.run(rec._sync_snapshot())
+        assert rec._synced is True
+        assert rec._last_update_id == 103
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_recorder_seed_failure_sets_reseed_flag():
+    """After the final seed attempt fails, _seed_failed is set so the receive loop reconnects."""
+    import aiohttp
+    rec, tmp = _recorder_with_tmpdb()
+
+    async def _fail():
+        raise aiohttp.ClientError("boom")
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    try:
+        with patch.object(rec, "_fetch_rest_snapshot", new=_fail), \
+             patch("core.lob_recorder.asyncio.sleep", new=_no_sleep):
+            asyncio.run(rec._sync_snapshot())
+        assert rec._synced is False
+        assert rec._seed_failed is True
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_recorder_pending_diffs_capped():
+    """Diffs buffered while unsynced are bounded by _MAX_PENDING_DIFFS (no memory leak)."""
+    rec, tmp = _recorder_with_tmpdb()
+    rec._running = True
+    rec._synced = False
+    try:
+        with patch("core.lob_recorder._MAX_PENDING_DIFFS", 5):
+            asyncio.run(rec._receive_loop(_fake_ws([_make_depth_msg() for _ in range(12)], rec)))
+        assert len(rec._pending_diffs) == 5
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)
+
+
+def test_recorder_receive_loop_breaks_on_seed_failed():
+    """_seed_failed short-circuits the receive loop so the connect loop reconnects."""
+    rec, tmp = _recorder_with_tmpdb()
+    rec._running = True
+    rec._synced = False
+    rec._seed_failed = True
+    try:
+        asyncio.run(rec._receive_loop(_fake_ws([_make_depth_msg(), _make_depth_msg()], rec)))
+        assert len(rec._pending_diffs) == 0   # broke before buffering anything
+    finally:
+        rec._conn.close()
+        os.unlink(tmp)

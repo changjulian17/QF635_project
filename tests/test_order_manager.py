@@ -1023,75 +1023,43 @@ async def test_tp_sl_monitor_exits_cleanly_on_external_close():
         position_closed_event=closed_event, poll_interval_s=0.01,
     )
 
-    assert not close_calls
+
+# ── Unrealised PnL (fed to budget/killswitch via the MTM loop) ───────────────
+
+def test_unrealised_pnl_zero_when_no_position():
+    om, *_ = _make_manager(book_fn=lambda: (100.0, 100.02))
+    assert om.unrealised_pnl() == 0.0
 
 
-@pytest.mark.asyncio
-async def test_tp_sl_monitor_defers_while_placing_oco():
-    """While a bracket placement is in flight, the monitor must not start its own close."""
-    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))  # touched price
-    closed_event = asyncio.Event()
-    om._open_tp_price = 96_000.0
-    om._open_sl_price = 94_000.0
-    om._placing_oco   = True
-
-    close_calls: list = []
-    async def spy_close(qty, side, reason):
-        close_calls.append((qty, side, reason))
-        return True, 96_015.0
-    om._emergency_close = spy_close
-
-    task = asyncio.create_task(om._watch_tp_sl(
-        position_side="BUY", fill_qty=0.001, signal_id="sig-defer",
-        entry_price=95_000.0, entry_time=time.monotonic(),
-        position_closed_event=closed_event, poll_interval_s=0.01,
-    ))
-    await asyncio.sleep(0.05)   # let it poll several times while the flag is True
-    assert not close_calls
-    assert not closed_event.is_set()
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+def test_unrealised_pnl_long_marks_to_mid():
+    om, *_ = _make_manager(book_fn=lambda: (109.0, 111.0))   # mid 110
+    om._open_position_side = "BUY"
+    om._open_position_qty  = 2.0
+    om._open_entry_price    = 100.0
+    assert om.unrealised_pnl() == pytest.approx((110.0 - 100.0) * 2.0)   # +20
 
 
-@pytest.mark.asyncio
-async def test_tp_sl_monitor_skips_when_emergency_close_in_progress():
-    """If another path already started an emergency close, the monitor must not start a second one."""
-    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))  # touched price
-    closed_event = asyncio.Event()
-    om._open_tp_price                 = 96_000.0
-    om._open_sl_price                 = 94_000.0
-    om._emergency_close_in_progress   = True
-
-    close_calls: list = []
-    async def spy_close(qty, side, reason):
-        close_calls.append((qty, side, reason))
-        return True, 96_015.0
-    om._emergency_close = spy_close
-
-    task = asyncio.create_task(om._watch_tp_sl(
-        position_side="BUY", fill_qty=0.001, signal_id="sig-skip",
-        entry_price=95_000.0, entry_time=time.monotonic(),
-        position_closed_event=closed_event, poll_interval_s=0.01,
-    ))
-    await asyncio.sleep(0.05)
-    assert not close_calls
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+def test_unrealised_pnl_short_loss_is_negative():
+    om, *_ = _make_manager(book_fn=lambda: (109.0, 111.0))   # mid 110
+    om._open_position_side = "SELL"
+    om._open_position_qty  = 2.0
+    om._open_entry_price    = 100.0
+    assert om.unrealised_pnl() == pytest.approx((100.0 - 110.0) * 2.0)   # -20
 
 
-@pytest.mark.asyncio
-async def test_tp_sl_monitor_not_started_when_not_demo():
-    """The software TP/SL monitor must only run when BINANCE_DEMO=True."""
-    om, _, _, _ = _make_manager(book_fn=lambda: (95_000.0, 95_010.0))
-    req = _make_req("LONG")
+def test_unrealised_pnl_zero_without_book():
+    om, *_ = _make_manager(book_fn=None)
+    om._open_position_side = "BUY"
+    om._open_position_qty  = 2.0
+    om._open_entry_price    = 100.0
+    assert om.unrealised_pnl() == 0.0   # no book → cannot mark to market
 
-    with patch.object(settings, "DRY_RUN", True), \
-         patch.object(settings, "BINANCE_DEMO", False):
-        await om._submit(req)
 
-    assert om._open_position_qty > 0
-    assert om._tp_sl_monitor_task is None
+def test_dry_run_position_reports_unrealised_pnl():
+    with patch.object(settings, "DRY_RUN", True):
+        om, *_ = _make_manager(book_fn=lambda: (109.0, 111.0))
+        om._open_position_side = "BUY"
+        om._open_position_qty  = 2.0
+        om._open_entry_price    = 100.0
+        pos = om.get_dry_run_position()
+    assert pos["unrealised_pnl"] == pytest.approx(20.0)

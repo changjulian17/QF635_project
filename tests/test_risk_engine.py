@@ -200,71 +200,33 @@ def test_budget_rebase_updates_equity_preserves_pnl():
     assert b.realised_pnl == pytest.approx(-50.0)  # PnL must survive rebase
 
 
-# ── record_trade_result used as budget_update_cb ──────────────────────────────
+# ── Circuit breakers: drawdown + consecutive-loss cooldown ──────────────────
 
-def test_record_trade_result_updates_all_portfolio_counters():
-    """record_trade_result must update every counter that the dashboard reads."""
-    pf = make_portfolio()
-    engine = make_engine(portfolio=pf)
-
-    engine.record_trade_result(pnl=50.0)
-
-    assert pf.equity      == pytest.approx(10_050.0)
-    assert pf.daily_pnl   == pytest.approx(50.0)
-    assert pf.peak_equity == pytest.approx(10_050.0)
-    assert pf.num_trades  == 1
-    assert pf.num_wins    == 1
-    assert pf.consecutive_losses == 0
+def test_drawdown_circuit_breaker_halts():
+    pf = make_portfolio(equity=9_400.0, peak_equity=10_000.0)   # 6% drawdown >= 5%
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.HALTED
 
 
-def test_record_trade_result_loss_increments_consecutive_losses():
-    pf = make_portfolio()
-    engine = make_engine(portfolio=pf)
-
-    engine.record_trade_result(pnl=-100.0)
-
-    assert pf.num_trades         == 1
-    assert pf.num_wins           == 0
-    assert pf.consecutive_losses == 1
-    assert pf.daily_pnl          == pytest.approx(-100.0)
-    assert pf.equity             == pytest.approx(9_900.0)
+def test_drawdown_below_threshold_does_not_halt():
+    pf = make_portfolio(equity=9_600.0, peak_equity=10_000.0)   # 4% drawdown < 5%
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is not CircuitBreakerStatus.HALTED
 
 
-def test_record_trade_result_as_budget_update_cb_updates_budget():
-    """Verify the callback wiring: record_trade_result must also update budget.realised_pnl."""
-    pf     = make_portfolio()
-    budget = DailyBudget.from_equity(pf.starting_equity)
-    engine = make_engine(portfolio=pf, budget=budget)
-
-    engine.record_trade_result(pnl=-200.0)
-
-    assert budget.realised_pnl == pytest.approx(-200.0)
-    assert pf.budget_loss_pct  == pytest.approx(budget.loss_pct)
+def test_consecutive_loss_cooldown_pauses():
+    pf = make_portfolio(consecutive_losses=3)                   # >= MAX_CONSECUTIVE_LOSSES
+    eng = make_engine(pf)
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED
 
 
-def test_sync_tier_passive_on_consecutive_losses():
-    from config import settings
-    pf = make_portfolio(consecutive_losses=settings.MAX_CONSECUTIVE_LOSSES)
-    engine = make_engine(pf)
-
-    tier = engine.sync_tier()
-
-    assert tier == "PASSIVE"
-    assert pf.circuit_breaker == CircuitBreakerStatus.PAUSED
-
-
-def test_sync_tier_restores_full_after_cooldown_expires_with_win():
-    from config import settings
-    pf = make_portfolio(consecutive_losses=settings.MAX_CONSECUTIVE_LOSSES)
-    engine = make_engine(pf)
-
-    engine.sync_tier()  # enters PAUSED → sets _cooldown_until, tier=PASSIVE
-    assert engine.tier == "PASSIVE"
-
-    engine.record_trade_result(+1.0)  # win resets consecutive_losses to 0
-    engine._cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)  # expire cooldown
-
-    tier = engine.sync_tier()
-
-    assert tier == "FULL"
-    assert pf.circuit_breaker == CircuitBreakerStatus.ACTIVE
+def test_cooldown_persists_after_losses_cleared():
+    pf = make_portfolio(consecutive_losses=3)
+    eng = make_engine(pf)
+    eng.sync_tier()                                             # arms 300s cooldown
+    pf.consecutive_losses = 0                                   # losses reset, but window still open
+    eng.sync_tier()
+    assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED

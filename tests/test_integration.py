@@ -297,7 +297,43 @@ def test_tier_scaling_full_vs_minimal_end_to_end():
     assert full_fills == 1, "fill_processor did not consume the FULL-tier fill"
     assert min_fills  == 1, "fill_processor did not consume the MINIMAL-tier fill"
     assert full_qty > 0 and min_qty > 0
-    # MINIMAL tier scalar (0.25) vs FULL (1.0) — same signal/book → qty ratio ≈ 0.25
-    # Absolute tolerance of one lot-size step accounts for floor-quantization rounding.
-    from config import settings as _s
-    assert abs(min_qty - 0.25 * full_qty) <= _s.QTY_STEP_SIZE
+    # MINIMAL tier scalar (0.25) vs FULL (1.0) — same signal/book → qty ratio == 0.25
+    assert min_qty == pytest.approx(0.25 * full_qty, rel=0.05)
+
+
+# ── Test 4: MTM loop feeds open-position unrealised PnL into the budget ───────
+
+def test_mtm_loop_marks_unrealised_into_budget():
+    """The 1 Hz MTM loop must push OrderManager.unrealised_pnl() into the budget so
+    KS-1 / risk tiers see open-position losses before they're realised."""
+    from unittest.mock import MagicMock
+    from main import _portfolio_mtm_loop
+    from risk.budget import DailyBudget
+    from risk.engine import RiskEngine
+    from models import PortfolioState
+
+    pf = PortfolioState(equity=10_000.0, starting_equity=10_000.0, peak_equity=10_000.0)
+    budget = DailyBudget.from_equity(10_000.0)
+    ks = GlobalKillswitch(dov=10_000.0)
+    risk_engine = RiskEngine(portfolio=pf, budget=budget, killswitch=ks)
+    om = MagicMock()
+    om.unrealised_pnl.return_value = -25.0
+
+    calls = {"n": 0}
+    async def _fake_sleep(_t):
+        calls["n"] += 1
+        if calls["n"] >= 2:        # let one full iteration run, then break the loop
+            raise asyncio.CancelledError
+
+    async def _run():
+        with patch("main.asyncio.sleep", new=_fake_sleep):
+            try:
+                await _portfolio_mtm_loop(
+                    ks, budget, om, pf, MagicMock(), risk_engine, MagicMock(), MagicMock(),
+                )
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(_run())
+    assert budget.unrealised_pnl == -25.0
+    om.unrealised_pnl.assert_called()
