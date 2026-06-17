@@ -10,12 +10,12 @@ import os
 # Add project root to path so config and dashboard modules are importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import requests
 import dash
 import dash_bootstrap_components as dbc
 from dash import dcc, html, Input, Output, State
 
 from config import settings
+from dashboard._db import fetch_engine_health as _fetch_engine_health
 
 app = dash.Dash(
     __name__,
@@ -25,14 +25,10 @@ app = dash.Dash(
     title="CryptoSentinel",
 )
 
-_API_BASE = f"http://127.0.0.1:{settings.DASHBOARD_API_PORT}"
-
 _NAV_ITEMS = [
     dbc.NavItem(dbc.NavLink("Live", href="/", active="exact")),
     dbc.NavItem(dbc.NavLink("LOB", href="/lob", active="exact")),
-    dbc.NavItem(dbc.NavLink("Walls", href="/walls", active="exact")),
-    dbc.NavItem(dbc.NavLink("Backtest", href="/backtest", active="exact")),
-    dbc.NavItem(dbc.NavLink("Registry", href="/registry", active="exact")),
+    dbc.NavItem(dbc.NavLink("Strategies", href="/strategies", active="exact")),
     dbc.NavItem(dbc.NavLink("Config", href="/config", active="exact")),
 ]
 
@@ -71,13 +67,7 @@ app.layout = html.Div([
     Input("engine-poll-interval", "n_intervals"),
 )
 def poll_engine_state(n_intervals):
-    try:
-        resp = requests.get(f"{_API_BASE}/api/health", timeout=2)
-        if resp.ok:
-            return resp.json()
-    except Exception:
-        pass
-    return None
+    return _fetch_engine_health()
 
 
 @app.callback(
