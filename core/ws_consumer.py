@@ -12,6 +12,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config import settings
+from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
 from models import AggTrade, Candle, SharedState
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,7 @@ class BinanceWebSocketConsumer:
         self._ask_book:       dict[float, float] = {}
         self._lob_update_id:  int  = 0
         self._lob_synced:     bool = False
+        self._seed_failed:    bool = False
         self._lob_pending:    list[dict] = []
 
     async def start(self) -> None:
@@ -186,6 +188,7 @@ class BinanceWebSocketConsumer:
                     self._ask_book.clear()
                     self._lob_update_id = 0
                     self._lob_synced    = False
+                    self._seed_failed   = False
                     self._lob_pending   = []
                     sync_task = asyncio.create_task(
                         self._sync_lob_snapshot(), name="ws_lob_sync"
@@ -219,6 +222,11 @@ class BinanceWebSocketConsumer:
 
         while True:
             if not self._running:
+                break
+
+            if self._seed_failed:   # final seed attempt failed → reconnect to reseed
+                logger.warning("[WS] seed failed — reconnecting to reseed")
+                await ws.close()
                 break
 
             if time.monotonic() - conn_start > _MAX_CONNECTION_SECONDS:
@@ -267,49 +275,68 @@ class BinanceWebSocketConsumer:
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning("[WS] Malformed message: %s", exc)
 
+    async def _fetch_rest_snapshot(self) -> dict:
+        """Fetch a REST depth snapshot (extracted for testability)."""
+        url = f"{settings.REST_BASE}/api/v3/depth"
+        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+
     async def _sync_lob_snapshot(self) -> None:
         """Seed the local book from a REST snapshot, retrying on failure.
 
         Only sets _lob_synced=True after a successful seed, so Gate 0 never sees
         SYNCED on a partial book reconstructed from diffs alone.
         """
-        url = f"{settings.REST_BASE}/api/v3/depth"
-        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
         for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        resp.raise_for_status()
-                        snap = await resp.json()
+                snap = await self._fetch_rest_snapshot()
 
                 self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
                 self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
                 last_uid = int(snap["lastUpdateId"])
+                # Apply buffered diffs only if they form a gapless bridge from the
+                # snapshot — first must straddle lastUpdateId+1, rest must be contiguous.
+                prev_u, first = last_uid, True
                 for event in self._lob_pending:
-                    if int(event.get("u", 0)) <= last_uid:
+                    u = int(event.get("u", 0))
+                    if u <= last_uid:
                         continue
+                    U = int(event.get("U", 0))
+                    if first:
+                        if not seed_bridge_ok(U, u, last_uid):
+                            raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
+                        first = False
+                    elif not is_contiguous(prev_u, U):
+                        raise SeedDiscontinuity(f"gap U={U} != prev_u+1={prev_u + 1}")
                     self._apply_depth_diff(event)
+                    prev_u = u
                 self._lob_pending.clear()
-                self._lob_update_id = last_uid
+                self._lob_update_id = prev_u
                 self._lob_synced = True
                 logger.info(
                     "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
-                    last_uid, len(self._bid_book), len(self._ask_book),
+                    prev_u, len(self._bid_book), len(self._ask_book),
                 )
                 return
-            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
+                    KeyError, ValueError, SeedDiscontinuity) as exc:
                 logger.error(
                     "[WS] LOB seed attempt %d/%d failed: %s", attempt, _SEED_MAX_ATTEMPTS, exc,
                 )
                 await asyncio.sleep(min(2 ** (attempt - 1), 5))
 
-        # All attempts failed — stay unsynced so Gate 0 won't trade on a partial book.
+        # All attempts failed — flag for reconnect/reseed; stay unsynced meanwhile
+        # so Gate 0 won't trade on a partial book.
         self._lob_pending.clear()
         self._lob_synced = False
+        self._seed_failed = True
         logger.critical(
-            "[WS] LOB seed failed after %d attempts — staying UNSYNCED (Gate 0 will block)",
+            "[WS] LOB seed failed after %d attempts — reconnecting to reseed (Gate 0 blocks meanwhile)",
             _SEED_MAX_ATTEMPTS,
         )
 
