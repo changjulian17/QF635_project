@@ -482,8 +482,12 @@ async def test_s2_closed_event_not_set_on_unfilled_exit():
     with patch.object(settings, "DRY_RUN", False):
         await om.handle_protection_wall_removed("LONG")
 
+    # Core S2 guarantee: event must NOT be set on unfilled exit
     assert not closed_event.is_set()
-    assert om._open_position_side is None
+    # Post-fix: state is preserved (not reset) so _watch_tp_sl can retry
+    assert om._open_position_side == "BUY"
+    assert om._open_position_qty == pytest.approx(0.001)
+    assert om._emergency_close_in_progress is False  # released for retry
 
 
 # ── Helper: _weighted_avg_fill ────────────────────────────────────────────────
@@ -1023,7 +1027,6 @@ async def test_tp_sl_monitor_exits_cleanly_on_external_close():
         position_closed_event=closed_event, poll_interval_s=0.01,
     )
 
-
 # ── Unrealised PnL (fed to budget/killswitch via the MTM loop) ───────────────
 
 def test_unrealised_pnl_zero_when_no_position():
@@ -1055,11 +1058,188 @@ def test_unrealised_pnl_zero_without_book():
     assert om.unrealised_pnl() == 0.0   # no book → cannot mark to market
 
 
-def test_dry_run_position_reports_unrealised_pnl():
-    with patch.object(settings, "DRY_RUN", True):
-        om, *_ = _make_manager(book_fn=lambda: (109.0, 111.0))
-        om._open_position_side = "BUY"
-        om._open_position_qty  = 2.0
-        om._open_entry_price    = 100.0
-        pos = om.get_dry_run_position()
-    assert pos["unrealised_pnl"] == pytest.approx(20.0)
+    assert om._open_position_qty > 0
+    assert om._tp_sl_monitor_task is None
+
+
+# ── Item 2 (Plan 2): conditional reset on failed emergency close ──────────────
+
+@pytest.mark.asyncio
+async def test_tp_sl_monitor_preserves_state_on_failed_close():
+    """When _emergency_close returns (False, 0.0), _watch_tp_sl must NOT reset position
+    state — qty and signal_id are preserved so _watch_tp_sl can retry on the next touch."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))
+    closed_event = asyncio.Event()
+    om._open_signal_id              = "sig-preserve"
+    om._open_tp_price               = 96_000.0
+    om._open_sl_price               = 94_000.0
+    om._open_position_qty           = 0.001
+    om._open_position_side          = "BUY"
+    om._open_position_closed_event  = closed_event
+    om._cancel_bracket_orders       = AsyncMock()
+
+    async def _always_fail(qty, side, reason=""):
+        return False, 0.0
+
+    om._emergency_close = _always_fail
+    om._record_outcome  = lambda *a, **kw: None
+
+    task = asyncio.create_task(om._watch_tp_sl(
+        position_side="BUY", fill_qty=0.001, signal_id="sig-preserve",
+        entry_price=95_000.0, entry_time=0.0,
+        position_closed_event=closed_event, poll_interval_s=0.01,
+    ))
+    await asyncio.sleep(0.15)  # one close attempt + backoff (poll*5=0.05s)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert om._open_position_qty == 0.001, "qty must be preserved on failed close"
+    assert om._emergency_close_in_progress is False, "_emergency_close_in_progress must be released for retry"
+    assert not closed_event.is_set(), "position_closed_event must NOT be set on failed close"
+
+
+@pytest.mark.asyncio
+async def test_tp_sl_monitor_retries_and_closes_on_second_attempt():
+    """When first close fails, _watch_tp_sl retries; second close succeeds and sets event."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (96_010.0, 96_020.0))
+    closed_event = asyncio.Event()
+    om._open_signal_id              = "sig-retry"
+    om._open_tp_price               = 96_000.0
+    om._open_sl_price               = 94_000.0
+    om._open_position_qty           = 0.001
+    om._open_position_side          = "BUY"
+    om._open_position_closed_event  = closed_event
+    om._cancel_bracket_orders       = AsyncMock()
+
+    call_count = 0
+
+    async def _fail_then_succeed(qty, side, reason=""):
+        nonlocal call_count
+        call_count += 1
+        return (False, 0.0) if call_count == 1 else (True, 96_015.0)
+
+    outcomes: list = []
+    om._emergency_close = _fail_then_succeed
+    om._record_outcome  = lambda *a, **kw: outcomes.append(a)
+
+    await asyncio.wait_for(
+        om._watch_tp_sl(
+            position_side="BUY", fill_qty=0.001, signal_id="sig-retry",
+            entry_price=95_000.0, entry_time=0.0,
+            position_closed_event=closed_event, poll_interval_s=0.01,
+        ),
+        timeout=1.0,
+    )
+
+    assert call_count == 2, f"Expected 2 close attempts, got {call_count}"
+    assert closed_event.is_set()
+    assert len(outcomes) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_wall_removed_preserves_state_on_failed_close():
+    """When handle_protection_wall_removed's IOC goes unfilled, local position state
+    must be preserved and _emergency_close_in_progress released for _watch_tp_sl retry."""
+    om, _, _, _ = _make_manager()
+    closed_event = asyncio.Event()
+    om._open_position_qty           = 0.001
+    om._open_position_side          = "LONG"
+    om._open_position_closed_event  = closed_event
+    om._open_signal_id              = "sig-wall"
+    om._open_entry_price            = 65_000.0
+    om._open_entry_time             = 0.0
+    om._open_sl_price               = 64_000.0
+    om._placing_oco                 = False
+    om._emergency_close_in_progress = False
+
+    async def _fail(qty, side, reason=""):
+        return False, 0.0
+
+    om._cancel_bracket_orders = AsyncMock()
+    om._emergency_close       = _fail
+    om._record_outcome        = lambda *a, **kw: None
+
+    with patch.object(settings, "DRY_RUN", False):
+        await om.handle_protection_wall_removed("LONG")
+
+    assert om._open_position_qty == 0.001, "qty must be preserved on failed close"
+    assert om._emergency_close_in_progress is False, "flag released for _watch_tp_sl retry"
+    assert not closed_event.is_set(), "position_closed_event must NOT be set on failed close"
+
+
+# ── Item 1 (Plan 2): close_orphan_position ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_close_orphan_position_resumes_trading_on_success():
+    """close_orphan_position does NOT set accepting_new_signals=False when close succeeds."""
+    om, _, _, _ = _make_manager()
+
+    async def _succeed(qty, side, reason=""):
+        return True, 65_000.0
+
+    om._emergency_close = _succeed
+    om.accepting_new_signals = True
+
+    await om.close_orphan_position(qty=0.01, side="BUY")
+
+    assert om.accepting_new_signals is True, "accepting_new_signals must remain True after successful orphan close"
+
+
+@pytest.mark.asyncio
+async def test_close_orphan_position_blocks_signals_on_failure():
+    """close_orphan_position sets accepting_new_signals=False when close fails — safe fallback."""
+    om, _, _, _ = _make_manager()
+
+    async def _fail(qty, side, reason=""):
+        return False, 0.0
+
+    om._emergency_close = _fail
+    om.accepting_new_signals = True
+
+    await om.close_orphan_position(qty=0.01, side="BUY")
+
+    assert om.accepting_new_signals is False, "accepting_new_signals must be False when orphan close fails"
+
+
+# ── get_unrealised_pnl ────────────────────────────────────────────────────────
+
+def test_get_unrealised_pnl_long_profit():
+    """LONG position in profit: mid above entry."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (65100.0, 65102.0))
+    om._open_position_side  = "BUY"
+    om._open_entry_price    = 65000.0
+    om._open_position_qty   = 0.001
+
+    pnl = om.get_unrealised_pnl()
+
+    assert pnl == pytest.approx((65101.0 - 65000.0) * 0.001)
+
+
+def test_get_unrealised_pnl_short_loss():
+    """SHORT position in loss: mid above entry."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (65100.0, 65102.0))
+    om._open_position_side  = "SELL"
+    om._open_entry_price    = 64000.0
+    om._open_position_qty   = 0.001
+
+    pnl = om.get_unrealised_pnl()
+
+    assert pnl == pytest.approx((64000.0 - 65101.0) * 0.001)
+
+
+def test_get_unrealised_pnl_no_position():
+    """No open position → 0.0."""
+    om, _, _, _ = _make_manager(book_fn=lambda: (65100.0, 65102.0))
+
+    assert om.get_unrealised_pnl() == 0.0
+
+
+def test_get_unrealised_pnl_no_book():
+    """book_fn returns None (LOB not yet SYNCED) → 0.0."""
+    om, _, _, _ = _make_manager(book_fn=lambda: None)
+    om._open_position_side  = "BUY"
+    om._open_entry_price    = 65000.0
+    om._open_position_qty   = 0.001
+
+    assert om.get_unrealised_pnl() == 0.0

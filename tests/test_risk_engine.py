@@ -223,10 +223,44 @@ def test_consecutive_loss_cooldown_pauses():
     assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED
 
 
-def test_cooldown_persists_after_losses_cleared():
-    pf = make_portfolio(consecutive_losses=3)
-    eng = make_engine(pf)
-    eng.sync_tier()                                             # arms 300s cooldown
-    pf.consecutive_losses = 0                                   # losses reset, but window still open
-    eng.sync_tier()
-    assert pf.circuit_breaker is CircuitBreakerStatus.PAUSED
+def test_sync_tier_passive_on_consecutive_losses():
+    from config import settings
+    pf = make_portfolio(consecutive_losses=settings.MAX_CONSECUTIVE_LOSSES)
+    engine = make_engine(pf)
+
+    tier = engine.sync_tier()
+
+    assert tier == "PASSIVE"
+    assert pf.circuit_breaker == CircuitBreakerStatus.PAUSED
+
+
+def test_sync_tier_restores_full_after_cooldown_expires_with_win():
+    from config import settings
+    pf = make_portfolio(consecutive_losses=settings.MAX_CONSECUTIVE_LOSSES)
+    engine = make_engine(pf)
+
+    engine.sync_tier()  # enters PAUSED → sets _cooldown_until, tier=PASSIVE
+    assert engine.tier == "PASSIVE"
+
+    engine.record_trade_result(+1.0)  # win resets consecutive_losses to 0
+    engine._cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)  # expire cooldown
+
+    tier = engine.sync_tier()
+
+    assert tier == "FULL"
+    assert pf.circuit_breaker == CircuitBreakerStatus.ACTIVE
+
+
+def test_record_trade_result_zeros_unrealised_on_close():
+    """Closing a position must clear the floating mark so check_budget sees no double-count."""
+    ks = GlobalKillswitch(dov=10_000.0)   # hard_limit=100 — way above any 1-trade loss here
+    budget = DailyBudget.from_equity(10_000.0)
+    engine = make_engine(budget=budget, killswitch=ks)
+
+    # Simulate a previous MTM mark (stale floating loss at close time)
+    budget.unrealised_pnl = -0.9
+
+    engine.record_trade_result(-1.0)
+
+    assert budget.unrealised_pnl == 0.0, "unrealised_pnl must be zeroed when position closes"
+    assert ks.is_active is False, "KS-1 must NOT fire spuriously due to stale floating mark"

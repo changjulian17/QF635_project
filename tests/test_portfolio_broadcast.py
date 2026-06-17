@@ -182,3 +182,42 @@ async def test_portfolio_mtm_loop_skips_broadcast_when_killswitch_active():
             risk, exe, alerts, hub=hub,
         )
     hub.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mtm_loop_marks_unrealised_and_fires_ks1():
+    """When get_unrealised_pnl() returns a large loss, mark_unrealised wires it into the budget
+    and check_budget fires KS-1, triggering emergency_close_all."""
+    from main import _portfolio_mtm_loop
+    from models import PortfolioState
+    from risk.budget import DailyBudget
+    from risk.engine import RiskEngine
+    from risk.killswitch import GlobalKillswitch
+
+    ks     = GlobalKillswitch(dov=5_000.0)   # hard_limit = 50 USDT
+    budget = DailyBudget.from_equity(5_000.0)
+    pf     = PortfolioState(equity=5_000.0, starting_equity=5_000.0, peak_equity=5_000.0)
+    engine = RiskEngine(portfolio=pf, budget=budget, killswitch=ks)
+
+    om = MagicMock()
+    om.get_unrealised_pnl = MagicMock(return_value=-200.0)   # way above hard_limit=50
+    om.force_close_all = AsyncMock()
+
+    telemetry         = MagicMock()
+    telemetry.write_system_event = MagicMock()
+    strategy_executor = MagicMock()
+    alert_dispatcher  = MagicMock()
+
+    async def fake_sleep(t):
+        return  # one tick then let check_budget fire
+
+    with patch("main.asyncio.sleep", fake_sleep), \
+         patch("main.emergency_close_all", new_callable=AsyncMock) as mock_eca:
+        await _portfolio_mtm_loop(
+            ks, budget, om, pf, telemetry, engine, strategy_executor, alert_dispatcher,
+        )
+
+    assert ks.is_active is True, "KS-1 must fire when floating loss exceeds hard_limit"
+    mock_eca.assert_awaited_once()
+    call_kwargs = mock_eca.await_args
+    assert call_kwargs[0][3] == "KILLSWITCH_BUDGET"

@@ -895,3 +895,53 @@ def test_gate_3_position_size_skipped_when_no_equity_fn():
         assert not signal_q.empty(), "gate must be skipped when equity_fn is None"
 
     asyncio.run(_run())
+
+
+# ── Item 4 (Plan 2): _evaluate exception guard in run() ──────────────────────
+
+def test_evaluate_exception_does_not_crash_run_loop():
+    """An exception inside _evaluate must be caught and logged; run() must continue
+    processing the next signal without crashing the TaskGroup."""
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="UNINITIALISED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+        )
+
+        call_count = 0
+        original_evaluate = ex._evaluate
+
+        async def _patched_evaluate(signal):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("simulated gate exception")
+            await original_evaluate(signal)
+
+        ex._evaluate = _patched_evaluate  # type: ignore[method-assign]
+
+        # Feed 2 signals; first raises, second must still be processed
+        await micro_q.put(_signal())
+        await micro_q.put(_signal())
+
+        run_task = asyncio.create_task(ex.run())
+        # Allow both signals to be consumed
+        await asyncio.sleep(0.05)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+        assert call_count == 2, (
+            f"_evaluate called {call_count} time(s) — expected 2 "
+            "(first signal raised, second signal should still be processed)"
+        )
+
+    asyncio.run(_run())

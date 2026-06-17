@@ -131,8 +131,7 @@ async def _portfolio_mtm_loop(
         await asyncio.sleep(1.0)
         if killswitch.is_active:
             return
-        # Mark the open position to market so KS-1 / risk tiers see unrealised losses now.
-        risk_engine.mark_unrealised(order_manager.unrealised_pnl())
+        risk_engine.mark_unrealised(order_manager.get_unrealised_pnl())
         if killswitch.check_budget(budget.realised_pnl, budget.unrealised_pnl):
             await emergency_close_all(
                 order_manager, portfolio, telemetry, "KILLSWITCH_BUDGET", alert_dispatcher

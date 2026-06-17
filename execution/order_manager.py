@@ -284,6 +284,18 @@ class OrderManager:
             "unrealised_pnl": self.unrealised_pnl(),
         }
 
+    def get_unrealised_pnl(self) -> float:
+        """MTM PnL of open position at current mid-price. 0.0 if no position or no book."""
+        if self._open_position_side is None or self._open_position_qty <= 0.0:
+            return 0.0
+        book = self._book_fn() if self._book_fn else None
+        if book is None:
+            return 0.0
+        mid = (book[0] + book[1]) / 2.0
+        if self._open_position_side == "BUY":
+            return (mid - self._open_entry_price) * self._open_position_qty
+        return (self._open_entry_price - mid) * self._open_position_qty
+
     async def _submit(self, req: MicroOrderRequest) -> None:
         async with self._position_lock:
             if self._has_active_exposure_locked():

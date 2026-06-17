@@ -128,6 +128,7 @@ class RiskEngine:
         self.portfolio.daily_pnl   += pnl
         self.portfolio.peak_equity  = max(self.portfolio.peak_equity, self.portfolio.equity)
         self._budget.realised_pnl  += pnl
+        self._budget.unrealised_pnl = 0.0   # position is closed; floating leg goes to zero
 
         if pnl < 0:
             self.portfolio.consecutive_losses += 1
