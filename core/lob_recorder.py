@@ -213,8 +213,7 @@ class LOBRecorder:
 
                 if event_type == "depthUpdate":
                     if not self._synced:
-                        if len(self._pending_diffs) < _MAX_PENDING_DIFFS:
-                            self._pending_diffs.append(msg)
+                        self._pending_diffs.append(msg)
                     else:
                         self._apply_diff(msg)
                         ts = int(msg.get("E") or time.time() * 1000)
