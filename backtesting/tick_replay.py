@@ -41,9 +41,27 @@ from strategy.microstructure import (
     identify_walls,
     rolling_abs_move_threshold,
 )
+from strategy.spec import EntryRules
 
 _CONSUMED_RATIO = 0.15      # pre-filter: skip walls still intact (mirrors live code)
 _STALE_WALL_MS  = 30_000    # prune wall states absent > 30 s
+
+
+@dataclass
+class VariantConfig:
+    """Per-variant strategy parameters for the multi-variant backtest sweep.
+
+    Defaults reproduce the legacy single-pass behaviour exactly — wall-based stop,
+    TP = settings.ATR_MULTIPLIER_TP, no extra edge floor, no entry gate — so a
+    `baseline` variant matches scripts/run_backtest_singlepass.py byte-for-byte.
+    """
+    name:                str                       = "baseline"
+    stop_mode:           Literal["wall", "vol_floor"] = "wall"
+    stop_floor_atr_mult: float                     = 0.0
+    atr_mult_tp:         float                     = settings.ATR_MULTIPLIER_TP
+    min_edge_bps:        float                     = 0.0
+    apply_entry_gate:    bool                      = False
+    entry_rules:         Optional[EntryRules]      = None
 
 
 @dataclass
@@ -91,6 +109,7 @@ class TickReplayEngine:
         starting_equity: float = 10_000.0,
         candle_minutes: int = 1,
         collect_features: bool = False,
+        variant: Optional[VariantConfig] = None,
     ) -> None:
         self._db_path         = db_path
         self._fc              = FeatureComputer(FeatureParams(**params.get("feature", {})))
@@ -99,6 +118,15 @@ class TickReplayEngine:
         self._starting_equity = starting_equity
         self._candle_minutes  = candle_minutes
         self._collect_features = collect_features
+
+        # Variant config — defaults reproduce legacy single-pass behaviour exactly.
+        self._variant = variant or VariantConfig()
+        # Entry-gate scorer (only when the variant opts in). Lazy import avoids a
+        # circular dependency at module load (executor → spec, but not backtesting).
+        self._gate_scorer = None
+        if self._variant.apply_entry_gate:
+            from strategy.executor import RuleBasedScorer
+            self._gate_scorer = RuleBasedScorer(self._variant.entry_rules)
 
         # Public — populated when collect_features=True
         self.feature_history: list[tuple[int, FeatureVector]] = []
@@ -514,27 +542,46 @@ class TickReplayEngine:
             return
         if self._equity <= 0:
             return
-        # SL at protection wall price — mirrors live order_manager which uses
-        # protection_wall.price (not the consumed wall that was swept).
-        sl_price = signal.protection_wall.price
-        # Guard: SL must be on the correct side of entry price
-        if signal.direction == "LONG" and sl_price >= entry_price:
+
+        # Optional entry gate — mirror the live Gate 2 confidence check. fv is None
+        # during warm-up (rsi not ready), which is a skip just like the live path.
+        if self._gate_scorer is not None:
+            fv = self._fc.compute(self._cvd, self._shared_state)
+            if fv is None or self._gate_scorer.score(fv, signal) < settings.MIN_CONFIDENCE:
+                return
+
+        # The protection wall must sit on the correct side of entry (sweep with
+        # protection behind it). This gate is identical across stop modes.
+        wall_price = signal.protection_wall.price
+        if signal.direction == "LONG" and wall_price >= entry_price:
             return
-        if signal.direction == "SHORT" and sl_price <= entry_price:
+        if signal.direction == "SHORT" and wall_price <= entry_price:
             return
-        sl_dist = abs(entry_price - sl_price)
+
+        # Stop distance. "wall": stop at the protection wall (legacy behaviour).
+        # "vol_floor": floor the stop at stop_floor_atr_mult × ATR so it clears the
+        # microstructure noise band (the live <3 s instant-stop failure mode).
+        wall_dist = abs(entry_price - wall_price)
+        if self._variant.stop_mode == "vol_floor":
+            sl_dist = max(wall_dist, self._variant.stop_floor_atr_mult * self._fc.current_atr)
+        else:
+            sl_dist = wall_dist
         if sl_dist < 1e-9:
             return
-        # Breakeven filter: TP gross = ATR_MULTIPLIER_TP×sl_dist×qty; need that > round-trip cost.
-        rr = settings.ATR_MULTIPLIER_TP
-        if rr * sl_dist < entry_price * self._cost_model.round_trip_pct:
+        sl_price = entry_price - sl_dist if signal.direction == "LONG" else entry_price + sl_dist
+
+        # Breakeven/edge filter: TP gross must exceed the larger of round-trip cost and
+        # the variant's min-edge floor (min_edge_bps=0 ⇒ identical to the legacy check).
+        rr = self._variant.atr_mult_tp
+        edge_floor = max(self._cost_model.round_trip_pct, self._variant.min_edge_bps / 1e4)
+        if rr * sl_dist < entry_price * edge_floor:
             return
 
         # Position sizing aligned with live: 1% equity risk × Kelly fraction.
         # (Confidence is not scored in backtest; Kelly fraction alone is applied.)
         risk_usd = self._equity * settings.RISK_PER_TRADE_PCT * settings.KELLY_FRACTION
         qty      = risk_usd / sl_dist
-        # TP at ATR_MULTIPLIER_TP × sl_dist — mirrors live OCO bracket formula.
+        # TP at rr × sl_dist — mirrors live OCO bracket formula.
         if signal.direction == "LONG":
             tp_price = entry_price + rr * sl_dist
         else:

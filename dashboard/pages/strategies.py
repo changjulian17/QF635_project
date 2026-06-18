@@ -15,6 +15,7 @@ import dash_bootstrap_components as dbc
 from config import settings
 from dashboard._db import (
     fetch_backtest_results,
+    fetch_sweep_results,
     fetch_strategies,
     fetch_gate_funnel_drift,
     DBOffline,
@@ -38,6 +39,20 @@ _leaderboard_tab = html.Div([
     html.H5("Walk-Forward Details", className="mt-3 mb-2"),
     html.P("Click a strategy row to see full walk-forward metrics.", className="text-muted small"),
     html.Div(id="bt-detail-panel"),
+])
+
+
+# ── Variant Sweep tab layout (multi-variant backtest leaderboard) ──────────────
+
+_sweep_tab = html.Div([
+    dcc.Interval(id="sweep-interval", interval=30000),
+    html.H4("Variant Sweep Leaderboard", className="mb-2 mt-3"),
+    html.P(
+        "Ranked by expected_value (avg $ PnL / trade). Run "
+        "python scripts/run_backtest_sweep.py to (re)generate.",
+        className="text-muted small",
+    ),
+    html.Div(id="sweep-content"),
 ])
 
 
@@ -81,6 +96,7 @@ layout = html.Div([
     html.H3("Strategies", className="mb-3"),
     dbc.Tabs([
         dbc.Tab(_leaderboard_tab, label="Leaderboard", tab_id="strat-tab-leaderboard"),
+        dbc.Tab(_sweep_tab, label="Variant Sweep", tab_id="strat-tab-sweep"),
         dbc.Tab(_registry_tab, label="Live & Decay", tab_id="strat-tab-registry"),
     ], id="strat-tabs", active_tab="strat-tab-leaderboard"),
 ])
@@ -166,6 +182,48 @@ def update_backtest(n):
         html.Hr(),
         make_table(benchmarks, "Benchmarks", offset=len(strategies)),
     ]), results
+
+
+# ── Variant Sweep callback ─────────────────────────────────────────────────────
+
+@callback(
+    Output("sweep-content", "children"),
+    Input("sweep-interval", "n_intervals"),
+)
+def update_sweep(n):
+    results = fetch_sweep_results()
+    if isinstance(results, DBOffline):
+        return dbc.Alert("Sweep DB offline.", color="secondary")
+    if not results:
+        return dbc.Alert(
+            "No sweep results yet — run python scripts/run_backtest_sweep.py.",
+            color="info",
+        )
+
+    rows = []
+    for r in results:
+        ev = r.get("expected_value") or 0.0
+        rows.append(html.Tr([
+            html.Td(r.get("strategy", "—")),
+            html.Td(r.get("total_trades", 0)),
+            html.Td(f"{r.get('win_rate_pct') or 0:.1f}%"),
+            html.Td(dbc.Badge(f"{ev:+.4f}", color="success" if ev > 0 else "danger")),
+            html.Td(f"{(r.get('total_return_pct') or 0):.2f}%"),
+            html.Td(f"{r.get('profit_factor') or 0:.2f}"),
+            html.Td(f"{r.get('composite_score') or 0:.3f}"),
+        ]))
+
+    return dbc.Table(
+        [
+            html.Thead(html.Tr([
+                html.Th("Variant"), html.Th("Trades"), html.Th("Win%"),
+                html.Th("Exp. Value ($)"), html.Th("Return"), html.Th("PF"),
+                html.Th("Score"),
+            ])),
+            html.Tbody(rows),
+        ],
+        striped=True, bordered=True, hover=True, size="sm",
+    )
 
 
 @callback(

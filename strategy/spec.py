@@ -42,6 +42,7 @@ class EntryRules:
     sweep_qty_mult:   float = 2.0    # microstructure: sweep qty multiplier
     atr_mult_sl:      float = 1.5    # risk: ATR multiplier for stop-loss
     atr_mult_tp:      float = 3.0    # risk: ATR multiplier for take-profit
+    stop_floor_atr_mult: float = 0.0  # backtest: floor stop at N×ATR (0 = wall-only stop)
     micro_price_move_floor_bps: float = settings.MICRO_PRICE_MOVE_FLOOR_BPS
     micro_price_move_percentile: float = settings.MICRO_PRICE_MOVE_PERCENTILE
     protection_max_distance_bps: float = settings.PROTECTION_MAX_DISTANCE_BPS
@@ -128,6 +129,7 @@ class StrategySpec:
             "sweep_qty_mult":        self.entry_rules.sweep_qty_mult,
             "atr_mult_sl":           self.entry_rules.atr_mult_sl,
             "atr_mult_tp":           self.entry_rules.atr_mult_tp,
+            "stop_floor_atr_mult":   self.entry_rules.stop_floor_atr_mult,
             "micro_price_move_floor_bps": self.entry_rules.micro_price_move_floor_bps,
             "micro_price_move_percentile": self.entry_rules.micro_price_move_percentile,
             "protection_max_distance_bps": self.entry_rules.protection_max_distance_bps,
@@ -160,6 +162,7 @@ class StrategySpec:
                 sweep_qty_mult   = d.get("sweep_qty_mult",   2.0),
                 atr_mult_sl      = d.get("atr_mult_sl",      1.5),
                 atr_mult_tp      = d.get("atr_mult_tp",      3.0),
+                stop_floor_atr_mult = d.get("stop_floor_atr_mult", 0.0),
                 micro_price_move_floor_bps = d.get(
                     "micro_price_move_floor_bps", settings.MICRO_PRICE_MOVE_FLOOR_BPS
                 ),

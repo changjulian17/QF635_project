@@ -13,6 +13,7 @@ MAIN_DB = "cryptosentinel.db"
 REGISTRY_DB = settings.REGISTRY_DB
 BACKTEST_DB = settings.BACKTEST_RESULTS_DB
 LOB_TICK_DB = settings.LOB_TICK_DB
+SWEEP_DB = "data/sweep_results.db"   # written by scripts/run_backtest_sweep.py
 
 
 class DBOffline(Exception):
@@ -57,6 +58,15 @@ def backtest_db() -> Generator[sqlite3.Connection, None, None]:
 @contextmanager
 def lob_tick_db() -> Generator[sqlite3.Connection, None, None]:
     conn = _connect(LOB_TICK_DB)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def sweep_db() -> Generator[sqlite3.Connection, None, None]:
+    conn = _connect(SWEEP_DB)
     try:
         yield conn
     finally:
@@ -423,5 +433,22 @@ def fetch_backtest_results() -> Union[list[dict], DBOffline]:
             rows = conn.execute("SELECT * FROM results ORDER BY composite_score DESC").fetchall()
         except sqlite3.OperationalError as e:
             logger.warning("[DB] backtest offline: %s", e)
+            return DBOffline(str(e))
+    return [dict(r) for r in rows]
+
+
+def fetch_sweep_results() -> Union[list[dict], DBOffline]:
+    """Multi-variant sweep leaderboard, ranked by expected_value (avg $ PnL/trade).
+
+    Reads the dedicated data/sweep_results.db written by run_backtest_sweep.py — kept
+    separate from BACKTEST_DB so the chart-pattern walk-forward leaderboard is untouched.
+    """
+    if not os.path.exists(SWEEP_DB):
+        return []
+    with sweep_db() as conn:
+        try:
+            rows = conn.execute("SELECT * FROM results ORDER BY expected_value DESC").fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("[DB] sweep offline: %s", e)
             return DBOffline(str(e))
     return [dict(r) for r in rows]

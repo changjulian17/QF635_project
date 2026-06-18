@@ -89,6 +89,11 @@ class FeatureComputer:
     def wall_sigma(self) -> float:
         return self._p.wall_sigma
 
+    @property
+    def current_atr(self) -> float:
+        """Latest Wilder ATR in price units. 0.0 until atr_period candles are seen."""
+        return self._atr
+
     # ── Candle update ─────────────────────────────────────────────────────────
 
     def update_candle(self, candle: Candle) -> None:
