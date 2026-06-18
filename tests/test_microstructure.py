@@ -82,45 +82,45 @@ def test_wall_side_field_correct():
 def test_absorption_bid_wall_with_sell_aggression():
     # Bid wall, sell aggression (CVD negative) → should arm
     ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
-    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
+    assert detect_absorption(ws, cvd_delta=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
 
 
 def test_absorption_ask_wall_with_buy_aggression():
     # Ask wall, buy aggression (CVD positive) → should arm
     ws = _wall(side="ask", qty_initial=50.0, qty_current=40.0, age_ms=600)
-    assert detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
+    assert detect_absorption(ws, cvd_delta=0.5, price_move_pct=0.0001, reload_ratio=0.80) is True
 
 
 def test_absorption_false_wrong_direction_bid():
     # Bid wall but buy aggression (positive CVD) → wrong direction → False
     ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
-    assert detect_absorption(ws, cvd_delta_1t=0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
+    assert detect_absorption(ws, cvd_delta=0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_wrong_direction_ask():
     # Ask wall but sell aggression (negative CVD) → wrong direction → False
     ws = _wall(side="ask", qty_initial=50.0, qty_current=40.0, age_ms=600)
-    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
+    assert detect_absorption(ws, cvd_delta=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_not_persistent():
     ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=100)  # < 500 ms
-    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
+    assert detect_absorption(ws, cvd_delta=-0.5, price_move_pct=0.0001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_price_breaks():
     ws = _wall(side="bid", qty_initial=50.0, qty_current=40.0, age_ms=600)
-    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.001, reload_ratio=0.80) is False
+    assert detect_absorption(ws, cvd_delta=-0.5, price_move_pct=0.001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_no_aggression():
     ws = _wall(side="bid", age_ms=600)
-    assert detect_absorption(ws, cvd_delta_1t=0.0, price_move_pct=0.0001, reload_ratio=0.80) is False
+    assert detect_absorption(ws, cvd_delta=0.0, price_move_pct=0.0001, reload_ratio=0.80) is False
 
 
 def test_absorption_false_when_reload_low():
     ws = _wall(side="bid", qty_initial=50.0, qty_current=25.0, age_ms=600)  # reload=0.50 < 0.70
-    assert detect_absorption(ws, cvd_delta_1t=-0.5, price_move_pct=0.0001, reload_ratio=0.50) is False
+    assert detect_absorption(ws, cvd_delta=-0.5, price_move_pct=0.0001, reload_ratio=0.50) is False
 
 
 # ── detect_sweep_with_protection ─────────────────────────────────────────────
@@ -332,7 +332,9 @@ def test_absorption_emits_hub_event_on_first_arm():
     hub = MagicMock()
     hub.broadcast = AsyncMock()
     detector = _make_detector(hub=hub)
-    detector._cvd.get_cvd_delta = MagicMock(return_value=-1.0)  # sellers aggressing → bid wall absorbs
+    # get_raw_cvd returns -1.0; _prev_snapshot_raw_cvd starts at 0.0
+    # → snapshot_cvd_delta = -1.0 − 0.0 = -1.0 (sellers aggressing bid wall)
+    detector._cvd.get_raw_cvd.return_value = -1.0
 
     now = int(time.time() * 1000)
     wall = WallState(
@@ -367,7 +369,7 @@ def test_absorption_does_not_re_emit_on_subsequent_tick():
     hub = MagicMock()
     hub.broadcast = AsyncMock()
     detector = _make_detector(hub=hub)
-    detector._cvd.get_cvd_delta = MagicMock(return_value=-1.0)
+    detector._cvd.get_raw_cvd.return_value = -1.0  # sell aggression → absorption re-confirmed
 
     now = int(time.time() * 1000)
     wall = WallState(
@@ -438,7 +440,7 @@ def test_no_hub_no_emission_no_crash():
     from unittest.mock import MagicMock
 
     detector = _make_detector(hub=None)
-    detector._cvd.get_cvd_delta = MagicMock(return_value=-1.0)
+    detector._cvd.get_raw_cvd.return_value = -1.0  # sell aggression; no hub so no broadcast attempt
 
     now = int(time.time() * 1000)
     detector._wall_states[30000.0] = WallState(
@@ -462,6 +464,7 @@ def _make_detector(feature_computer=None, hub=None):
     cvd = MagicMock()
     cvd.get_cvd_delta.return_value = 0.0
     cvd.get_cvd_tick_std.return_value = 0.0
+    cvd.get_raw_cvd.return_value = 0.0
     cvd.is_warmed_up = False
 
     return MicrostructureDetector(

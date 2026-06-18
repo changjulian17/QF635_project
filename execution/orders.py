@@ -1,15 +1,16 @@
 """
 Order domain classes — one class per order shape.
 
-Each subclass wraps the parameters for a specific Binance order type and
+Each subclass wraps the parameters for a specific Binance Futures order type and
 exposes them via to_entry_params(), returning the kwargs dict for the
 matching AsyncClient method:
 
-  IOCLimitOrder → client.create_order(**order.to_entry_params())
-  OCOOrder      → client.create_oco_order(**order.to_entry_params())
+  IOCLimitOrder     → client.futures_create_order(**order.to_entry_params())
+  FuturesMarketOrder → client.futures_create_order(**order.to_entry_params())
+  FuturesTPOrder    → client.futures_create_order(**order.to_entry_params())
+  FuturesSLOrder    → client.futures_create_order(**order.to_entry_params())
 
-Adding a new order type (MarketOrder, PostOnlyLimit, TWAP bracket …)
-requires only a new subclass — OrderManager is not modified.
+Adding a new order type requires only a new subclass — OrderManager is not modified.
 """
 
 from abc import ABC, abstractmethod
@@ -46,50 +47,77 @@ class IOCLimitOrder(Order):
             "type":        "LIMIT",
             "timeInForce": "IOC",
             "quantity":    self.quantity,
-            "price":       str(round(self.price, 2)),
+            "price":       str(round(self.price, 1)),
         }
 
 
 @dataclass
-class OCOOrder(Order):
+class FuturesMarketOrder(Order):
     """
-    One-Cancels-the-Other bracket: TP limit + SL stop-limit.
+    Futures market order for demo account entries and emergency closes.
 
-    sl_limit is set slightly inside sl_price so the stop-limit leg
-    fills immediately on trigger rather than posting passively:
-      SELL bracket: sl_limit = sl_price × 0.999  (below → fills on downmove)
-      BUY  bracket: sl_limit = sl_price × 1.001  (above → fills on upmove)
+    Executes immediately at best available price. Used when BINANCE_DEMO=True
+    because the demo book has thin synthetic liquidity that causes IOC LIMIT
+    orders to expire unfilled.
     """
-    tp_price: float = 0.0
-    sl_price: float = 0.0
-    sl_limit: float = 0.0    # maps to belowPrice (SELL bracket) or abovePrice (BUY bracket)
-
     def to_entry_params(self) -> dict:
-        # python-binance ≥1.0.28 targets the new /api/v3/orderList/oco endpoint
-        # which uses aboveType/belowType instead of the old stopPrice/stopLimitPrice flat params.
-        # SELL bracket (exit LONG): TP limit is above price, SL stop-limit is below.
-        # BUY  bracket (exit SHORT): SL stop-limit is above price, TP limit is below.
-        base: dict = {
+        return {
             "symbol":   self.symbol,
             "side":     self.side,
+            "type":     "MARKET",
             "quantity": self.quantity,
         }
-        if self.side == "SELL":
-            base.update({
-                "aboveType":        "LIMIT_MAKER",
-                "abovePrice":       str(round(self.tp_price, 2)),
-                "belowType":        "STOP_LOSS_LIMIT",
-                "belowStopPrice":   str(round(self.sl_price, 2)),
-                "belowPrice":       str(round(self.sl_limit, 2)),
-                "belowTimeInForce": "GTC",
-            })
-        else:
-            base.update({
-                "aboveType":        "STOP_LOSS_LIMIT",
-                "aboveStopPrice":   str(round(self.sl_price, 2)),
-                "abovePrice":       str(round(self.sl_limit, 2)),
-                "aboveTimeInForce": "GTC",
-                "belowType":        "LIMIT_MAKER",
-                "belowPrice":       str(round(self.tp_price, 2)),
-            })
-        return base
+
+
+@dataclass
+class FuturesTPOrder(Order):
+    """
+    Futures take-profit limit bracket order (reduceOnly). type=TAKE_PROFIT.
+
+    Uses the standard /fapi/v1/order endpoint (not the algo endpoint), so it
+    returns a numeric orderId that can be cancelled with futures_cancel_order.
+    sl_limit is set slightly inside stop_price to guarantee a fill on trigger:
+      SELL TP (exit LONG): limit_price == stop_price (price is above market)
+      BUY  TP (exit SHORT): limit_price == stop_price (price is below market)
+    """
+    stop_price:  float = 0.0
+    limit_price: float = 0.0
+
+    def to_entry_params(self) -> dict:
+        return {
+            "symbol":      self.symbol,
+            "side":        self.side,
+            "type":        "TAKE_PROFIT",
+            "timeInForce": "GTC",
+            "quantity":    self.quantity,
+            "price":       str(round(self.limit_price, 1)),
+            "stopPrice":   str(round(self.stop_price, 1)),
+            "reduceOnly":  "true",
+        }
+
+
+@dataclass
+class FuturesSLOrder(Order):
+    """
+    Futures stop-loss limit bracket order (reduceOnly). type=STOP.
+
+    Uses the standard /fapi/v1/order endpoint (not the algo endpoint), so it
+    returns a numeric orderId that can be cancelled with futures_cancel_order.
+    limit_price is set slightly inside stop_price to fill immediately on trigger:
+      SELL SL (exit LONG): limit_price = stop_price × 0.999
+      BUY  SL (exit SHORT): limit_price = stop_price × 1.001
+    """
+    stop_price:  float = 0.0
+    limit_price: float = 0.0
+
+    def to_entry_params(self) -> dict:
+        return {
+            "symbol":      self.symbol,
+            "side":        self.side,
+            "type":        "STOP",
+            "timeInForce": "GTC",
+            "quantity":    self.quantity,
+            "price":       str(round(self.limit_price, 1)),
+            "stopPrice":   str(round(self.stop_price, 1)),
+            "reduceOnly":  "true",
+        }

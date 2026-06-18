@@ -1,0 +1,16 @@
+WebSocket Diagnostic — HEARTBEAT LATENCY MEASUREMENT
+  Measuring bookTicker delta on wss://fstream.binance.com for 60s
+  Validates whether HEARTBEAT_CRITICAL_MS=5000ms is too tight
+
+
+  Connecting to wss://fstream.binance.com/stream?streams=btcusdt@bookTicker for 60s …
+
+  bookTicker delta distribution (4975 msgs in 60s):
+    min=3ms  p50=34ms  p95=89ms  p99=117ms  max=135ms
+    msgs > 5s  (current CRITICAL_MS):  0 / 4975  (0%)
+    msgs > 30s (proposed CRITICAL_MS): 0 / 4975  (0%)
+
+────────────────────────────────────────────────────────────────
+  ✓  delta is consistently < 5s in this window.
+  Root cause may be transient. Check logs around the reconnect timestamps.
+────────────────────────────────────────────────────────────────

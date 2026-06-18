@@ -61,6 +61,7 @@ stop_process "LOB Recorder"   "core.lob_recorder"
 ENGINE_PID_FILE="/tmp/cs_engine.pid"
 if [[ -f "$ENGINE_PID_FILE" ]]; then
     engine_pid=$(cat "$ENGINE_PID_FILE")
+    rm -f "$ENGINE_PID_FILE"
     if kill -0 "$engine_pid" 2>/dev/null; then
         echo "  Stopping Trading Engine (PID: $engine_pid) ..."
         kill -TERM "$engine_pid" 2>/dev/null || true
@@ -76,11 +77,11 @@ if [[ -f "$ENGINE_PID_FILE" ]]; then
         done
         log_ok "Trading Engine stopped"
     else
-        log_warn "Trading Engine — not running (stale PID file)"
+        log_warn "Trading Engine — stale PID file (PID $engine_pid already dead), falling back to pgrep"
+        stop_process "Trading Engine" "[Pp]ython.*main\.py"
     fi
-    rm -f "$ENGINE_PID_FILE"
 else
-    stop_process "Trading Engine" "python.*main\.py"
+    stop_process "Trading Engine" "[Pp]ython.*main\.py"
 fi
 stop_process "Dash Dashboard" "dashboard/app\.py"
 

@@ -7,20 +7,24 @@ from config import settings
 
 
 def test_binance_connection() -> bool:
-    print(f"API key loaded: {'yes' if settings.BINANCE_API_KEY else 'NO — check .env'}")
-    print(f"API secret loaded: {'yes' if settings.BINANCE_API_SECRET else 'NO — check .env'}")
-    print(f"Testnet mode: {settings.BINANCE_TESTNET}")
+    _api_key    = settings.DEMO_BINANCE_API_KEY if settings.BINANCE_DEMO else settings.BINANCE_API_KEY
+    _api_secret = settings.DEMO_BINANCE_API_SECRET if settings.BINANCE_DEMO else settings.BINANCE_API_SECRET
+    _mode_label = "demo" if settings.BINANCE_DEMO else "testnet" if settings.BINANCE_TESTNET else "live"
+    print(f"API key loaded: {'yes' if _api_key else 'NO — check .env'}")
+    print(f"API secret loaded: {'yes' if _api_secret else 'NO — check .env'}")
+    print(f"Demo mode: {settings.BINANCE_DEMO}  Testnet mode: {settings.BINANCE_TESTNET}")
     print("-" * 50)
 
     try:
         client = Client(
-            api_key=settings.BINANCE_API_KEY,
-            api_secret=settings.BINANCE_API_SECRET,
-            testnet=settings.BINANCE_TESTNET,
+            api_key    = _api_key,
+            api_secret = _api_secret,
+            testnet    = settings.BINANCE_TESTNET,
+            demo       = settings.BINANCE_DEMO,
         )
 
         server_time = client.get_server_time()
-        print(f"✓ Connected to Binance testnet")
+        print(f"✓ Connected to Binance {_mode_label}")
         print(f"✓ Server time: {server_time}")
 
         account = client.get_account()
@@ -40,7 +44,8 @@ def test_binance_connection() -> bool:
 
 
 if __name__ == "__main__":
-    print("Testing Binance testnet connection...")
+    _label = "demo" if settings.BINANCE_DEMO else "testnet" if settings.BINANCE_TESTNET else "live"
+    print(f"Testing Binance {_label} connection...")
     print("-" * 50)
     ok = test_binance_connection()
     print("-" * 50)

@@ -25,7 +25,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config import settings
-from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
+from core.lob_sync import SeedDiscontinuity, futures_is_contiguous, futures_seed_bridge_ok
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +38,10 @@ _BUCKET_WIDTH        = 1.0     # USD
 _FLUSH_RECORDS       = 100
 _FLUSH_SECONDS       = 5.0
 _MAX_RECONNECT_DELAY = 60.0
-_SEED_MAX_ATTEMPTS   = 3       # REST seed retries before reconnecting to reseed
-_MAX_PENDING_DIFFS   = 1_000   # cap diffs buffered while unsynced (bounds memory)
+_SEED_MAX_ATTEMPTS   = 3       # REST seed retries before giving up (stay unsynced, no recording)
 _MAX_BUFFER_SIZE     = 10_000
 _RETENTION_DAYS      = 7
 _CLEANUP_INTERVAL    = 86_400.0
-
-_STREAMS = (
-    f"{settings.SYMBOL.lower()}@depth@100ms",
-    f"{settings.SYMBOL.lower()}@aggTrade",
-)
 
 
 class LOBRecorder:
@@ -157,32 +151,24 @@ class LOBRecorder:
             await asyncio.sleep(self._reconnect_delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, _MAX_RECONNECT_DELAY)
 
-    async def _fetch_rest_snapshot(self) -> dict:
-        """Fetch a REST depth snapshot (extracted for testability)."""
-        url = "https://api.binance.com/api/v3/depth"
-        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.json()
-
     async def _sync_snapshot(self) -> None:
-        """Seed the local LOB from a REST snapshot, retrying on failure.
-
-        Only sets _synced=True after a successful seed — never records snapshots
-        built from partial diffs (which would poison backtest data).
-        """
+        """Fetch a REST depth snapshot to seed the local LOB, then apply any buffered diffs."""
+        url = f"{settings.LOB_RECORDER_REST}/fapi/v1/depth"
+        params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
         for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
             try:
-                snap = await self._fetch_rest_snapshot()
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        resp.raise_for_status()
+                        snap = await resp.json()
 
                 self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
                 self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
-                last_uid = snap["lastUpdateId"]
-                # Apply buffered diffs only if they bridge the snapshot gaplessly
-                # (first straddles lastUpdateId+1, rest contiguous) — else reseed.
+                last_uid = int(snap["lastUpdateId"])
+                # Futures bridge/contiguity: first event straddles lastUpdateId
+                # (U <= lastUpdateId <= u); each later event's pu == previous u.
                 prev_u, first = last_uid, True
                 for event in self._pending_diffs:
                     u = int(event["u"])
@@ -190,11 +176,13 @@ class LOBRecorder:
                         continue
                     U = int(event.get("U", 0))
                     if first:
-                        if not seed_bridge_ok(U, u, last_uid):
+                        if not futures_seed_bridge_ok(U, u, last_uid):
                             raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
                         first = False
-                    elif not is_contiguous(prev_u, U):
-                        raise SeedDiscontinuity(f"gap U={U} != prev_u+1={prev_u + 1}")
+                    else:
+                        pu = int(event.get("pu", 0))
+                        if not futures_is_contiguous(prev_u, pu):
+                            raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
                     self._apply_diff(event)
                     prev_u = u
                 self._pending_diffs.clear()
@@ -202,7 +190,7 @@ class LOBRecorder:
                 self._synced = True
                 logger.info(
                     "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
-                    prev_u, len(self._bid_book), len(self._ask_book),
+                    last_uid, len(self._bid_book), len(self._ask_book),
                 )
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
@@ -213,12 +201,11 @@ class LOBRecorder:
                 )
                 await asyncio.sleep(min(2 ** (attempt - 1), 5))
 
-        # All attempts failed — flag for reconnect/reseed; stay unsynced meanwhile.
+        # All attempts failed — stay unsynced so nothing is recorded until a reseed.
         self._pending_diffs.clear()
         self._synced = False
-        self._seed_failed = True
         logger.critical(
-            "[LOBRec] LOB seed failed after %d attempts — reconnecting to reseed",
+            "[LOBRec] LOB seed failed after %d attempts — not recording until reseed",
             _SEED_MAX_ATTEMPTS,
         )
 
@@ -231,13 +218,17 @@ class LOBRecorder:
                 break
             try:
                 outer = json.loads(raw)
+                stream_name = outer.get("stream", "")
                 msg = outer.get("data", outer)
-                event_type = msg.get("e")
+                event_type = msg.get("e") or (
+                    "aggTrade"    if "@aggTrade" in stream_name else
+                    "depthUpdate" if "@depth"   in stream_name else
+                    None
+                )
 
                 if event_type == "depthUpdate":
                     if not self._synced:
-                        if len(self._pending_diffs) < _MAX_PENDING_DIFFS:
-                            self._pending_diffs.append(msg)
+                        self._pending_diffs.append(msg)
                     else:
                         self._apply_diff(msg)
                         ts = int(msg.get("E") or time.time() * 1000)
@@ -256,6 +247,11 @@ class LOBRecorder:
                         float(msg["q"]),
                         1 if msg["m"] else 0,
                     ))
+
+                else:
+                    logger.debug(
+                        "[LOBRec] Unrecognised event: stream=%s e=%s", stream_name, event_type
+                    )
 
                 await self._maybe_flush()
 
@@ -394,6 +390,10 @@ class LOBRecorder:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_depth_ts ON depth_snapshots(ts_event)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON agg_trades(ts_event)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trades_cov "
+            "ON agg_trades(ts_event, qty, is_buyer_maker)"
+        )
         conn.commit()
         return conn
 

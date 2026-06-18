@@ -53,6 +53,8 @@ class GlobalKillswitch:
 
     def check_heartbeat(self, heartbeat_status: str, delta_ms: float) -> bool:
         """KS-2: fire after settings.HEARTBEAT_CONSEC_LIMIT consecutive CRITICAL packets."""
+        if not settings.HEARTBEAT_KS2_ENABLED:
+            return False
         if self._state.fired:
             return True
         if heartbeat_status == "CRITICAL":

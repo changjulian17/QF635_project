@@ -48,6 +48,17 @@ if ! "$PYTHON" "$SCRIPT_DIR/scripts/test_connection.py"; then
 fi
 log_ok "Connectivity OK"
 
+# Rotate previous log to timestamped archive before starting fresh
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+if [[ -f "$LOG_DIR/cryptosentinel.log" ]]; then
+    mv "$LOG_DIR/cryptosentinel.log" \
+       "$LOG_DIR/cryptosentinel_$(date +%Y%m%d_%H%M%S).log"
+    log_ok "Previous log archived"
+fi
+
+export TRADING_MODE=live
+
 # --- Launch each component in a new Terminal window ---
 # NOTE: macOS only — uses osascript / Terminal.app.
 # On Linux, start each component manually using the commands printed at the end of this script.
@@ -64,9 +75,9 @@ open_window() {
 }
 
 echo "Launching components..."
-open_window "LOB Recorder"    "'$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine"  "'$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
-open_window "Dash Dashboard"  "'$PYTHON' dashboard/app.py"
+open_window "LOB Recorder"    "TRADING_MODE=live '$PYTHON' -m core.lob_recorder"
+open_window "Trading Engine"  "TRADING_MODE=live '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Dash Dashboard"  "TRADING_MODE=live '$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""

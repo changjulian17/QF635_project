@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Testnet execution test: real orders on Binance testnet + synthetic signal injection.
+# Demo futures execution test: real orders on Binance demo futures + synthetic signal injection.
 # NOT for paper trading, backtesting, or production.
 set -euo pipefail
 
@@ -15,7 +15,7 @@ log_ok()   { echo -e "${GREEN}[OK]${NC}  $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()  { echo -e "${RED}[ERR]${NC} $*"; }
 
-echo "=== CryptoSentinel TESTNET startup ==="
+echo "=== CryptoSentinel DEMO FUTURES startup ==="
 
 # --- Pre-flight: .env ---
 if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
@@ -23,7 +23,8 @@ if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
     exit 1
 fi
 log_ok ".env found"
-log_warn "TESTNET MODE — DRY_RUN=false, real orders will be placed on Binance testnet"
+log_warn "DEMO FUTURES MODE — DRY_RUN=false, real orders will be placed on Binance demo futures"
+export TRADING_MODE=testnet
 
 # --- Pre-flight: .venv ---
 if [[ ! -f "$SCRIPT_DIR/.venv/bin/activate" ]]; then
@@ -45,11 +46,20 @@ fi
 
 # --- Pre-flight: connectivity test ---
 echo "Running connectivity test (scripts/test_connection.py)..."
-if ! "$PYTHON" "$SCRIPT_DIR/scripts/test_connection.py"; then
+if ! BINANCE_DEMO=true BINANCE_TESTNET=false "$PYTHON" "$SCRIPT_DIR/scripts/test_connection.py"; then
     log_err "Connectivity test failed. Check your .env credentials and network."
     exit 1
 fi
 log_ok "Connectivity OK"
+
+# Rotate previous log to timestamped archive before starting fresh
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+if [[ -f "$LOG_DIR/cryptosentinel.log" ]]; then
+    mv "$LOG_DIR/cryptosentinel.log" \
+       "$LOG_DIR/cryptosentinel_$(date +%Y%m%d_%H%M%S).log"
+    log_ok "Previous log archived"
+fi
 
 # --- Launch each component in a new Terminal window ---
 # NOTE: macOS only — uses osascript / Terminal.app.
@@ -66,13 +76,13 @@ open_window() {
     "
 }
 
-echo "Launching TESTNET components (DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true)..."
-open_window "LOB Recorder"               "'$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine (TESTNET)"   "DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true TIMEFRAME=1s '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
-open_window "Dash Dashboard"             "'$PYTHON' dashboard/app.py"
+echo "Launching DEMO FUTURES components (DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true)..."
+open_window "LOB Recorder"                  "TRADING_MODE=testnet '$PYTHON' -m core.lob_recorder"
+open_window "Trading Engine (DEMO FUTURES)" "TRADING_MODE=testnet '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Dash Dashboard"                "TRADING_MODE=testnet '$PYTHON' dashboard/app.py"
 
 log_ok "All three components launched in separate Terminal windows."
 echo ""
 echo "  LOB Recorder             → python -m core.lob_recorder"
-echo "  Trading Engine (TESTNET) → DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true python main.py"
+echo "  Trading Engine (DEMO FUTURES) → BINANCE_DEMO=true BINANCE_TESTNET=false DRY_RUN=false MIN_CONFIDENCE=0.1 TEST_SIGNAL_INJECT=true python main.py"
 echo "  Dash Dashboard           → http://127.0.0.1:8050"

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict, model_validator
 
@@ -9,9 +11,14 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: str = ""
     BINANCE_API_SECRET: str = ""
     BINANCE_TESTNET: bool = True
-    WS_BASE: str = "wss://stream.testnet.binance.vision"
-    REST_BASE: str = "https://testnet.binance.vision"
-    LOB_RECORDER_WS: str = "wss://stream.binance.com:9443"  # real Binance public stream (Rule 4)
+    BINANCE_DEMO: bool = False
+    TRADING_MODE: Literal["testnet", "demo", "live"] = "testnet"
+    DEMO_BINANCE_API_KEY: str = ""
+    DEMO_BINANCE_API_SECRET: str = ""
+    WS_BASE: str = "wss://stream.binancefuture.com"
+    REST_BASE: str = "https://testnet.binancefuture.com"
+    LOB_RECORDER_WS: str = "wss://stream.binancefuture.com"  # futures testnet stream; fstream.binance.com does not deliver aggTrade on this connection
+    LOB_RECORDER_REST: str = "https://testnet.binancefuture.com"  # REST base matching LOB_RECORDER_WS; must stay in sync
 
     # Strategy
     SYMBOL: str = "BTCUSDT"
@@ -46,11 +53,15 @@ class Settings(BaseSettings):
     # fail the "insufficient BTC" pre-flight. Default False keeps BTC inventory tradeable.
     LIQUIDATE_BTC_ON_STARTUP: bool = False
     IOC_TIMEOUT_MS: int = 200          # IOC order max age before cancel-no-retry
-    QTY_STEP_SIZE: float = 0.00001     # BTCUSDT LOT_SIZE stepSize
+    QTY_STEP_SIZE: float = 0.001        # BTCUSDT perpetual futures LOT_SIZE stepSize
+    PRICE_TICK_SIZE: float = 0.10       # BTCUSDT perpetual futures price tick
     MIN_NOTIONAL: float = 100.0        # BTCUSDT NOTIONAL filter minimum (USD)
     MAX_ORDER_NOTIONAL_PCT: float = 0.90  # gate rejects signals whose estimated notional exceeds 90% of equity
     SLIPPAGE_RESEARCH_BPS: float = 3.0  # expected slippage assumption (KS-3 baseline)
     SLIPPAGE_MULTIPLIER: float = 1.5    # KS-3 fires when rolling avg > research × multiplier
+    WS_RECV_TIMEOUT_S: float = 20.0     # Max seconds between WS messages before reconnect
+    WS_PING_TIMEOUT_S: float = 20.0     # Max seconds for WS pong before reconnect
+    WS_PING_INTERVAL_S: float = 20.0    # Seconds between WS pings
 
     # UI
     UI_REFRESH_INTERVAL: float = 1.0
@@ -59,7 +70,8 @@ class Settings(BaseSettings):
     LOB_DEPTH: int = 1000
     LOB_OBI_DEPTH: int = 20
     LOB_HISTORY: int = 18000
-    LOB_HEATMAP_BUCKET: float = 5.0
+    LOB_HEATMAP_BUCKET: float = 1.0
+    LOB_HEATMAP_BUCKET: float = 1.0
     LOB_WALL_SIGMA: float = 2.5        # σ threshold for Wall identification (§5)
     LOB_WALL_WINDOW: int = 5           # ticks each side for Wall median/std
     RELOAD_SIGMA: float = 3.0
@@ -92,11 +104,18 @@ class Settings(BaseSettings):
     MICRO_EXIT_SPREAD_HARD_CAP_BPS: float = 12.0
     LOB_FRESH_WALL_MS: int = 3_000    # protection wall must appear within this window
     LOB_STALE_WALL_MS: int = 30_000   # prune wall states not seen for this long
+    GATE6_WALL_ABSENT_CONSEC: int = 2  # require N consecutive misses before firing wall-removed
+
+    # LOB gap handling
+    LOB_GAP_RECONNECT_MIN_CONSECUTIVE: int = 3  # reconnect only after this many consecutive gaps
+    LOB_GAP_TOLERANCE_UPDATEIDS: int = 1000     # tolerate batching gaps under this size without reconnect
 
     # Heartbeat monitor (§4)
     HEARTBEAT_WARN_MS: int = 200
     HEARTBEAT_CRITICAL_MS: int = 500
+    HEARTBEAT_LOB_CRITICAL_MS: int = 30000   # depth@500ms stream; higher due to aggregation window
     HEARTBEAT_CONSEC_LIMIT: int = 3
+    HEARTBEAT_KS2_ENABLED: bool = True   # set False in demo/dev to suppress KS-2 on poor WS links
     HEARTBEAT_DEGRADED_RATE_THRESH: float = 0.5    # ≥50% of 10-msg window → enter DEGRADED
     HEARTBEAT_DEGRADED_RECOVERY_THRESH: float = 0.3 # <30% of window → exit (hysteresis)
     HEARTBEAT_SUSTAINED_MS: int = 10_000            # ms in DEGRADED before SUSTAINED_DEGRADED
@@ -127,8 +146,87 @@ class Settings(BaseSettings):
     TEST_INJECT_INTERVAL_MS: int = 30_000   # ms between injected signals
 
     @model_validator(mode="after")
+    def _apply_mode_presets(self) -> "Settings":
+        """
+        Apply mode-specific defaults for any field not explicitly set by the caller.
+        Explicit env vars / .env entries always win — only unset fields are touched.
+        Runs before _validate_tier_ordering so preset values are visible to validation.
+        """
+        # fmt: off
+        _PRESETS: dict[str, dict[str, object]] = {
+            # ── testnet (start_test.sh) ───────────────────────────────────────────
+            # WS: wss://stream.binancefuture.com (~10ms baseline). Real orders, fake money.
+            "testnet": {
+                "BINANCE_TESTNET":            False,
+                "BINANCE_DEMO":               True,
+                "DRY_RUN":                    False,
+                "HEARTBEAT_WARN_MS":          5000,
+                "HEARTBEAT_CRITICAL_MS":      30000,
+                "HEARTBEAT_LOB_CRITICAL_MS":  30000,
+                "HEARTBEAT_CONSEC_LIMIT":     20,
+                "WS_RECV_TIMEOUT_S":          30.0,
+                "WS_PING_TIMEOUT_S":          30.0,
+                "MIN_CONFIDENCE":             0.1,
+                "TEST_SIGNAL_INJECT":         True,
+                "TIMEFRAME":                  "1m",
+            },
+            # ── demo (start_demo.sh) ──────────────────────────────────────────────
+            # WS: wss://fstream.binance.com (live server, p50=181ms p95=428ms).
+            # Heartbeat calibrated for ~200ms baseline + periodic 3–5s TCP stalls.
+            "demo": {
+                "WS_BASE":                    "wss://fstream.binance.com",
+                "REST_BASE":                  "https://fapi.binance.com",
+                "BINANCE_TESTNET":            False,
+                "BINANCE_DEMO":               True,
+                "DRY_RUN":                    False,
+                "HEARTBEAT_WARN_MS":          5000,
+                "HEARTBEAT_CRITICAL_MS":      30000,
+                "HEARTBEAT_LOB_CRITICAL_MS":  30000,
+                "HEARTBEAT_CONSEC_LIMIT":     20,
+                "HEARTBEAT_KS2_ENABLED":      False,
+                "WS_RECV_TIMEOUT_S":          60.0,
+                "WS_PING_TIMEOUT_S":          60.0,
+                "MIN_CONFIDENCE":             0.1,
+                "TEST_SIGNAL_INJECT":         True,
+                "TIMEFRAME":                  "1m",
+            },
+            # ── live (start.sh) ───────────────────────────────────────────────────
+            # Same server as demo. Real money. Full risk management on.
+            "live": {
+                "WS_BASE":                    "wss://fstream.binance.com",
+                "REST_BASE":                  "https://fapi.binance.com",
+                "BINANCE_TESTNET":            False,
+                "BINANCE_DEMO":               False,
+                "DRY_RUN":                    False,
+                "HEARTBEAT_WARN_MS":          500,
+                "HEARTBEAT_CRITICAL_MS":      3000,
+                "HEARTBEAT_LOB_CRITICAL_MS":  5000,
+                "HEARTBEAT_CONSEC_LIMIT":     5,
+                "HEARTBEAT_KS2_ENABLED":      True,
+                "MIN_CONFIDENCE":             0.58,
+                "TEST_SIGNAL_INJECT":         False,
+                "TIMEFRAME":                  "5m",
+            },
+        }
+        # fmt: on
+        for field, value in _PRESETS.get(self.TRADING_MODE, {}).items():
+            if field not in self.model_fields_set:
+                object.__setattr__(self, field, value)
+        return self
+
+    @model_validator(mode="after")
     def _validate_tier_ordering(self) -> "Settings":
-        if not self.DRY_RUN and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
+        if self.BINANCE_TESTNET and self.BINANCE_DEMO:
+            raise ValueError(
+                "BINANCE_TESTNET and BINANCE_DEMO cannot both be True. "
+                "Set BINANCE_TESTNET=false when using demo.binance.com."
+            )
+        if self.BINANCE_DEMO and (not self.DEMO_BINANCE_API_KEY or not self.DEMO_BINANCE_API_SECRET):
+            raise ValueError(
+                "DEMO_BINANCE_API_KEY and DEMO_BINANCE_API_SECRET must be set "
+                "when BINANCE_DEMO=True. Add them to .env."
+            )
+        if not self.DRY_RUN and not self.BINANCE_DEMO and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
             raise ValueError(
                 "BINANCE_API_KEY and BINANCE_API_SECRET must be set when DRY_RUN=False. "
                 "Add them to .env or set DRY_RUN=True for paper trading."

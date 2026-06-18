@@ -7,7 +7,6 @@ Every step is wrapped in try/except so a single exchange error never blocks star
 import asyncio
 import json
 import logging
-import math
 import sqlite3
 from datetime import date, datetime, timezone
 from typing import Any
@@ -47,13 +46,14 @@ async def reconcile_on_startup(
         "actual_equity":        0.0,
         "reconciled_positions": 0,
         "restored_pnl":         0.0,
+        "has_orphan_position":  False,
         "errors":               [],
     }
 
     # S1 — open orders on exchange
     try:
         open_orders = await asyncio.wait_for(
-            client.get_open_orders(symbol=symbol), timeout=30.0
+            client.futures_get_open_orders(symbol=symbol), timeout=30.0
         )
         result["open_orders"] = open_orders
         logger.info("[Reconcile] %d open order(s) found on exchange", len(open_orders))
@@ -61,79 +61,21 @@ async def reconcile_on_startup(
         result["errors"].append(f"get_open_orders: {exc}")
         logger.warning("[Reconcile] Could not fetch open orders: %s", exc)
 
-    # S2 — USDT + BTC balances + ticker price
+    # S2 — futures USDT margin balance (walletBalance = realised + unrealised PnL)
     try:
-        account   = await asyncio.wait_for(client.get_account(), timeout=30.0)
-        usdt_free = 0.0
-        btc_free  = 0.0
-        for bal in account.get("balances", []):
-            if bal["asset"] == "USDT":
-                usdt_free = float(bal["free"])
-            if bal["asset"] == "BTC":
-                btc_free = float(bal["free"]) + float(bal["locked"])
+        balances    = await asyncio.wait_for(client.futures_account_balance(), timeout=30.0)
+        usdt_entry  = next((b for b in balances if b["asset"] == "USDT"), {})
+        usdt_balance = float(usdt_entry.get("balance", 0.0))
 
-        try:
-            ticker    = await asyncio.wait_for(
-                client.get_symbol_ticker(symbol=symbol), timeout=10.0
-            )
-            btc_price = float(ticker["price"])
-        except Exception as exc:
-            result["errors"].append(f"get_symbol_ticker: {exc}")
-            logger.warning("[Reconcile] Could not fetch ticker: %s", exc)
-            btc_price = 0.0
-
-        # S2b — optionally liquidate BTC holdings to start clean in USDT.
-        # Gated on LIQUIDATE_BTC_ON_STARTUP (default False): liquidating all BTC
-        # breaks SHORT entries, which sell held BTC on a spot account.
-        try:
-            _min_btc = settings.QTY_STEP_SIZE
-            if settings.LIQUIDATE_BTC_ON_STARTUP and not settings.DRY_RUN and btc_price > 0 and btc_free > _min_btc:
-                step = settings.QTY_STEP_SIZE
-                qty  = round(math.floor(btc_free / step) * step, 5)
-                limit_price = round(btc_price * 0.98, 2)  # 2% below last price, crosses bid on testnet
-                if qty * btc_price < settings.MIN_NOTIONAL:
-                    logger.warning(
-                        "[Reconcile] BTC dust too small to liquidate "
-                        "(%.5f BTC ≈ %.2f USDT < MIN_NOTIONAL %.2f) — skipping",
-                        qty, qty * btc_price, settings.MIN_NOTIONAL,
-                    )
-                else:
-                    resp = await asyncio.wait_for(
-                        client.create_order(
-                            symbol=symbol,
-                            side="SELL",
-                            type="LIMIT",
-                            timeInForce="IOC",
-                            quantity=qty,
-                            price=str(limit_price),
-                        ),
-                        timeout=15.0,
-                    )
-                    filled_qty  = float(resp.get("executedQty", 0))
-                    filled_usdt = float(resp.get("cummulativeQuoteQty", 0))
-                    logger.info(
-                        "[Reconcile] BTC liquidated at startup: SELL %.5f BTC → %.2f USDT",
-                        filled_qty, filled_usdt,
-                    )
-                    account2 = await asyncio.wait_for(client.get_account(), timeout=15.0)
-                    for bal in account2.get("balances", []):
-                        if bal["asset"] == "USDT":
-                            usdt_free = float(bal["free"])
-                        if bal["asset"] == "BTC":
-                            btc_free = float(bal["free"]) + float(bal["locked"])
-        except Exception as exc:
-            result["errors"].append(f"btc_liquidation: {exc}")
-            logger.warning("[Reconcile] Could not liquidate BTC at startup: %s", exc)
-
-        result["btc_balance"]   = btc_free        # keep existing key for backwards compat
-        result["usdt_free"]     = usdt_free
-        result["btc_free"]      = btc_free
-        result["btc_price"]     = btc_price
-        result["actual_equity"] = usdt_free + btc_free * btc_price
-        logger.info("[Reconcile] BTC balance: %.8f", btc_free)
+        result["btc_balance"]   = 0.0           # futures account has no spot BTC
+        result["usdt_free"]     = usdt_balance
+        result["btc_free"]      = 0.0
+        result["btc_price"]     = 0.0
+        result["actual_equity"] = usdt_balance
+        logger.info("[Reconcile] Futures USDT wallet balance: %.2f", usdt_balance)
     except Exception as exc:
-        result["errors"].append(f"get_account: {exc}")
-        logger.warning("[Reconcile] Could not fetch account: %s", exc)
+        result["errors"].append(f"futures_account_balance: {exc}")
+        logger.warning("[Reconcile] Could not fetch futures account balance: %s", exc)
 
     # S4 — restore today's realised_pnl from registry DB
     try:
@@ -155,6 +97,33 @@ async def reconcile_on_startup(
     except Exception as exc:
         result["errors"].append(f"restore_pnl: {exc}")
         logger.warning("[Reconcile] Could not restore PnL: %s", exc)
+
+    # S6 — restore consecutive-loss cooldown state from engine_health
+    try:
+        import engine.db_writer as db_writer_module
+
+        conn = sqlite3.connect(db_writer_module.DB_PATH)
+        row = conn.execute(
+            "SELECT consecutive_losses, cooldown_until_ms FROM engine_health WHERE id = 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            consecutive_losses, cooldown_until_ms = row
+            portfolio.consecutive_losses = consecutive_losses or 0
+            risk_engine._cooldown_until = (
+                datetime.fromtimestamp(cooldown_until_ms / 1000, tz=timezone.utc)
+                if cooldown_until_ms else None
+            )
+            result["restored_consecutive_losses"] = portfolio.consecutive_losses
+            logger.info(
+                "[Reconcile] Restored consecutive_losses=%d cooldown_until=%s",
+                portfolio.consecutive_losses, risk_engine._cooldown_until,
+            )
+        else:
+            logger.warning("[Reconcile] No engine_health row found — consecutive-loss state defaults to 0")
+    except Exception as exc:
+        result["errors"].append(f"restore_cooldown: {exc}")
+        logger.warning("[Reconcile] Could not restore consecutive-loss cooldown: %s", exc)
 
     # Set equity from real account.
     # result["actual_equity"] defaults to 0.0 if S2 failed, so this never raises.
@@ -190,6 +159,29 @@ async def reconcile_on_startup(
                 order.get("side"), order.get("symbol"),
                 order.get("origQty"), order.get("price"),
             )
+
+    # S7 — detect orphan exchange position (BINANCE_DEMO never places brackets,
+    # so S3's open_orders check always sees empty — a live position is invisible to it).
+    try:
+        account_detail = await asyncio.wait_for(client.futures_account(), timeout=30.0)
+        btc_pos = next(
+            (p for p in account_detail.get("positions", []) if p["symbol"] == symbol),
+            None,
+        )
+        pos_amt = float(btc_pos.get("positionAmt", "0")) if btc_pos else 0.0
+        if abs(pos_amt) >= settings.QTY_STEP_SIZE:
+            result["orphan_position_qty"] = pos_amt
+            result["has_orphan_position"] = True
+            logger.critical(
+                "[Reconcile] ORPHAN POSITION DETECTED: positionAmt=%.6f — "
+                "will close before trading resumes", pos_amt
+            )
+        else:
+            result["has_orphan_position"] = False
+    except Exception as exc:
+        result["errors"].append(f"orphan_position_check: {exc}")
+        result["has_orphan_position"] = False
+        logger.warning("[Reconcile] Could not check for orphan position: %s", exc)
 
     # S5 — write STARTUP_RECONCILIATION event
     _write_event("STARTUP_RECONCILIATION", result)

@@ -151,3 +151,18 @@ def test_init_db_enables_wal(temp_db):
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     conn.close()
     assert mode == "wal"
+
+
+# ── _write_engine_health_sync ────────────────────────────────────────────────
+
+def test_write_engine_health_persists_risk_state(temp_db):
+    DBWriter._write_engine_health_sync(
+        lob_status="SYNCED", hb_status="OK", risk_tier="PASSIVE", ks_active=False,
+        consecutive_losses=2, cooldown_until_ms=123456,
+    )
+    conn = sqlite3.connect(temp_db)
+    row = conn.execute(
+        "SELECT consecutive_losses, cooldown_until_ms FROM engine_health WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    assert row == (2, 123456)

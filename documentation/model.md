@@ -1,6 +1,6 @@
 # Model Documentation
 
-CryptoSentinel v3.0 uses its model layer as a confidence gate for microstructure signals. The model does not discover the primary trade setup. Wall identification, absorption, and sweep-with-protection logic create the candidate signal first; the model layer then decides whether the current market context is strong enough for that signal to continue through Gate 2.
+CryptoSentinel v3.1 uses its model layer as a confidence gate for microstructure signals. The model does not discover the primary trade setup. Wall identification, absorption, and sweep-with-protection logic create the candidate signal first; the model layer then decides whether the current market context is strong enough for that signal to continue through Gate 2.
 
 This document reflects the current implementation. It intentionally describes the live code path as it exists now, including neutral default fields and training workflow gaps.
 
@@ -31,7 +31,7 @@ flowchart LR
     EXEC --> G345[Gate 3-5 approval]
     G345 --> REQ[MicroOrderRequest]
     REQ --> OM[OrderManager]
-    OM --> TESTNET[Binance Spot Testnet]
+    OM --> FUTURES[Binance USD-M Futures]
 ```
 
 `RiskEngine` is instantiated for budget/tier state and tier synchronization; it is not between the microstructure `StrategyExecutor` and `OrderManager` — budget, exposure, and risk-tier checks happen inside `StrategyExecutor`. The legacy `MicrostructureEngine` (`engine/microstructure_engine.py`) is not started in the live `TaskGroup`.

@@ -94,11 +94,13 @@ class RiskEngine:
 
         # Consecutive-loss cooldown
         if self._cooldown_until and now < self._cooldown_until:
+            self._tier = _Tier.PASSIVE
             pf.circuit_breaker = CircuitBreakerStatus.PAUSED
             return CircuitBreakerStatus.PAUSED
 
         if pf.consecutive_losses >= settings.MAX_CONSECUTIVE_LOSSES:
             self._cooldown_until = now + timedelta(seconds=self.COOLDOWN_SECONDS)
+            self._tier = _Tier.PASSIVE
             pf.circuit_breaker = CircuitBreakerStatus.PAUSED
             logger.warning("[Risk] Consecutive losses=%d → PAUSE %ds", pf.consecutive_losses, self.COOLDOWN_SECONDS)
             return CircuitBreakerStatus.PAUSED
@@ -126,6 +128,7 @@ class RiskEngine:
         self.portfolio.daily_pnl   += pnl
         self.portfolio.peak_equity  = max(self.portfolio.peak_equity, self.portfolio.equity)
         self._budget.realised_pnl  += pnl
+        self._budget.unrealised_pnl = 0.0   # position is closed; floating leg goes to zero
 
         if pnl < 0:
             self.portfolio.consecutive_losses += 1
@@ -184,3 +187,7 @@ class RiskEngine:
     @property
     def tier(self) -> str:
         return self._tier
+
+    @property
+    def cooldown_until(self) -> datetime | None:
+        return self._cooldown_until

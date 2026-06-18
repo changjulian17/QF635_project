@@ -129,9 +129,17 @@ class WallState:
     last_seen_ts:    int
     side:            str       # "bid" or "ask"
     sigma:           float     # how many σ above surrounding median
+    qty_peak:        float = 0.0   # rolling high-water mark; set to qty_initial by __post_init__
+
+    def __post_init__(self) -> None:
+        if self.qty_peak == 0.0:
+            self.qty_peak = self.qty_initial
+
     @property
     def reload_ratio(self) -> float:
-        return self.qty_current / self.qty_initial if self.qty_initial > 0 else 0.0
+        # Measured against the rolling peak so growing walls don't trivially pass,
+        # and genuine refills after consumption are correctly detected.
+        return self.qty_current / self.qty_peak if self.qty_peak > 0 else 0.0
 
     @property
     def persistence_ms(self) -> int:
@@ -234,6 +242,7 @@ class KillswitchState:
 @dataclass
 class SharedState:
     """Shared mutable state between ws_consumer, LOB engine, and risk components."""
-    heartbeat_status: str   = "HEALTHY"   # "HEALTHY" | "DEGRADED" | "CRITICAL"
-    last_delta_ms:    float = 0.0
-    lob_status:       str   = "UNINITIALISED"  # mirrors LOBStateMachineState.value
+    heartbeat_status:     str   = "HEALTHY"   # price stream (bookTicker+aggTrade)
+    lob_heartbeat_status: str   = "HEALTHY"   # LOB stream (depth@100ms+kline)
+    last_delta_ms:        float = 0.0
+    lob_status:           str   = "UNINITIALISED"  # mirrors LOBStateMachineState.value
