@@ -270,6 +270,24 @@ class OrderManager:
             return (mid - self._open_entry_price) * self._open_position_qty
         return (self._open_entry_price - mid) * self._open_position_qty
 
+    def get_open_position(self) -> dict | None:
+        """Return the in-memory open position for display (futures live path).
+
+        Unlike get_dry_run_position this is not DRY_RUN-gated — main.py and the
+        user-data-stream path use it to surface the live position.
+        """
+        if self._open_position_side is None:
+            return None
+        return {
+            "symbol":         settings.SYMBOL,
+            "side":           self._open_position_side,
+            "entry_price":    self._open_entry_price,
+            "quantity":       self._open_position_qty,
+            "stop_loss":      self._open_sl_price or None,
+            "take_profit":    self._open_tp_price or None,
+            "unrealised_pnl": None,
+        }
+
     def get_dry_run_position(self) -> dict | None:
         """Return in-memory open position for DRY_RUN display. None if no open position."""
         if not settings.DRY_RUN or self._open_position_side is None:
