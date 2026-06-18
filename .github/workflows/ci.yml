@@ -26,4 +26,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run test suite
+        env:
+          BINANCE_DEMO: "false"
+          DRY_RUN: "true"
         run: pytest tests/ -q
