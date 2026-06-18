@@ -25,6 +25,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config import settings
+from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class LOBRecorder:
         self._ask_book:       dict[float, float] = {}
         self._last_update_id: int                = 0
         self._synced:         bool               = False
+        self._seed_failed:    bool               = False
         self._pending_diffs:  list[dict]         = []
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -114,6 +116,7 @@ class LOBRecorder:
                 self._ask_book.clear()
                 self._last_update_id = 0
                 self._synced = False
+                self._seed_failed = False
                 self._pending_diffs = []
 
                 async with websockets.connect(
@@ -195,6 +198,9 @@ class LOBRecorder:
         async for raw in ws:
             if not self._running:
                 break
+            if self._seed_failed:   # final seed attempt failed → break to reconnect/reseed
+                logger.warning("[LOBRec] seed failed — reconnecting to reseed")
+                break
             try:
                 outer = json.loads(raw)
                 stream_name = outer.get("stream", "")
@@ -207,7 +213,8 @@ class LOBRecorder:
 
                 if event_type == "depthUpdate":
                     if not self._synced:
-                        self._pending_diffs.append(msg)
+                        if len(self._pending_diffs) < _MAX_PENDING_DIFFS:
+                            self._pending_diffs.append(msg)
                     else:
                         self._apply_diff(msg)
                         ts = int(msg.get("E") or time.time() * 1000)
