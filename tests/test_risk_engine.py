@@ -268,3 +268,17 @@ def test_sync_tier_restores_full_after_cooldown_expires_with_win():
 
     assert tier == "FULL"
     assert pf.circuit_breaker == CircuitBreakerStatus.ACTIVE
+
+
+def test_record_trade_result_zeros_unrealised_on_close():
+    """Closing a position must clear the floating mark so check_budget sees no double-count."""
+    ks     = GlobalKillswitch(dov=10_000.0)   # hard_limit=100 — well above 1.9 total loss
+    budget = DailyBudget.from_equity(10_000.0)
+    engine = make_engine(budget=budget, killswitch=ks)
+
+    budget.unrealised_pnl = -0.9   # stale MTM mark from last tick
+
+    engine.record_trade_result(-1.0)
+
+    assert budget.unrealised_pnl == 0.0, "unrealised_pnl must be zeroed when position closes"
+    assert ks.is_active is False, "KS-1 must NOT fire spuriously due to stale floating mark"
