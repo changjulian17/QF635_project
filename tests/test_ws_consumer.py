@@ -213,14 +213,14 @@ def test_ws_seed_rejects_gapful_buffer():
 
 
 def test_ws_seed_accepts_bridging_buffer():
-    """First diff straddles lastUpdateId+1 and the rest are contiguous → SYNCED."""
+    """First diff straddles lastUpdateId and each later diff's pu == prev u → SYNCED (futures)."""
     import asyncio
     from core.ws_consumer import BinanceWebSocketConsumer
     consumer = BinanceWebSocketConsumer(candle_queue=asyncio.Queue())
     snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
     consumer._lob_pending = [
-        {"U": 100, "u": 101, "b": [], "a": []},   # bridge: 100 <= 101 <= 101
-        {"U": 102, "u": 103, "b": [], "a": []},   # contiguous
+        {"U": 100, "u": 101, "b": [], "a": []},               # futures bridge: 100 <= 100 <= 101
+        {"U": 102, "u": 103, "pu": 101, "b": [], "a": []},    # contiguous: pu == prev u (101)
     ]
 
     async def _fetch():

@@ -646,8 +646,8 @@ def test_recorder_seed_accepts_bridging_buffer():
     rec, tmp = _recorder_with_tmpdb()
     snap = {"bids": [["100.0", "1"]], "asks": [["101.0", "1"]], "lastUpdateId": 100}
     rec._pending_diffs = [
-        {"U": 100, "u": 101, "b": [], "a": []},
-        {"U": 102, "u": 103, "b": [], "a": []},
+        {"U": 100, "u": 101, "b": [], "a": []},               # futures bridge: 100 <= 100 <= 101
+        {"U": 102, "u": 103, "pu": 101, "b": [], "a": []},    # contiguous: pu == prev u (101)
     ]
 
     async def _fetch():

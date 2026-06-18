@@ -11,7 +11,7 @@ import numpy as np
 import websockets
 
 from config import settings
-from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
+from core.lob_sync import SeedDiscontinuity, futures_is_contiguous, futures_seed_bridge_ok
 from models import AggTrade, Candle, SharedState
 
 logger = logging.getLogger(__name__)
@@ -227,6 +227,10 @@ class BinanceWebSocketConsumer:
     async def _receive_loop(self, ws: Any) -> None:
         conn_start = time.monotonic()
 
+        while True:
+            if not self._running:
+                break
+
             if self._seed_failed:   # final seed attempt failed → reconnect to reseed
                 logger.warning("[WS] seed failed — reconnecting to reseed")
                 await ws.close()
@@ -277,7 +281,7 @@ class BinanceWebSocketConsumer:
 
     async def _fetch_rest_snapshot(self) -> dict:
         """Fetch a REST depth snapshot (extracted for testability)."""
-        url = f"{settings.REST_BASE}/api/v3/depth"
+        url = f"{settings.REST_BASE}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -300,7 +304,9 @@ class BinanceWebSocketConsumer:
                 self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
                 last_uid = int(snap["lastUpdateId"])
                 # Apply buffered diffs only if they form a gapless bridge from the
-                # snapshot — first must straddle lastUpdateId+1, rest must be contiguous.
+                # snapshot. USD-M Futures rules: first event must straddle lastUpdateId
+                # (U <= lastUpdateId <= u); every subsequent event's pu must equal the
+                # previous event's u.
                 prev_u, first = last_uid, True
                 for event in self._lob_pending:
                     u = int(event.get("u", 0))
@@ -308,11 +314,13 @@ class BinanceWebSocketConsumer:
                         continue
                     U = int(event.get("U", 0))
                     if first:
-                        if not seed_bridge_ok(U, u, last_uid):
+                        if not futures_seed_bridge_ok(U, u, last_uid):
                             raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
                         first = False
-                    elif not is_contiguous(prev_u, U):
-                        raise SeedDiscontinuity(f"gap U={U} != prev_u+1={prev_u + 1}")
+                    else:
+                        pu = int(event.get("pu", 0))
+                        if not futures_is_contiguous(prev_u, pu):
+                            raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
                     self._apply_depth_diff(event)
                     prev_u = u
                 self._lob_pending.clear()
