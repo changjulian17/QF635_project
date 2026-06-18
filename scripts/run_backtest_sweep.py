@@ -59,8 +59,10 @@ def _variants():
         VariantConfig(name="baseline"),
         VariantConfig(name="vol_floor_1.5", stop_mode="vol_floor", stop_floor_atr_mult=1.5),
         VariantConfig(name="vol_floor_3.0", stop_mode="vol_floor", stop_floor_atr_mult=3.0),
+        # min_edge_bps must exceed the round-trip cost floor (~30 bps) to bind —
+        # below that, max(round_trip_pct, min_edge_bps/1e4) == round_trip_pct (a no-op).
         VariantConfig(name="edge_gate",     stop_mode="vol_floor", stop_floor_atr_mult=1.5,
-                      min_edge_bps=4.0),
+                      min_edge_bps=50.0),
         VariantConfig(name="tp_2x", atr_mult_tp=2.0),
         VariantConfig(name="tp_4x", atr_mult_tp=4.0),
         VariantConfig(name="gated", apply_entry_gate=True, entry_rules=EntryRules()),
