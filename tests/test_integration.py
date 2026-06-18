@@ -1,5 +1,6 @@
 """
 import pytest
+import pytest
 Integration tests — Phase 1N: GlobalKillswitch + 7-gate funnel.
 
 Run with:  source .venv/bin/activate && python -m pytest tests/test_integration.py -v
@@ -8,6 +9,8 @@ import asyncio
 import sqlite3
 import time
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import pytest
 

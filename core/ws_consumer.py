@@ -11,12 +11,14 @@ import numpy as np
 import websockets
 
 from config import settings
+from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
 from models import AggTrade, LOBLevel, LOBSnapshot, SharedState
 
 logger = logging.getLogger(__name__)
 
 # Max connection duration before forced reconnect (24h)
 _MAX_CONNECTION_SECONDS = 24 * 3600
+_SEED_MAX_ATTEMPTS      = 3        # REST seed retries before staying UNSYNCED
 
 
 class HeartbeatMonitor:
@@ -164,6 +166,7 @@ class BinanceWebSocketConsumer:
         self._ask_book: dict[float, float] = {}
         self._lob_update_id: int = 0
         self._lob_synced = False
+        self._seed_failed:    bool = False
         self._lob_pending: list[dict] = []
         self._consecutive_lob_gaps: int = 0
 
@@ -198,6 +201,7 @@ class BinanceWebSocketConsumer:
                     self._ask_book.clear()
                     self._lob_update_id       = 0
                     self._lob_synced          = False
+                    self._seed_failed   = False
                     self._lob_pending         = []
                     self._consecutive_lob_gaps = 0
 
