@@ -25,7 +25,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config import settings
-from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
+from core.lob_sync import SeedDiscontinuity, futures_is_contiguous, futures_seed_bridge_ok
 
 logger = logging.getLogger(__name__)
 
@@ -166,20 +166,35 @@ class LOBRecorder:
 
                 self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
                 self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
-                last_uid = snap["lastUpdateId"]
+                last_uid = int(snap["lastUpdateId"])
+                # Futures bridge/contiguity: first event straddles lastUpdateId
+                # (U <= lastUpdateId <= u); each later event's pu == previous u.
+                prev_u, first = last_uid, True
                 for event in self._pending_diffs:
-                    if event["u"] <= last_uid:
+                    u = int(event["u"])
+                    if u <= last_uid:
                         continue
+                    U = int(event.get("U", 0))
+                    if first:
+                        if not futures_seed_bridge_ok(U, u, last_uid):
+                            raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
+                        first = False
+                    else:
+                        pu = int(event.get("pu", 0))
+                        if not futures_is_contiguous(prev_u, pu):
+                            raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
                     self._apply_diff(event)
+                    prev_u = u
                 self._pending_diffs.clear()
-                self._last_update_id = last_uid
+                self._last_update_id = prev_u
                 self._synced = True
                 logger.info(
                     "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
                     last_uid, len(self._bid_book), len(self._ask_book),
                 )
                 return
-            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
+                    KeyError, ValueError, SeedDiscontinuity) as exc:
                 logger.error(
                     "[LOBRec] Snapshot seed attempt %d/%d failed: %s",
                     attempt, _SEED_MAX_ATTEMPTS, exc,

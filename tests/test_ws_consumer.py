@@ -300,7 +300,8 @@ def test_apply_depth_diff_tolerates_small_gap():
     consumer = BinanceWebSocketConsumer(streams=["btcusdt@depth@500ms"], shared_state=SharedState())
     consumer._lob_update_id = 100
 
-    diff = {"U": 100 + 50, "u": 100 + 60, "b": [["100.0", "1.0"]], "a": []}
+    # futures: pu=150 vs last u=100 → gap of 50 (< tolerance) → applied
+    diff = {"U": 100 + 50, "u": 100 + 60, "pu": 150, "b": [["100.0", "1.0"]], "a": []}
     assert consumer._apply_depth_diff(diff) is True
     assert consumer._lob_update_id == 160
     assert consumer._bid_book[100.0] == 1.0
@@ -311,6 +312,7 @@ def test_apply_depth_diff_rejects_large_gap():
     consumer = BinanceWebSocketConsumer(streams=["btcusdt@depth@500ms"], shared_state=SharedState())
     consumer._lob_update_id = 100
 
-    diff = {"U": 100 + 5000, "u": 100 + 5010, "b": [], "a": []}
+    # futures: pu=5100 vs last u=100 → gap of 5000 (>= tolerance) → rejected
+    diff = {"U": 100 + 5000, "u": 100 + 5010, "pu": 5100, "b": [], "a": []}
     assert consumer._apply_depth_diff(diff) is False
     assert consumer._lob_update_id == 100

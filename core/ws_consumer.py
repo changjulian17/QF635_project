@@ -11,7 +11,7 @@ import numpy as np
 import websockets
 
 from config import settings
-from core.lob_sync import SeedDiscontinuity, is_contiguous, seed_bridge_ok
+from core.lob_sync import SeedDiscontinuity, futures_is_contiguous, futures_seed_bridge_ok
 from models import AggTrade, LOBLevel, LOBSnapshot, SharedState
 
 logger = logging.getLogger(__name__)
@@ -320,27 +320,30 @@ class BinanceWebSocketConsumer:
             if self._trade_queue is not None:
                 await self._trade_queue.put(msg)
 
-    def _apply_depth_diff(self, diff: dict) -> bool:
+    def _apply_depth_diff(self, diff: dict, validate: bool = True) -> bool:
         """
-        Update local book with incremental diffs.
-        Returns True if successful, False if a gap was detected.
+        Update local book with an incremental diff.
+        Returns True if applied, False if a gap was detected.
+
+        USD-M Futures contiguity: each event's `pu` (previous final update id)
+        must equal the last applied `u`. The seed validates the bridge + pu chain
+        itself and calls this with validate=False (mutation only).
         """
-        # 1. verify U <= last_update_id + 1 <= u
-        first_id = int(diff.get("U", 0))
-        last_id  = int(diff.get("u", 0))
+        last_id = int(diff.get("u", 0))
 
         if not last_id:
             return True
 
-        if self._lob_update_id > 0 and first_id > 0 and first_id > self._lob_update_id + 1:
-            gap = first_id - (self._lob_update_id + 1)
-            if gap < settings.LOB_GAP_TOLERANCE_UPDATEIDS:
-                logger.debug("[WS] LOB small gap (%d IDs) — applying and advancing", gap)
-                # fall through — diff is applied below, _lob_update_id advances normally
-            else:
-                logger.warning("[WS] LOB GAP DETECTED: expected %d, got %d (gap=%d)",
-                               self._lob_update_id + 1, first_id, gap)
-                return False
+        if validate and self._lob_update_id > 0:
+            pu = int(diff.get("pu", 0))
+            if not futures_is_contiguous(self._lob_update_id, pu):
+                gap = abs(pu - self._lob_update_id)
+                if gap < settings.LOB_GAP_TOLERANCE_UPDATEIDS:
+                    logger.debug("[WS] LOB small gap (%d IDs) — applying and advancing", gap)
+                else:
+                    logger.warning("[WS] LOB GAP DETECTED: pu=%d != last u=%d (gap=%d)",
+                                   pu, self._lob_update_id, gap)
+                    return False
 
         if last_id <= self._lob_update_id:
             return True
@@ -397,25 +400,37 @@ class BinanceWebSocketConsumer:
             self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
             last_uid = int(snap["lastUpdateId"])
 
-            # Process buffered diffs; stop on first internal gap to avoid
-            # leaving _lob_update_id below the gap and triggering an immediate
-            # reconnect on the next live diff.
+            # Apply buffered diffs only if they form a gapless bridge (futures rules):
+            # first event straddles lastUpdateId (U <= lastUpdateId <= u); every later
+            # event's pu must equal the previous event's u. A gap → reseed.
+            prev_u, first = last_uid, True
             for diff in self._lob_pending:
-                u_last = int(diff.get("u", 0))
-                if u_last <= last_uid:
+                u = int(diff.get("u", 0))
+                if u <= last_uid:
                     continue
-                if not self._apply_depth_diff(diff):
-                    break
+                U = int(diff.get("U", 0))
+                if first:
+                    if not futures_seed_bridge_ok(U, u, last_uid):
+                        raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
+                    first = False
+                else:
+                    pu = int(diff.get("pu", 0))
+                    if not futures_is_contiguous(prev_u, pu):
+                        raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
+                self._apply_depth_diff(diff, validate=False)
+                prev_u = u
             
-            self._lob_update_id = max(self._lob_update_id, last_uid)
+            self._lob_pending.clear()
+            self._lob_update_id = prev_u
+            self._lob_synced = True   # only on a clean seed — Gate 0 never sees a partial book
             logger.info(
                 "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
-                last_uid, len(self._bid_book), len(self._ask_book),
+                prev_u, len(self._bid_book), len(self._ask_book),
             )
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.error("[WS] LOB REST seed failed (%s) — continuing with buffered diffs.", exc)
-        finally:
-            self._lob_pending.clear()
-            self._lob_synced = True
             if self._bid_book and self._ask_book:
                 self._enqueue_latest_depth_snapshot(int(time.time() * 1000))
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
+                KeyError, ValueError, SeedDiscontinuity) as exc:
+            logger.error("[WS] LOB seed failed (%s) — staying unsynced; will reseed.", exc)
+            self._lob_pending.clear()
+            self._lob_synced = False
