@@ -40,6 +40,8 @@ def _make_client(open_orders=None, usdt_balance: str = "10000.0"):
     client.futures_account_balance = AsyncMock(return_value=[
         {"asset": "USDT", "balance": usdt_balance},
     ])
+    # S7 orphan-position check — configure so the coroutine is awaited/consumed.
+    client.futures_account = AsyncMock(return_value={"positions": []})
     return client
 
 
@@ -120,6 +122,7 @@ def test_s1_exchange_error_captured(tmp_path):
     client = AsyncMock()
     client.futures_get_open_orders = AsyncMock(side_effect=Exception("network timeout"))
     client.futures_account_balance = AsyncMock(return_value=[])
+    client.futures_account = AsyncMock(return_value={"positions": []})
     portfolio = _make_portfolio()
     risk_engine = _make_risk_engine()
 
@@ -175,6 +178,7 @@ def test_s2_missing_usdt_asset_returns_zero(tmp_path):
     client = AsyncMock()
     client.futures_get_open_orders = AsyncMock(return_value=[])
     # Return a list with no USDT entry
+    client.futures_account = AsyncMock(return_value={"positions": []})
     client.futures_account_balance = AsyncMock(return_value=[
         {"asset": "BNB", "balance": "0.5"},
     ])
@@ -196,6 +200,7 @@ def test_s2_account_failure_keeps_initialised_equity(tmp_path):
     client = AsyncMock()
     client.futures_get_open_orders = AsyncMock(return_value=[])
     client.futures_account_balance = AsyncMock(side_effect=Exception("network error"))
+    client.futures_account = AsyncMock(return_value={"positions": []})
     portfolio = _make_portfolio(equity=10_000.0)
     risk_engine = _make_risk_engine()
 
