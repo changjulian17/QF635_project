@@ -31,7 +31,6 @@ from core.lob_recorder import LOBRecorder
 from core.signal_telemetry import SignalTelemetry
 from core.startup_reconciler import reconcile_on_startup
 from core.user_data_stream import UserDataStreamConsumer
-from core.user_data_stream import UserDataStreamConsumer
 from core.ws_consumer import BinanceWebSocketConsumer
 from engine.db_writer import DBWriter, init_db
 from engine.lob_snapshot_writer import lob_snapshot_writer as _lob_snapshot_writer
@@ -291,19 +290,22 @@ def _build_portfolio_payload(
     return payload
 
 
-async def _api_server(
+def create_api_app(
     killswitch: GlobalKillswitch,
     portfolio: PortfolioState,
     shared_state: SharedState,
     order_manager: OrderManager,
     telemetry: SignalTelemetry,
-    port: int,
     alert_dispatcher: AlertDispatcher | None = None,
     lob_hub: RealtimeHub | None = None,
     portfolio_hub: RealtimeHub | None = None,
     signal_hub: RealtimeHub | None = None,
-) -> None:
-    """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
+) -> web.Application:
+    """Build the REST/WS aiohttp app (handlers + routes).
+
+    Production factory shared by _api_server and the REST API tests, so tests
+    exercise the real wiring rather than a hand-copied mini app.
+    """
 
     async def _handle_health(request: web.Request) -> web.Response:
         return web.json_response({
@@ -376,7 +378,26 @@ async def _api_server(
     app.router.add_get("/ws/lob", _handle_ws_lob)
     app.router.add_get("/ws/portfolio", _handle_ws_portfolio)
     app.router.add_get("/ws/signals", _handle_ws_signals)
+    return app
 
+
+async def _api_server(
+    killswitch: GlobalKillswitch,
+    portfolio: PortfolioState,
+    shared_state: SharedState,
+    order_manager: OrderManager,
+    telemetry: SignalTelemetry,
+    port: int,
+    alert_dispatcher: AlertDispatcher | None = None,
+    lob_hub: RealtimeHub | None = None,
+    portfolio_hub: RealtimeHub | None = None,
+    signal_hub: RealtimeHub | None = None,
+) -> None:
+    """aiohttp REST API co-resident with the engine TaskGroup (localhost only)."""
+    app = create_api_app(
+        killswitch, portfolio, shared_state, order_manager, telemetry,
+        alert_dispatcher, lob_hub, portfolio_hub, signal_hub,
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", port)
