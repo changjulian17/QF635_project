@@ -1,6 +1,6 @@
 # CLAUDE.md — CryptoSentinel project guidance
 
-Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on the Binance Spot Testnet.
+Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on Binance USD-M Futures.
 
 **Current phase:** Phase 3 complete. All deliverables shipped.
 
@@ -14,7 +14,7 @@ models.py        — shared dataclasses and enums
 core/
   ws_consumer.py       — WebSocket consumer + HeartbeatMonitor
   lob_engine.py        — Local Order Book + full state machine (UNINITIALISED → SYNCED)
-  lob_recorder.py      — Always-on LOB data collector (real Binance public stream)
+  lob_recorder.py      — Always-on LOB data collector (Binance USD-M Futures public stream)
   cvd.py               — Standalone CVD calculator (WelfordOnline std)
   signal_telemetry.py  — Async signal record writer (all gates, pass + fail)
   startup_reconciler.py — Exchange state reconciliation on startup + midnight reset
@@ -103,9 +103,9 @@ Run unit tests:
 
 ## Configuration notes
 
-- Put Binance testnet credentials in `.env` (gitignored). Use `.env.example` as a template.
+- Put Binance USD-M Futures credentials in `.env` (gitignored). `TRADING_MODE` (`testnet`/`demo`/`live`) selects the endpoint preset (`WS_BASE`/`REST_BASE`). Use `.env.example` as a template.
 - `DRY_RUN=True` in config.py — set `DRY_RUN=False` in `.env` to enable live order execution.
-- `LOB_RECORDER_WS` points to real Binance public stream (`wss://stream.binance.com:9443`), not testnet — this is intentional (Rule 4).
+- `LOB_RECORDER_WS` / `LOB_RECORDER_REST` point at the Binance USD-M Futures stream + REST (`stream.binancefuture.com` / `testnet.binancefuture.com`) and must stay in sync; the recorder seeds via `/fapi/v1/depth` and needs no API key (public market data).
 - Never add API keys to source files.
 - Always use the `.venv` virtual environment in the project root.
 
