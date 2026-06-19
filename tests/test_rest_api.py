@@ -8,58 +8,15 @@ import aiohttp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from aiohttp import web
+from unittest.mock import AsyncMock, patch
+
 from models import PortfolioState, SharedState, Position, Direction, CircuitBreakerStatus
 from risk.killswitch import GlobalKillswitch
 from risk.budget import DailyBudget
 
 
-# ── Minimal in-process server for testing ─────────────────────────────────────
-
-async def _build_app(killswitch, portfolio, shared_state):
-    """Build the same aiohttp app as _api_server in main.py."""
-
-    async def _handle_health(request):
-        return web.json_response({
-            "lob_status": shared_state.lob_status,
-            "heartbeat_status": shared_state.heartbeat_status,
-            "risk_tier": portfolio.circuit_breaker.name,
-            "killswitch_active": killswitch.is_active,
-            "dry_run": True,
-        })
-
-    async def _handle_portfolio(request):
-        positions = [
-            {
-                "symbol": p.symbol,
-                "side": p.side.name,
-                "entry_price": p.entry_price,
-                "quantity": p.quantity,
-                "stop_loss": p.stop_loss,
-                "take_profit": p.take_profit,
-                "unrealised_pnl": p.unrealised_pnl,
-            }
-            for p in portfolio.positions
-        ]
-        return web.json_response({
-            "equity": portfolio.equity,
-            "daily_pnl": portfolio.daily_pnl,
-            "drawdown_pct": portfolio.drawdown_pct,
-            "consecutive_losses": portfolio.consecutive_losses,
-            "positions": positions,
-        })
-
-    async def _handle_killswitch(request):
-        if killswitch.is_active:
-            return web.json_response({"fired": True, "already_active": True})
-        killswitch._state.fired = True  # directly set for test isolation
-        return web.json_response({"fired": True})
-
-    app = web.Application()
-    app.router.add_get("/api/health", _handle_health)
-    app.router.add_get("/api/portfolio", _handle_portfolio)
-    app.router.add_post("/api/killswitch", _handle_killswitch)
-    return app
+# Tests exercise the production app from main.create_api_app (not a copied mini app),
+# so REST wiring regressions in main.py are caught here.
 
 
 @pytest.fixture
@@ -83,7 +40,8 @@ def killswitch():
 
 @pytest.fixture
 async def client(aiohttp_client, portfolio, shared_state, killswitch):
-    app = await _build_app(killswitch, portfolio, shared_state)
+    from main import create_api_app
+    app = create_api_app(killswitch, portfolio, shared_state, order_manager=None, telemetry=None)
     return await aiohttp_client(app)
 
 
@@ -153,7 +111,10 @@ async def test_portfolio_includes_positions(client, portfolio):
 @pytest.mark.asyncio
 async def test_killswitch_fires(client, killswitch):
     assert not killswitch.is_active
-    resp = await client.post("/api/killswitch")
+    # The production handler schedules emergency_close_all as a background task;
+    # stub it so the unit test stays on the REST-handler boundary.
+    with patch("main.emergency_close_all", new=AsyncMock()):
+        resp = await client.post("/api/killswitch")
     assert resp.status == 200
     data = await resp.json()
     assert data["fired"] is True
