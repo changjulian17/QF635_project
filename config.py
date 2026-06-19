@@ -221,32 +221,39 @@ class Settings(BaseSettings):
                 "BINANCE_TESTNET and BINANCE_DEMO cannot both be True. "
                 "Set BINANCE_TESTNET=false when using demo.binance.com."
             )
-        if self.BINANCE_DEMO and (not self.DEMO_BINANCE_API_KEY or not self.DEMO_BINANCE_API_SECRET):
+        if not self.DRY_RUN and self.BINANCE_DEMO and (not self.DEMO_BINANCE_API_KEY or not self.DEMO_BINANCE_API_SECRET):
             raise ValueError(
                 "DEMO_BINANCE_API_KEY and DEMO_BINANCE_API_SECRET must be set "
-                "when BINANCE_DEMO=True. Add them to .env."
+                "when BINANCE_DEMO=True and DRY_RUN=False. Add them to .env "
+                "or set DRY_RUN=True for paper trading."
             )
         if not self.DRY_RUN and not self.BINANCE_DEMO and (not self.BINANCE_API_KEY or not self.BINANCE_API_SECRET):
             raise ValueError(
                 "BINANCE_API_KEY and BINANCE_API_SECRET must be set when DRY_RUN=False. "
                 "Add them to .env or set DRY_RUN=True for paper trading."
             )
-        assert self.TIER_REDUCED_PCT < self.TIER_MINIMAL_PCT, \
-            f"TIER_REDUCED_PCT ({self.TIER_REDUCED_PCT}) must be < TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT})"
-        assert self.TIER_MINIMAL_PCT < self.TIER_PASSIVE_PCT, \
-            f"TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT}) must be < TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT})"
-        assert self.TIER_PASSIVE_PCT < self.TIER_HALTED_PCT, \
-            f"TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT}) must be < TIER_HALTED_PCT ({self.TIER_HALTED_PCT})"
-        assert self.TIER_HALTED_PCT <= self.DAILY_LOSS_LIMIT_PCT, \
-            f"TIER_HALTED_PCT ({self.TIER_HALTED_PCT}) must be <= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"
-        assert self.MAX_DRAWDOWN_PCT >= self.DAILY_LOSS_LIMIT_PCT, \
-            f"MAX_DRAWDOWN_PCT ({self.MAX_DRAWDOWN_PCT}) must be >= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"
-        assert 0.0 < self.KELLY_FRACTION <= 0.5, \
-            f"KELLY_FRACTION ({self.KELLY_FRACTION}) must be in (0.0, 0.5]"
-        assert self.ATR_MULTIPLIER_TP > self.ATR_MULTIPLIER_SL, \
-            f"ATR_MULTIPLIER_TP ({self.ATR_MULTIPLIER_TP}) must be > ATR_MULTIPLIER_SL ({self.ATR_MULTIPLIER_SL})"
-        assert self.MICRO_PRICE_MOVE_FLOOR_BPS > 0.0, \
-            "MICRO_PRICE_MOVE_FLOOR_BPS must be > 0"
+        # Runtime config invariants — raise ValueError (not assert, which `python -O` strips).
+        _checks = [
+            (self.TIER_REDUCED_PCT < self.TIER_MINIMAL_PCT,
+             f"TIER_REDUCED_PCT ({self.TIER_REDUCED_PCT}) must be < TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT})"),
+            (self.TIER_MINIMAL_PCT < self.TIER_PASSIVE_PCT,
+             f"TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT}) must be < TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT})"),
+            (self.TIER_PASSIVE_PCT < self.TIER_HALTED_PCT,
+             f"TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT}) must be < TIER_HALTED_PCT ({self.TIER_HALTED_PCT})"),
+            (self.TIER_HALTED_PCT <= self.DAILY_LOSS_LIMIT_PCT,
+             f"TIER_HALTED_PCT ({self.TIER_HALTED_PCT}) must be <= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"),
+            (self.MAX_DRAWDOWN_PCT >= self.DAILY_LOSS_LIMIT_PCT,
+             f"MAX_DRAWDOWN_PCT ({self.MAX_DRAWDOWN_PCT}) must be >= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"),
+            (0.0 < self.KELLY_FRACTION <= 0.5,
+             f"KELLY_FRACTION ({self.KELLY_FRACTION}) must be in (0.0, 0.5]"),
+            (self.ATR_MULTIPLIER_TP > self.ATR_MULTIPLIER_SL,
+             f"ATR_MULTIPLIER_TP ({self.ATR_MULTIPLIER_TP}) must be > ATR_MULTIPLIER_SL ({self.ATR_MULTIPLIER_SL})"),
+            (self.MICRO_PRICE_MOVE_FLOOR_BPS > 0.0,
+             "MICRO_PRICE_MOVE_FLOOR_BPS must be > 0"),
+        ]
+        for ok, msg in _checks:
+            if not ok:
+                raise ValueError(msg)
         assert self.MICRO_PRICE_MOVE_WINDOW > 0, \
             "MICRO_PRICE_MOVE_WINDOW must be > 0"
         assert 0.0 < self.MICRO_PRICE_MOVE_PERCENTILE < 1.0, \
