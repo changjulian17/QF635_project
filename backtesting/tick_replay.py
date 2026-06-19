@@ -62,6 +62,12 @@ class VariantConfig:
     min_edge_bps:        float                     = 0.0
     apply_entry_gate:    bool                      = False
     entry_rules:         Optional[EntryRules]      = None
+    # Directional-bias gate from CVD + trend. "off": no bias. "skip": veto sweeps that
+    # fight the bias. "flip": take the bias direction instead when they conflict.
+    bias_mode:           Literal["off", "skip", "flip"] = "off"
+    bias_use_cvd:        bool                      = True
+    bias_use_trend:      bool                      = True
+    bias_vwap_band:      float                     = 0.15
 
 
 @dataclass
@@ -533,6 +539,22 @@ class TickReplayEngine:
 
     # ── Position management ───────────────────────────────────────────────────
 
+    def _directional_bias(self, fv) -> str:
+        """LONG / SHORT / NEUTRAL from trend (price_vs_vwap) and flow (cvd_delta).
+
+        With both inputs active, the bias is directional only if they agree AND are
+        both non-zero; otherwise NEUTRAL. The bias_use_* toggles isolate a single input.
+        """
+        band   = self._variant.bias_vwap_band
+        active: list[int] = []
+        if self._variant.bias_use_trend:
+            active.append(1 if fv.price_vs_vwap > band else -1 if fv.price_vs_vwap < -band else 0)
+        if self._variant.bias_use_cvd:
+            active.append(1 if fv.cvd_delta > 0 else -1 if fv.cvd_delta < 0 else 0)
+        if not active or any(a == 0 for a in active) or len(set(active)) != 1:
+            return "NEUTRAL"
+        return "LONG" if active[0] > 0 else "SHORT"
+
     def _simulate_trade(
         self, signal: MicroSignal, entry_price: float, ts_ms: int
     ) -> None:
@@ -543,23 +565,42 @@ class TickReplayEngine:
         if self._equity <= 0:
             return
 
-        # Optional entry gate — mirror the live Gate 2 confidence check. fv is None
-        # during warm-up (rsi not ready), which is a skip just like the live path.
+        # Compute the FeatureVector ONCE, only if a feature-based gate needs it
+        # (confidence or directional bias). Baseline / non-gated variants never compute
+        # it, so their path — and warm-up trade behaviour — is unchanged (parity).
+        need_fv = self._gate_scorer is not None or self._variant.bias_mode != "off"
+        fv = self._fc.compute(self._cvd, self._shared_state) if need_fv else None
+
+        # Optional confidence gate — mirror the live Gate 2 check. fv is None during
+        # warm-up (rsi not ready), which is a skip just like the live path.
         if self._gate_scorer is not None:
-            fv = self._fc.compute(self._cvd, self._shared_state)
             if fv is None or self._gate_scorer.score(fv, signal) < settings.MIN_CONFIDENCE:
                 return
 
         # The protection wall must sit on the correct side of entry (sweep with
-        # protection behind it). This gate is identical across stop modes.
+        # protection behind it). Validates the original sweep regardless of bias.
         wall_price = signal.protection_wall.price
         if signal.direction == "LONG" and wall_price >= entry_price:
             return
         if signal.direction == "SHORT" and wall_price <= entry_price:
             return
 
-        # Stop distance. "wall": stop at the protection wall (legacy behaviour).
-        # "vol_floor": floor the stop at stop_floor_atr_mult × ATR so it clears the
+        # Directional-bias gate. "skip" vetoes counter-bias sweeps; "flip" trades the bias
+        # direction instead. NEUTRAL (rangebound/conflicted tape) is always a skip.
+        effective_direction = signal.direction
+        if self._variant.bias_mode != "off":
+            if fv is None:                       # warm-up: no bias yet (mirrors gate skip)
+                return
+            bias = self._directional_bias(fv)
+            if bias == "NEUTRAL":
+                return
+            if bias != signal.direction:
+                if self._variant.bias_mode == "skip":
+                    return
+                effective_direction = bias       # "flip"
+
+        # Stop distance (magnitude). "wall": distance to the protection wall (legacy).
+        # "vol_floor": floored at stop_floor_atr_mult × ATR so it clears the
         # microstructure noise band (the live <3 s instant-stop failure mode).
         wall_dist = abs(entry_price - wall_price)
         if self._variant.stop_mode == "vol_floor":
@@ -568,7 +609,9 @@ class TickReplayEngine:
             sl_dist = wall_dist
         if sl_dist < 1e-9:
             return
-        sl_price = entry_price - sl_dist if signal.direction == "LONG" else entry_price + sl_dist
+        # Place the stop on the correct side of the EFFECTIVE direction (flipped trades
+        # reflect the magnitude to the opposite side).
+        sl_price = entry_price - sl_dist if effective_direction == "LONG" else entry_price + sl_dist
 
         # Breakeven/edge filter: TP gross must exceed the larger of round-trip cost and
         # the variant's min-edge floor (min_edge_bps=0 ⇒ identical to the legacy check).
@@ -582,7 +625,7 @@ class TickReplayEngine:
         risk_usd = self._equity * settings.RISK_PER_TRADE_PCT * settings.KELLY_FRACTION
         qty      = risk_usd / sl_dist
         # TP at rr × sl_dist — mirrors live OCO bracket formula.
-        if signal.direction == "LONG":
+        if effective_direction == "LONG":
             tp_price = entry_price + rr * sl_dist
         else:
             tp_price = entry_price - rr * sl_dist
@@ -591,7 +634,7 @@ class TickReplayEngine:
         self._equity -= entry_cost
 
         self._open_position = {
-            "direction":     signal.direction,
+            "direction":     effective_direction,
             "entry_price":   entry_price,
             "qty":           qty,
             "sl":            sl_price,

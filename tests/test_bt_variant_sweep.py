@@ -6,6 +6,7 @@ driven directly with synthetic signals.
 """
 import importlib.util
 import pathlib
+import types
 
 import pytest
 
@@ -160,3 +161,61 @@ def test_entry_gate_skips_during_warmup():
     # FeatureComputer is cold → compute() returns None → gate rejects the trade.
     eng._simulate_trade(sig, 100.0, 2_000)
     assert eng._open_position is None
+
+
+# ── directional-bias gate (skip / flip) ─────────────────────────────────────────
+
+def _fv(price_vs_vwap: float, cvd_delta: float):
+    return types.SimpleNamespace(price_vs_vwap=price_vs_vwap, cvd_delta=cvd_delta)
+
+
+def _bias_engine(variant, price_vs_vwap, cvd_delta):
+    """Engine whose FeatureComputer returns a fixed fv → deterministic bias."""
+    eng = _engine(variant)
+    eng._fc.compute = lambda *a, **k: _fv(price_vs_vwap, cvd_delta)  # type: ignore[method-assign]
+    return eng
+
+
+def test_directional_bias_truth_table():
+    db = _engine(VariantConfig(name="b", bias_mode="skip"))._directional_bias  # both inputs, band=0.15
+    assert db(_fv(0.5, 1.0)) == "LONG"      # trend up ∧ cvd up
+    assert db(_fv(-0.5, -1.0)) == "SHORT"   # both down
+    assert db(_fv(0.5, -1.0)) == "NEUTRAL"  # disagree
+    assert db(_fv(0.10, 1.0)) == "NEUTRAL"  # |price_vs_vwap| ≤ band → trend 0 → not both non-zero
+    assert db(_fv(0.0, 0.0)) == "NEUTRAL"
+
+
+def test_directional_bias_single_input_isolation():
+    cvd_only = _engine(VariantConfig(name="c", bias_mode="skip", bias_use_trend=False))._directional_bias
+    assert cvd_only(_fv(-0.9, 1.0)) == "LONG"    # trend ignored; cvd>0
+    assert cvd_only(_fv(0.9, -1.0)) == "SHORT"   # trend ignored; cvd<0
+    assert cvd_only(_fv(0.9, 0.0)) == "NEUTRAL"  # cvd==0
+    trend_only = _engine(VariantConfig(name="t", bias_mode="skip", bias_use_cvd=False))._directional_bias
+    assert trend_only(_fv(0.5, -1.0)) == "LONG"     # cvd ignored; trend up
+    assert trend_only(_fv(0.10, 1.0)) == "NEUTRAL"  # within band
+
+
+def test_bias_skip_vetoes_counter_bias_and_allows_aligned():
+    veto = _bias_engine(VariantConfig(name="b", bias_mode="skip"), 0.5, 1.0)   # bias LONG
+    veto._simulate_trade(_signal("SHORT", 100.0, 20.0), 100.0, 2_000)
+    assert veto._open_position is None                                          # SHORT vetoed
+
+    ok = _bias_engine(VariantConfig(name="b", bias_mode="skip"), 0.5, 1.0)      # bias LONG
+    ok._simulate_trade(_signal("LONG", 100.0, 20.0), 100.0, 2_000)
+    assert ok._open_position is not None and ok._open_position["direction"] == "LONG"
+
+
+def test_bias_skip_neutral_skips():
+    eng = _bias_engine(VariantConfig(name="b", bias_mode="skip"), 0.5, -1.0)    # disagree → NEUTRAL
+    eng._simulate_trade(_signal("LONG", 100.0, 20.0), 100.0, 2_000)
+    assert eng._open_position is None
+
+
+def test_bias_flip_inverts_counter_bias_trade():
+    eng = _bias_engine(VariantConfig(name="f", bias_mode="flip"), 0.5, 1.0)     # bias LONG
+    eng._simulate_trade(_signal("SHORT", 100.0, 20.0), 100.0, 2_000)            # SHORT sweep
+    pos = eng._open_position
+    assert pos is not None
+    assert pos["direction"] == "LONG"               # flipped to the bias direction
+    assert pos["sl"] < pos["entry_price"]           # LONG stop sits below entry
+    assert pos["tp"] > pos["entry_price"]           # LONG target sits above entry

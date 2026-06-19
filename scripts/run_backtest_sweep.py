@@ -66,6 +66,18 @@ def _variants():
         VariantConfig(name="tp_2x", atr_mult_tp=2.0),
         VariantConfig(name="tp_4x", atr_mult_tp=4.0),
         VariantConfig(name="gated", apply_entry_gate=True, entry_rules=EntryRules()),
+        # Directional-bias gate — the sweep showed all stop/TP variants lose, the
+        # signature of wrong entry DIRECTION. Veto (or flip) sweeps that fight a
+        # CVD+trend bias. Run the single-input variants first to see which input
+        # carries the signal before the stricter bias_both (which thins the sample).
+        VariantConfig(name="bias_cvd",   bias_mode="skip", bias_use_trend=False),
+        VariantConfig(name="bias_trend", bias_mode="skip", bias_use_cvd=False),
+        VariantConfig(name="bias_both",  bias_mode="skip"),
+        VariantConfig(name="bias_volfloor", bias_mode="skip",
+                      stop_mode="vol_floor", stop_floor_atr_mult=1.5),
+        # Decisive test: if entries are systematically wrong-direction, FLIP (trade the
+        # bias) should beat skip. If flip also fails, the signal is noise, not mistimed.
+        VariantConfig(name="bias_flip",  bias_mode="flip"),
     ]
 
 
