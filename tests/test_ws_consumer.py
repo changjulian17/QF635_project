@@ -316,3 +316,66 @@ def test_apply_depth_diff_rejects_large_gap():
     diff = {"U": 100 + 5000, "u": 100 + 5010, "pu": 5100, "b": [], "a": []}
     assert consumer._apply_depth_diff(diff) is False
     assert consumer._lob_update_id == 100
+
+
+# ── Futures LOB seed bridge (reconnect-loop regression) ───────────────────────
+# Root cause of the 268-reseed loop: the seed marked the book SYNCED with
+# _lob_update_id = the REST snapshot's lastUpdateId (a *between-events* id that
+# never equals any live event's `pu`), so the first live event always failed the
+# pu-contiguity check → gap → reconnect → reseed → loop. The seed must bridge to a
+# real event `u` (U <= lastUpdateId <= u) before syncing.
+
+def _seed_consumer():
+    from core.ws_consumer import BinanceWebSocketConsumer
+    return BinanceWebSocketConsumer(streams=["btcusdt@depth@500ms"], shared_state=SharedState())
+
+
+def test_seed_syncs_at_bridge_event_u_and_live_event_chains():
+    """Seed advances _lob_update_id to the bridge event's u (real id); next live event chains via pu."""
+    import asyncio
+    c = _seed_consumer()
+    snap = {"bids": [["100", "1"]], "asks": [["101", "1"]], "lastUpdateId": 1000}
+    c._lob_pending = [
+        {"U": 900,  "u": 950,  "pu": 880,  "b": [], "a": []},   # behind snapshot → skipped
+        {"U": 951,  "u": 1050, "pu": 950,  "b": [], "a": []},   # bridge: 951 <= 1000 <= 1050
+        {"U": 1051, "u": 1100, "pu": 1050, "b": [], "a": []},   # chained: pu == prev u
+    ]
+    async def _fetch():
+        return snap
+    with patch.object(c, "_fetch_rest_snapshot", new=_fetch):
+        asyncio.run(c._sync_lob_snapshot())
+    assert c._lob_synced is True
+    assert c._lob_update_id == 1100                      # real applied u, NOT snapshot 1000
+    # a subsequent live event chains via pu == last applied u (the bug made this fail)
+    assert c._apply_depth_diff({"U": 1101, "u": 1200, "pu": 1100, "b": [], "a": []}) is True
+    assert c._lob_update_id == 1200
+
+
+def test_seed_does_not_sync_at_snapshot_id_without_bridge():
+    """No buffered event bridges lastUpdateId → seed must NOT sync at the snapshot id (the loop bug)."""
+    import asyncio
+    c = _seed_consumer()
+    snap = {"bids": [["100", "1"]], "asks": [["101", "1"]], "lastUpdateId": 1000}
+    c._lob_pending = [   # all behind the snapshot — no bridge available
+        {"U": 900, "u": 950, "pu": 880, "b": [], "a": []},
+        {"U": 951, "u": 990, "pu": 950, "b": [], "a": []},
+    ]
+    async def _fetch():
+        return snap
+    async def _no_sleep(*_a, **_k):
+        return None
+    with patch("core.ws_consumer._SEED_BRIDGE_WAIT_S", 0.0), \
+         patch("core.ws_consumer.asyncio.sleep", new=_no_sleep), \
+         patch.object(c, "_fetch_rest_snapshot", new=_fetch):
+        asyncio.run(c._sync_lob_snapshot())
+    assert c._lob_synced is False        # did not falsely sync
+    assert c._lob_update_id != 1000      # not seeded at the (non-event) snapshot id
+
+
+def test_live_diff_skips_stale_event_not_flagged_as_gap():
+    """A live event entirely behind _lob_update_id is stale → skipped cleanly, never a gap/reconnect."""
+    c = _seed_consumer()
+    c._lob_update_id = 5000
+    stale = {"U": 4000, "u": 4500, "pu": 3990, "b": [], "a": []}   # u < 5000
+    assert c._apply_depth_diff(stale) is True   # skipped, not False(gap)
+    assert c._lob_update_id == 5000             # unchanged
