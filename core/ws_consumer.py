@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 # Max connection duration before forced reconnect (24h)
 _MAX_CONNECTION_SECONDS = 24 * 3600
 _SEED_MAX_ATTEMPTS      = 3        # REST seed retries before staying UNSYNCED
+_SEED_BRIDGE_WAIT_S     = 10.0     # max wait for buffered diffs to reach the snapshot (bridge)
+_SEED_BRIDGE_POLL_S     = 0.1      # poll interval while waiting for the bridge event
 
 
 class HeartbeatMonitor:
@@ -334,6 +336,11 @@ class BinanceWebSocketConsumer:
         if not last_id:
             return True
 
+        # Stale / already-applied event (entirely behind our state) — skip BEFORE the
+        # gap check, else a behind-event (pu < last u) is mis-flagged as a gap.
+        if last_id <= self._lob_update_id:
+            return True
+
         if validate and self._lob_update_id > 0:
             pu = int(diff.get("pu", 0))
             if not futures_is_contiguous(self._lob_update_id, pu):
@@ -344,9 +351,6 @@ class BinanceWebSocketConsumer:
                     logger.warning("[WS] LOB GAP DETECTED: pu=%d != last u=%d (gap=%d)",
                                    pu, self._lob_update_id, gap)
                     return False
-
-        if last_id <= self._lob_update_id:
-            return True
 
         for side, book in [("b", self._bid_book), ("a", self._ask_book)]:
             for price_str, qty_str in diff.get(side, []):
@@ -388,49 +392,78 @@ class BinanceWebSocketConsumer:
             "E": event_ms
         }
 
-    async def _sync_lob_snapshot(self) -> None:
-        """Fetch full snapshot from REST and align with buffered diffs."""
+    async def _fetch_rest_snapshot(self) -> dict:
+        """Fetch a futures REST depth snapshot (extracted for testability)."""
         url = f"{settings.REST_BASE}/fapi/v1/depth?symbol={settings.SYMBOL}&limit=1000"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    snap = await resp.json()
-            
-            self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
-            self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
-            last_uid = int(snap["lastUpdateId"])
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                return await resp.json()
 
-            # Apply buffered diffs only if they form a gapless bridge (futures rules):
-            # first event straddles lastUpdateId (U <= lastUpdateId <= u); every later
-            # event's pu must equal the previous event's u. A gap → reseed.
-            prev_u, first = last_uid, True
-            for diff in self._lob_pending:
-                u = int(diff.get("u", 0))
-                if u <= last_uid:
-                    continue
-                U = int(diff.get("U", 0))
-                if first:
-                    if not futures_seed_bridge_ok(U, u, last_uid):
-                        raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
-                    first = False
-                else:
-                    pu = int(diff.get("pu", 0))
-                    if not futures_is_contiguous(prev_u, pu):
-                        raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
-                self._apply_depth_diff(diff, validate=False)
-                prev_u = u
-            
-            self._lob_pending.clear()
-            self._lob_update_id = prev_u
-            self._lob_synced = True   # only on a clean seed — Gate 0 never sees a partial book
-            logger.info(
-                "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
-                prev_u, len(self._bid_book), len(self._ask_book),
-            )
-            if self._bid_book and self._ask_book:
-                self._enqueue_latest_depth_snapshot(int(time.time() * 1000))
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
-                KeyError, ValueError, SeedDiscontinuity) as exc:
-            logger.error("[WS] LOB seed failed (%s) — staying unsynced; will reseed.", exc)
-            self._lob_pending.clear()
-            self._lob_synced = False
+    async def _sync_lob_snapshot(self) -> None:
+        """Seed the local book from a REST snapshot, bridging to the live diff stream.
+
+        USD-M Futures: the snapshot's lastUpdateId is a *between-events* id, so we
+        must apply a real bridge event (U <= lastUpdateId <= u) before going SYNCED —
+        otherwise _lob_update_id sits on a non-event id and every live event's `pu`
+        mismatches it (the reconnect loop). If the buffer hasn't reached the snapshot
+        yet, wait for the stream to deliver the bridge rather than syncing at the
+        bare id. Diffs keep buffering meanwhile (dispatch appends while UNSYNCED).
+        """
+        for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
+            try:
+                snap = await self._fetch_rest_snapshot()
+                self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
+                self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
+                last_uid = int(snap["lastUpdateId"])
+
+                # Wait until a buffered diff reaches the snapshot (u >= lastUpdateId);
+                # on the contiguous futures stream the first such event straddles it.
+                deadline = time.monotonic() + _SEED_BRIDGE_WAIT_S
+                while not any(int(d.get("u", 0)) >= last_uid for d in self._lob_pending):
+                    if time.monotonic() >= deadline:
+                        raise SeedDiscontinuity(
+                            f"no diff reached lastUpdateId={last_uid} within {_SEED_BRIDGE_WAIT_S}s"
+                        )
+                    await asyncio.sleep(_SEED_BRIDGE_POLL_S)
+
+                # Apply from the bridge: first event straddles lastUpdateId, rest pu-chain.
+                prev_u, bridged = last_uid, False
+                for diff in self._lob_pending:
+                    u = int(diff.get("u", 0))
+                    if u <= last_uid:
+                        continue
+                    U = int(diff.get("U", 0))
+                    if not bridged:
+                        if not futures_seed_bridge_ok(U, u, last_uid):
+                            raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
+                        bridged = True
+                    else:
+                        pu = int(diff.get("pu", 0))
+                        if not futures_is_contiguous(prev_u, pu):
+                            raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
+                    self._apply_depth_diff(diff, validate=False)
+                    prev_u = u
+
+                if not bridged:
+                    raise SeedDiscontinuity(f"no bridge event for lastUpdateId={last_uid}")
+
+                self._lob_pending.clear()
+                self._lob_update_id = prev_u          # a real event u — live `pu` chains from here
+                self._lob_synced = True
+                logger.info(
+                    "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
+                    prev_u, len(self._bid_book), len(self._ask_book),
+                )
+                if self._bid_book and self._ask_book:
+                    self._enqueue_latest_depth_snapshot(int(time.time() * 1000))
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
+                    KeyError, ValueError, SeedDiscontinuity) as exc:
+                logger.warning("[WS] LOB seed attempt %d/%d failed: %s", attempt, _SEED_MAX_ATTEMPTS, exc)
+                await asyncio.sleep(min(2 ** (attempt - 1), 5))
+
+        # All attempts failed — stay UNSYNCED (Gate 0 blocks) until the next reconnect.
+        self._lob_pending.clear()
+        self._lob_synced = False
+        logger.error("[WS] LOB seed failed after %d attempts — staying unsynced.", _SEED_MAX_ATTEMPTS)

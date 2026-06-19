@@ -39,6 +39,8 @@ _FLUSH_RECORDS       = 100
 _FLUSH_SECONDS       = 5.0
 _MAX_RECONNECT_DELAY = 60.0
 _SEED_MAX_ATTEMPTS   = 3       # REST seed retries before giving up (stay unsynced, no recording)
+_SEED_BRIDGE_WAIT_S  = 10.0    # max wait for buffered diffs to reach the snapshot (bridge)
+_SEED_BRIDGE_POLL_S  = 0.1     # poll interval while waiting for the bridge event
 _MAX_BUFFER_SIZE     = 10_000
 _RETENTION_DAYS      = 7
 _CLEANUP_INTERVAL    = 86_400.0
@@ -167,30 +169,45 @@ class LOBRecorder:
                 self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
                 self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
                 last_uid = int(snap["lastUpdateId"])
-                # Futures bridge/contiguity: first event straddles lastUpdateId
+
+                # Wait until a buffered diff reaches the snapshot (u >= lastUpdateId)
+                # so a real bridge event exists — never sync at the bare snapshot id.
+                deadline = time.monotonic() + _SEED_BRIDGE_WAIT_S
+                while not any(int(d.get("u", 0)) >= last_uid for d in self._pending_diffs):
+                    if time.monotonic() >= deadline:
+                        raise SeedDiscontinuity(
+                            f"no diff reached lastUpdateId={last_uid} within {_SEED_BRIDGE_WAIT_S}s"
+                        )
+                    await asyncio.sleep(_SEED_BRIDGE_POLL_S)
+
+                # Futures bridge/contiguity: first applied event straddles lastUpdateId
                 # (U <= lastUpdateId <= u); each later event's pu == previous u.
-                prev_u, first = last_uid, True
+                prev_u, bridged = last_uid, False
                 for event in self._pending_diffs:
                     u = int(event["u"])
                     if u <= last_uid:
                         continue
                     U = int(event.get("U", 0))
-                    if first:
+                    if not bridged:
                         if not futures_seed_bridge_ok(U, u, last_uid):
                             raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
-                        first = False
+                        bridged = True
                     else:
                         pu = int(event.get("pu", 0))
                         if not futures_is_contiguous(prev_u, pu):
                             raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
                     self._apply_diff(event)
                     prev_u = u
+
+                if not bridged:
+                    raise SeedDiscontinuity(f"no bridge event for lastUpdateId={last_uid}")
+
                 self._pending_diffs.clear()
-                self._last_update_id = prev_u
+                self._last_update_id = prev_u          # a real event u, not the snapshot id
                 self._synced = True
                 logger.info(
                     "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
-                    last_uid, len(self._bid_book), len(self._ask_book),
+                    prev_u, len(self._bid_book), len(self._ask_book),
                 )
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
