@@ -39,6 +39,7 @@ from collections.abc import Awaitable, Callable
 from binance import AsyncClient
 
 from config import settings
+from core.alerting import AlertDispatcher
 from execution.orders import FuturesMarketOrder, FuturesSLOrder, FuturesTPOrder, IOCLimitOrder
 from models import FillDetail, MicroOrderRequest
 from risk.killswitch import GlobalKillswitch
@@ -51,9 +52,10 @@ logger = logging.getLogger(__name__)
 _DRY_RUN_BEST_BID = 95_000.0
 _DRY_RUN_BEST_ASK = 95_010.0
 
-_MAX_CONNECT_ATTEMPTS = 3
-_RECONNECT_DELAY_S    = 5.0
+_MAX_CONNECT_ATTEMPTS  = 3
+_RECONNECT_DELAY_S     = 5.0
 _IOC_OVERSHOOT_FRACTION = 0.25   # fraction of spread crossed beyond best bid/ask
+_MAX_CLOSE_RETRIES     = 5       # max emergency-close attempts before blocking new signals
 
 
 def _weighted_avg_fill(resp: dict) -> float:
@@ -114,7 +116,8 @@ class OrderManager:
         ks_fire_cb: Callable[[str], Awaitable[None]] | None = None,
         update_outcome_cb: Callable[[str, str, float, float, float, float | None], Awaitable[None]] | None = None,
         budget_update_cb: Callable[[float], None] | None = None,
-        portfolio_hub=None
+        portfolio_hub=None,
+        alert_dispatcher: AlertDispatcher | None = None,
     ) -> None:
         """
         book_fn: optional callable returning (best_bid, best_ask) without a REST
@@ -137,10 +140,14 @@ class OrderManager:
         self._update_outcome_cb = update_outcome_cb
         self._budget_update_cb  = budget_update_cb
         self._portfolio_hub     = portfolio_hub
+        self._alert_dispatcher  = alert_dispatcher
         self._client: AsyncClient | None = None
 
         # Graceful-shutdown gate: set False before draining the queue.
         self.accepting_new_signals: bool = True
+
+        # Counts consecutive emergency-close failures; reset on position open.
+        self._close_retry_count: int = 0
 
         # Single lock guards all _open_position_* and placement-flag fields.
         self._position_lock = asyncio.Lock()
@@ -267,6 +274,25 @@ class OrderManager:
             "take_profit":    self._open_tp_price  or None,
             "unrealised_pnl": None,
         }
+
+    async def get_exchange_position(self) -> tuple[float, str | None]:
+        """Query the exchange for the current BTCUSDT position.
+
+        Returns (qty, side_str) where side_str is 'BUY' or 'SELL', or (0.0, None) if flat.
+        Returns (0.0, None) when client is None, DRY_RUN, or on any exception.
+        """
+        if settings.DRY_RUN or self._client is None:
+            return 0.0, None
+        try:
+            account = await self._client.futures_account()
+            for pos in account.get("positions", []):
+                if pos.get("symbol") == settings.SYMBOL:
+                    amt = float(pos.get("positionAmt", 0.0))
+                    if abs(amt) > 0.0:
+                        return abs(amt), "BUY" if amt > 0 else "SELL"
+        except Exception as exc:
+            logger.warning("[Exec] get_exchange_position failed: %s", exc)
+        return 0.0, None
 
     def get_unrealised_pnl(self) -> float:
         """MTM PnL of open position at current mid-price. 0.0 if no position or no book."""
@@ -896,10 +922,23 @@ class OrderManager:
                     position_closed_event.set()
                 return
 
+            self._close_retry_count += 1
             logger.critical(
-                "[Exec] TP/SL emergency close FAILED — position still open, retrying | signal_id=%s",
-                signal_id[:8],
+                "[Exec] TP/SL emergency close FAILED — position still open, retrying | signal_id=%s | attempt=%d/%d",
+                signal_id[:8], self._close_retry_count, _MAX_CLOSE_RETRIES,
             )
+            if self._close_retry_count >= _MAX_CLOSE_RETRIES:
+                self.accepting_new_signals = False
+                logger.critical(
+                    "[Exec] Max close retries (%d) reached — blocking new signals until position resolves | signal_id=%s",
+                    _MAX_CLOSE_RETRIES, signal_id[:8],
+                )
+                if self._alert_dispatcher is not None:
+                    asyncio.create_task(
+                        self._alert_dispatcher.notify_killswitch(
+                            f"MAX_CLOSE_RETRIES_{_MAX_CLOSE_RETRIES}", 0.0
+                        )
+                    )
             await asyncio.sleep(poll_interval_s * 5)  # brief backoff before retry
 
     # ── User data stream callback ─────────────────────────────────────────────
@@ -1217,6 +1256,7 @@ class OrderManager:
         self._cancel_oco_on_placement     = False
         self._entry_in_flight             = False
         self._emergency_close_in_progress = False
+        self._close_retry_count           = 0
 
     # ── Killswitch hard stop ──────────────────────────────────────────────────
 

@@ -212,3 +212,59 @@ async def test_get_open_position_none_after_fill():
     msg = _futures_msg(99, status="FILLED", last_price="50500.0")
     await om.on_execution_report(msg)
     assert om.get_open_position() is None
+
+
+# ── T2-E: keepalive failure → reconnect ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_keepalive_failure_triggers_reconnect():
+    """Two consecutive keepalive failures must set _keepalive_failed so that
+    _receive_loop breaks and reconnects, obtaining a fresh listenKey."""
+    from core.user_data_stream import UserDataStreamConsumer
+
+    mock_client = MagicMock()
+    mock_client.futures_stream_keepalive = AsyncMock(
+        side_effect=Exception("keepalive rejected")
+    )
+    consumer = UserDataStreamConsumer(client=mock_client)
+    consumer._running   = True
+    consumer._listen_key = "test-key-abc"
+
+    # Run keepalive loop with a negligible sleep so two failures happen quickly.
+    with patch("core.user_data_stream._KEEPALIVE_INTERVAL_S", 0.001):
+        task = asyncio.create_task(consumer._keepalive_loop())
+        # Two intervals (2 × 0.001 s) plus some margin.
+        await asyncio.sleep(0.1)
+        consumer._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert consumer._keepalive_failed.is_set(), (
+        "_keepalive_failed must be set after 2 consecutive keepalive failures"
+    )
+
+    # Also verify: _receive_loop breaks immediately when _keepalive_failed is set.
+    consumer._keepalive_failed.set()
+    consumer._running = True
+
+    class _FakeWS:
+        async def recv(self_): await asyncio.sleep(9999)  # should never be called
+
+    broken = False
+
+    async def _run_receive():
+        nonlocal broken
+        await consumer._receive_loop(_FakeWS())
+        broken = True
+
+    task2 = asyncio.create_task(_run_receive())
+    await asyncio.sleep(0.01)
+    assert broken, "_receive_loop must exit immediately when _keepalive_failed is set"
+    task2.cancel()
+    try:
+        await task2
+    except asyncio.CancelledError:
+        pass

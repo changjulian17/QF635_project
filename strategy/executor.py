@@ -511,7 +511,9 @@ class StrategyExecutor:
             )
             sl_est     = signal.mid_price * capped_bps / 10_000
             if sl_est > 0:
-                est_notional = (equity * notional_hint / sl_est) * signal.mid_price
+                _book    = self._lob_engine.best_bid_ask() if self._lob_engine else None
+                live_mid = (_book[0] + _book[1]) / 2.0 if _book else signal.mid_price
+                est_notional = (equity * notional_hint / sl_est) * live_mid
                 ok, reason   = gate_3_position_size(
                     est_notional, equity, settings.MAX_ORDER_NOTIONAL_PCT
                 )

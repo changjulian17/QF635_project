@@ -17,7 +17,8 @@ from models import KillswitchState
 
 logger = logging.getLogger(__name__)
 
-_SLIPPAGE_WINDOW = 20
+_SLIPPAGE_WINDOW          = 20
+_SLIPPAGE_OUTLIER_CAP_BPS = 50   # single fill above this is a data-quality event, not systematic
 
 
 class GlobalKillswitch:
@@ -86,6 +87,7 @@ class GlobalKillswitch:
         else:
             slippage_bps = (signal_price - fill_price) / signal_price * 10_000
 
+        slippage_bps = min(slippage_bps, _SLIPPAGE_OUTLIER_CAP_BPS)
         self._slippage_buf.append(slippage_bps)
         if len(self._slippage_buf) < _SLIPPAGE_WINDOW:
             return False
@@ -101,6 +103,10 @@ class GlobalKillswitch:
                 total_loss=0.0,
             )
         return False
+
+    def reset_slippage_buffer(self) -> None:
+        """Clear the KS-3 rolling buffer at session boundary (call from midnight_reset_loop)."""
+        self._slippage_buf.clear()
 
     # ── Properties ────────────────────────────────────────────────────────────
 

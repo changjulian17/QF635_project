@@ -1298,3 +1298,50 @@ def test_get_unrealised_pnl_no_book():
     om._open_position_qty   = 0.001
 
     assert om.get_unrealised_pnl() == 0.0
+
+
+# ── T1-A: _watch_tp_sl max-retry cap ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_watch_tp_sl_blocks_signals_after_max_retries():
+    """After _MAX_CLOSE_RETRIES failed emergency closes, accepting_new_signals is False
+    and the killswitch is NOT permanently fired (transient demo rate-limit must not halt engine)."""
+    from execution.order_manager import _MAX_CLOSE_RETRIES
+    from unittest.mock import MagicMock
+
+    om, _, _, ks = _make_manager(book_fn=lambda: (64000.0, 64002.0))
+    position_closed_event = asyncio.Event()
+    om._open_position_side          = "BUY"
+    om._open_position_qty           = 0.001
+    om._open_entry_price            = 65000.0
+    om._open_tp_price               = 66000.0
+    om._open_sl_price               = 64001.0   # mid = 64001.0 → touches SL
+    om._open_signal_id              = "test-maxretry"
+    om._open_entry_time             = 0.0
+    om._open_position_closed_event  = position_closed_event
+    om._placing_oco                 = False
+    om._emergency_close_in_progress = False
+
+    alert_dispatcher = MagicMock()
+    alert_dispatcher.notify_killswitch = AsyncMock(return_value=None)
+    om._alert_dispatcher = alert_dispatcher
+
+    om._cancel_bracket_orders = AsyncMock()
+    om._emergency_close = AsyncMock(return_value=(False, 0.0))  # always fails
+
+    task = asyncio.create_task(
+        om._watch_tp_sl("BUY", 0.001, "test-maxretry", 65000.0, 0.0, position_closed_event,
+                        poll_interval_s=0.001)
+    )
+    # Each retry cycle: poll_interval_s(0.001) + backoff(0.005) ≈ 0.006 s
+    # _MAX_CLOSE_RETRIES=5 cycles → ~0.03 s; 0.2 s is comfortably beyond that.
+    await asyncio.sleep(0.2)
+
+    assert om.accepting_new_signals is False, "signals must be blocked after max retries"
+    assert ks.is_active is False, "killswitch must NOT be permanently fired"
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

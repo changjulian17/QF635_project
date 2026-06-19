@@ -936,3 +936,53 @@ async def test_evaluate_exception_does_not_crash_run_loop():
         pass
 
     assert call_count == 2, "run() must process second signal after first raises"
+
+
+# ── T1-C: Gate 3 live-mid test ────────────────────────────────────────────────
+
+def test_gate3_uses_live_mid_not_signal_mid():
+    """Gate 3 must use lob_engine.best_bid_ask() live mid, not the stale signal.mid_price.
+
+    Setup: signal.mid_price = 73_628 (high), live_mid from LOB = 100 (tiny).
+    With 1-bps wall: sl_est = 73_628 × 1/10_000 = 7.36.
+    est_notional = (equity × notional_hint / sl_est) × live_mid
+      = (10_000 × ~0.000228 / 7.36) × 100  ≈ 31  — well below 9 k cap → PASSES.
+    If signal.mid_price were used instead: est_notional ≈ 22_810 → GATE_3_FAIL (regression).
+    """
+    async def _run():
+        micro_q  = asyncio.Queue()
+        signal_q = asyncio.Queue()
+        telem_q  = asyncio.Queue()
+        state    = SharedState(lob_status="SYNCED", heartbeat_status="HEALTHY", last_delta_ms=20.0)
+
+        class _TinyMidLOB:
+            """Returns a book whose mid (100.0) is far below signal.mid_price (73_628)."""
+            def best_bid_ask(self):
+                return (99.9, 100.1)
+
+        ex = StrategyExecutor(
+            micro_signal_queue=micro_q,
+            signal_queue=signal_q,
+            telemetry_queue=telem_q,
+            feature_computer=_MockFC(),
+            shared_state=state,
+            equity_fn=lambda: 10_000.0,
+            lob_engine=_TinyMidLOB(),   # type: ignore[arg-type]
+        )
+
+        # 1-bps wall distance: if signal.mid_price used → est_notional ≈ 22_810 → FAIL
+        # If live_mid (100) used → est_notional ≈ 31 → PASS
+        sig = _signal_with_mid(mid=73_628.0, wall_distance_bps=1)
+        await ex._evaluate(sig)
+        await asyncio.sleep(0)
+
+        assert not signal_q.empty(), (
+            "gate 3 must use live mid from lob_engine — "
+            "signal must reach order queue when live_mid is tiny"
+        )
+        rec = await telem_q.get()
+        assert rec.gate_passed == "APPROVED", (
+            f"expected APPROVED but got {rec.gate_passed}: {rec.rejection_reason}"
+        )
+
+    asyncio.run(_run())

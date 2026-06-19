@@ -128,7 +128,7 @@ async def _portfolio_mtm_loop(
     render entirely from this stream without an extra REST poll.
     """
     while True:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.25)
         if killswitch.is_active:
             return
         risk_engine.mark_unrealised(order_manager.get_unrealised_pnl())
@@ -151,7 +151,7 @@ async def _portfolio_mtm_loop(
 
 # ── Midnight reset ────────────────────────────────────────────────────────────
 
-async def midnight_reset_loop(risk_engine: RiskEngine) -> None:
+async def midnight_reset_loop(risk_engine: RiskEngine, killswitch: GlobalKillswitch) -> None:
     """Sleep until next UTC midnight + 5 s, then reset daily risk counters."""
     while True:
         now = datetime.now(timezone.utc)
@@ -160,7 +160,35 @@ async def midnight_reset_loop(risk_engine: RiskEngine) -> None:
         )
         await asyncio.sleep((next_midnight - now).total_seconds())
         risk_engine.reset_for_new_session()
+        killswitch.reset_slippage_buffer()
         logger.info("[Midnight] Session reset complete")
+
+
+# ── Orphan position watchdog ──────────────────────────────────────────────────
+
+async def _orphan_watchdog(
+    order_manager: OrderManager,
+    killswitch: GlobalKillswitch,
+    alert_dispatcher,
+    interval_s: float = 30.0,
+) -> None:
+    """Poll the exchange every interval_s for positions not tracked locally."""
+    while True:
+        await asyncio.sleep(interval_s)
+        if killswitch.is_active:
+            return
+        exch_qty, exch_side = await order_manager.get_exchange_position()
+        local_exposed = order_manager.has_active_exposure()
+        if exch_qty > 0 and not local_exposed:
+            logger.critical(
+                "[Orphan] Exchange has %.4f %s, local state clear — closing",
+                exch_qty, exch_side,
+            )
+            await order_manager.close_orphan_position(qty=exch_qty, side=exch_side or "BUY")
+            if alert_dispatcher is not None:
+                asyncio.create_task(
+                    alert_dispatcher.notify_killswitch("ORPHAN_POSITION_DETECTED", 0.0)
+                )
 
 
 # ── TaskGroup helper coroutines ───────────────────────────────────────────────
@@ -576,6 +604,7 @@ async def main() -> None:
         update_outcome_cb=telemetry.update_outcome,
         budget_update_cb=risk_engine.record_trade_result,
         portfolio_hub=portfolio_hub,
+        alert_dispatcher=alert_dispatcher,
     )
     strategy_executor = StrategyExecutor(
         micro_signal_queue=micro_signal_queue,
@@ -673,7 +702,8 @@ async def main() -> None:
             tg.create_task(strategy_executor.run(),                                           name="strategy_executor")
             tg.create_task(order_manager.start(),                                             name="order_manager")
             tg.create_task(telemetry.run(),                                                   name="signal_telemetry")
-            tg.create_task(midnight_reset_loop(risk_engine),                                  name="midnight_reset")
+            tg.create_task(midnight_reset_loop(risk_engine, killswitch),                       name="midnight_reset")
+            tg.create_task(_orphan_watchdog(order_manager, killswitch, alert_dispatcher),      name="orphan_watchdog")
             tg.create_task(db_writer.run(),                                                   name="db_writer")
             tg.create_task(
                 _process_fills(fill_queue, portfolio, telemetry,

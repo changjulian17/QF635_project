@@ -403,3 +403,62 @@ def test_seed_resets_carried_id_so_retry_bridge_is_not_stale_skipped():
     assert c._lob_synced is True
     assert c._bid_book[100.0] == 7.0   # bridge level applied (missing without the reset)
     assert c._lob_update_id == 1040
+# ── REST seed timeout / empty book (from c0fcac4, adapted to the bridge seed) ──
+# The original c0fcac4 tests patched core.ws_consumer.asyncio.wait_for, which the old
+# simple seed used. The bridge seed uses _fetch_rest_snapshot + a bounded bridge wait,
+# so these patch that instead and assert the same safety property: a timeout / empty
+# book leaves the book UNSYNCED so Gate 0 keeps rejecting signals.
+
+def test_lob_seed_timeout_stays_uninitialised():
+    """A REST seed timeout must leave _lob_synced False (Gate 0 stays closed)."""
+    import asyncio
+    consumer = BinanceWebSocketConsumer(
+        shared_state=SharedState(),
+        streams=["btcusdt@depth@500ms"],
+        depth_queue=asyncio.Queue(),
+    )
+    consumer._running = True
+
+    async def _timeout():
+        raise asyncio.TimeoutError
+
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    async def _run():
+        with patch.object(consumer, "_fetch_rest_snapshot", new=_timeout), \
+             patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+            await consumer._sync_lob_snapshot()
+
+    asyncio.run(_run())
+
+    assert consumer._lob_synced is False, "_lob_synced must stay False when seed times out"
+    assert not consumer._bid_book, "bid_book must remain empty after timeout"
+
+
+def test_lob_seed_empty_book_stays_uninitialised():
+    """A REST seed that yields no usable bridge (empty book) must leave _lob_synced False."""
+    import asyncio
+    consumer = BinanceWebSocketConsumer(
+        shared_state=SharedState(),
+        streams=["btcusdt@depth@500ms"],
+        depth_queue=asyncio.Queue(),
+    )
+    consumer._running = True
+
+    async def _empty():
+        return {"lastUpdateId": 999, "bids": [], "asks": []}
+
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    async def _run():
+        with patch.object(consumer, "_fetch_rest_snapshot", new=_empty), \
+             patch("core.ws_consumer._SEED_BRIDGE_WAIT_S", 0.0), \
+             patch("core.ws_consumer.asyncio.sleep", new=_no_sleep):
+            await consumer._sync_lob_snapshot()
+
+    asyncio.run(_run())
+
+    assert consumer._lob_synced is False, "_lob_synced must stay False when seed returns empty book"
+    assert not consumer._bid_book, "bid_book must remain empty for an empty seed"

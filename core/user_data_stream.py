@@ -52,6 +52,7 @@ class UserDataStreamConsumer:
         self._reconnect_delay     = 1.0
         self._execution_report_cb: Callable[[dict], Awaitable[None]] | None = None
         self._balance_update_cb:   Callable[[dict], Awaitable[None]] | None = None
+        self._keepalive_failed    = asyncio.Event()
 
     async def start(
         self,
@@ -97,6 +98,7 @@ class UserDataStreamConsumer:
             return None
 
     async def _keepalive_loop(self) -> None:
+        consec_failures = 0
         while self._running:
             await asyncio.sleep(_KEEPALIVE_INTERVAL_S)
             if not self._running or not self._listen_key:
@@ -104,8 +106,18 @@ class UserDataStreamConsumer:
             try:
                 await self._client.futures_stream_keepalive(listenKey=self._listen_key)
                 logger.debug("[UserData] listenKey keepalive sent")
+                consec_failures = 0
             except Exception as exc:
-                logger.warning("[UserData] listenKey keepalive failed: %s", exc)
+                consec_failures += 1
+                logger.warning(
+                    "[UserData] listenKey keepalive failed (%d): %s", consec_failures, exc
+                )
+                if consec_failures >= 2:
+                    logger.critical(
+                        "[UserData] %d consecutive keepalive failures — forcing reconnect",
+                        consec_failures,
+                    )
+                    self._keepalive_failed.set()
 
     async def _connect_loop(self) -> None:
         attempt = 0
@@ -137,6 +149,7 @@ class UserDataStreamConsumer:
                     logger.info("[UserData] User data stream connected")
                     self._reconnect_delay = 1.0
                     attempt = 0
+                    self._keepalive_failed.clear()
                     keepalive_task = asyncio.create_task(
                         self._keepalive_loop(), name="user_data_keepalive"
                     )
@@ -165,6 +178,9 @@ class UserDataStreamConsumer:
     async def _receive_loop(self, ws) -> None:
         while True:
             if not self._running:
+                break
+            if self._keepalive_failed.is_set():
+                logger.warning("[UserData] Keepalive failed — forcing reconnect to renew listenKey")
                 break
 
             try:
