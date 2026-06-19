@@ -1,4 +1,7 @@
 """Tests for Settings preset values (config.py _apply_mode_presets)."""
+import subprocess
+import sys
+
 import pytest
 
 
@@ -65,3 +68,49 @@ def test_tier_ordering_violation_raises_valueerror():
     with pytest.raises(ValueError):
         Settings(BINANCE_TESTNET=False, BINANCE_DEMO=False, DRY_RUN=True,
                  TIER_REDUCED_PCT=0.5, TIER_MINIMAL_PCT=0.1, _env_file=None)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"MICRO_PRICE_MOVE_WINDOW": 0},
+        {"MICRO_PRICE_MOVE_PERCENTILE": 1.0},
+        {"MICRO_PRICE_MOVE_MIN_SAMPLES": 0},
+        {"PROTECTION_MIN_DISTANCE_BPS": 30.0},
+        {"MICRO_MAX_HOLD_MS": 0},
+        {"MICRO_EXIT_SPREAD_HARD_CAP_BPS": 0.0},
+        {"MIN_SIGNAL_INTERVAL_MS": 300},
+    ],
+)
+def test_runtime_invariant_violations_raise_valueerror(overrides):
+    """Runtime config invariants must raise ValueError, never AssertionError."""
+    from config import Settings
+
+    kwargs = {
+        "BINANCE_TESTNET": False,
+        "BINANCE_DEMO": False,
+        "DRY_RUN": True,
+        "_env_file": None,
+        **overrides,
+    }
+    with pytest.raises(ValueError):
+        Settings(**kwargs)
+
+
+def test_runtime_invariants_hold_under_optimized_python():
+    """Config validation must still reject bad values when Python strips asserts."""
+    code = (
+        "from config import Settings\n"
+        "Settings(BINANCE_TESTNET=False, BINANCE_DEMO=False, DRY_RUN=True, "
+        "MICRO_MAX_HOLD_MS=0, _env_file=None)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        cwd=".",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "MICRO_MAX_HOLD_MS" in result.stderr

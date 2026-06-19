@@ -250,29 +250,27 @@ class Settings(BaseSettings):
              f"ATR_MULTIPLIER_TP ({self.ATR_MULTIPLIER_TP}) must be > ATR_MULTIPLIER_SL ({self.ATR_MULTIPLIER_SL})"),
             (self.MICRO_PRICE_MOVE_FLOOR_BPS > 0.0,
              "MICRO_PRICE_MOVE_FLOOR_BPS must be > 0"),
+            (self.MICRO_PRICE_MOVE_WINDOW > 0,
+             "MICRO_PRICE_MOVE_WINDOW must be > 0"),
+            (0.0 < self.MICRO_PRICE_MOVE_PERCENTILE < 1.0,
+             "MICRO_PRICE_MOVE_PERCENTILE must be in (0, 1)"),
+            (0 < self.MICRO_PRICE_MOVE_MIN_SAMPLES <= self.MICRO_PRICE_MOVE_WINDOW,
+             "MICRO_PRICE_MOVE_MIN_SAMPLES must be in [1, MICRO_PRICE_MOVE_WINDOW]"),
+            (0.0 < self.PROTECTION_MIN_DISTANCE_BPS < self.PROTECTION_MAX_DISTANCE_BPS,
+             f"PROTECTION_MIN_DISTANCE_BPS ({self.PROTECTION_MIN_DISTANCE_BPS}) must be in "
+             f"(0, PROTECTION_MAX_DISTANCE_BPS={self.PROTECTION_MAX_DISTANCE_BPS})"),
+            (self.MICRO_MAX_HOLD_MS > 0,
+             "MICRO_MAX_HOLD_MS must be > 0"),
+            (self.MICRO_EXIT_SPREAD_HARD_CAP_BPS > 0.0,
+             "MICRO_EXIT_SPREAD_HARD_CAP_BPS must be > 0"),
+            (self.MIN_SIGNAL_INTERVAL_MS <= 0 or self.MIN_SIGNAL_INTERVAL_MS < self.IOC_TIMEOUT_MS,
+             f"MIN_SIGNAL_INTERVAL_MS ({self.MIN_SIGNAL_INTERVAL_MS}ms) must be < "
+             f"IOC_TIMEOUT_MS ({self.IOC_TIMEOUT_MS}ms) — otherwise approved signals "
+             f"expire before the next approval window opens"),
         ]
         for ok, msg in _checks:
             if not ok:
                 raise ValueError(msg)
-        assert self.MICRO_PRICE_MOVE_WINDOW > 0, \
-            "MICRO_PRICE_MOVE_WINDOW must be > 0"
-        assert 0.0 < self.MICRO_PRICE_MOVE_PERCENTILE < 1.0, \
-            "MICRO_PRICE_MOVE_PERCENTILE must be in (0, 1)"
-        assert 0 < self.MICRO_PRICE_MOVE_MIN_SAMPLES <= self.MICRO_PRICE_MOVE_WINDOW, \
-            "MICRO_PRICE_MOVE_MIN_SAMPLES must be in [1, MICRO_PRICE_MOVE_WINDOW]"
-        assert 0.0 < self.PROTECTION_MIN_DISTANCE_BPS < self.PROTECTION_MAX_DISTANCE_BPS, \
-            (f"PROTECTION_MIN_DISTANCE_BPS ({self.PROTECTION_MIN_DISTANCE_BPS}) must be in "
-             f"(0, PROTECTION_MAX_DISTANCE_BPS={self.PROTECTION_MAX_DISTANCE_BPS})")
-        assert self.MICRO_MAX_HOLD_MS > 0, \
-            "MICRO_MAX_HOLD_MS must be > 0"
-        assert self.MICRO_EXIT_SPREAD_HARD_CAP_BPS > 0.0, \
-            "MICRO_EXIT_SPREAD_HARD_CAP_BPS must be > 0"
-        if self.MIN_SIGNAL_INTERVAL_MS > 0:
-            assert self.MIN_SIGNAL_INTERVAL_MS < self.IOC_TIMEOUT_MS, (
-                f"MIN_SIGNAL_INTERVAL_MS ({self.MIN_SIGNAL_INTERVAL_MS}ms) must be < "
-                f"IOC_TIMEOUT_MS ({self.IOC_TIMEOUT_MS}ms) — otherwise approved signals "
-                f"expire before the next approval window opens"
-            )
         return self
 
 
