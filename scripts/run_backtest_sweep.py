@@ -78,6 +78,16 @@ def _variants():
         # Decisive test: if entries are systematically wrong-direction, FLIP (trade the
         # bias) should beat skip. If flip also fails, the signal is noise, not mistimed.
         VariantConfig(name="bias_flip",  bias_mode="flip"),
+        # Stop-vs-direction: does a loser recover if we don't stop out tight? Wide stop +
+        # a reachable (decoupled) target lets a recovered trade bank a gain. modesttp's
+        # 1×ATR target is cost-throttled (must clear ~30bps round-trip); modesttp2 gives room.
+        VariantConfig(name="widestop_modesttp",  stop_mode="vol_floor", stop_floor_atr_mult=2.0,
+                      tp_atr_mult=1.0),
+        VariantConfig(name="widestop_modesttp2", stop_mode="vol_floor", stop_floor_atr_mult=2.0,
+                      tp_atr_mult=2.0),
+        # Wide stop + 5-min time exit removes the target question entirely.
+        VariantConfig(name="widestop_timeexit",  stop_mode="vol_floor", stop_floor_atr_mult=2.0,
+                      max_hold_ms=300_000.0),
     ]
 
 
@@ -98,6 +108,17 @@ def _adapt_trades(trades) -> list[dict]:
     return out
 
 
+def _excursion_stats(trades) -> dict:
+    """MAE/MFE diagnostics from a variant's trades. `loser_mfe_bps` is the headline —
+    large ⇒ losers recover ⇒ stop problem; tiny ⇒ direction problem."""
+    losers = [t for t in trades if t.pnl_usd < 0]
+    return {
+        "avg_mae_bps":   round(sum(t.mae_bps for t in trades) / len(trades), 2) if trades else 0.0,
+        "avg_mfe_bps":   round(sum(t.mfe_bps for t in trades) / len(trades), 2) if trades else 0.0,
+        "loser_mfe_bps": round(sum(t.mfe_bps for t in losers) / len(losers), 2) if losers else 0.0,
+    }
+
+
 def _run_variant(variant, db_path, equity, lo, warmup_end, hi):
     """Backtest one variant; return its metrics dict row, or None if it errored/no-trades."""
     from backtesting.metrics import calculate_metrics
@@ -116,6 +137,7 @@ def _run_variant(variant, db_path, equity, lo, warmup_end, hi):
         )
         row = metrics.to_dict()
         row["is_benchmark"] = False
+        row.update(_excursion_stats(trades))
         return row
     except Exception as exc:  # one bad variant must not abort the whole sweep
         logger.warning("[sweep] variant %s failed: %s", variant.name, exc)
@@ -124,7 +146,7 @@ def _run_variant(variant, db_path, equity, lo, warmup_end, hi):
 
 def _print_leaderboard(df: pd.DataFrame) -> None:
     cols = ["strategy", "total_trades", "win_rate_pct", "expected_value",
-            "total_return_pct", "profit_factor", "composite_score"]
+            "total_return_pct", "profit_factor", "loser_mfe_bps", "avg_mae_bps", "avg_mfe_bps"]
     view = df[[c for c in cols if c in df.columns]].copy()
     sep = "=" * 92
     print("\n" + sep)

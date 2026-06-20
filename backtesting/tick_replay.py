@@ -68,6 +68,12 @@ class VariantConfig:
     bias_use_cvd:        bool                      = True
     bias_use_trend:      bool                      = True
     bias_vwap_band:      float                     = 0.15
+    # Decoupled target / time exit (for the "does a wider stop recover?" test).
+    # tp_atr_mult > 0 → TP = tp_atr_mult × ATR, independent of the stop distance
+    # (0 ⇒ legacy TP = atr_mult_tp × stop). max_hold_ms > 0 → force exit after that
+    # long (0 ⇒ no time exit).
+    tp_atr_mult:         float                     = 0.0
+    max_hold_ms:         float                     = 0.0
 
 
 @dataclass
@@ -86,8 +92,25 @@ class ReplayTrade:
     exit_price:   float
     qty:          float
     pnl_usd:      float  # net of both entry and exit costs
-    exit_reason:  str    # "SL" | "TP" | "EOD"
+    exit_reason:  str    # "SL" | "TP" | "EOD" | "TIME"
     signal:       MicroSignal
+    mae_bps:      float = 0.0  # max adverse excursion: furthest AGAINST us (bps from entry)
+    mfe_bps:      float = 0.0  # max favorable excursion: furthest FOR us (bps from entry)
+
+
+@dataclass
+class SignalObservation:
+    """Forward-excursion record for ONE sweep signal, independent of any position.
+
+    Produced by the observer pass (observe_mode); measures the unconstrained N-min path
+    after a signal — used to decide whether losers recover (stop problem) or not (direction).
+    """
+    ts_ms:          int
+    direction:      str    # "LONG" | "SHORT"
+    entry_price:    float
+    mae_bps:        float  # furthest against the signal direction over the window (bps)
+    mfe_bps:        float  # furthest in favour over the window (bps)
+    end_return_bps: float  # signed return entry→window-close (bps); <0 = would-be loser
 
 
 class TickReplayEngine:
@@ -116,6 +139,8 @@ class TickReplayEngine:
         candle_minutes: int = 1,
         collect_features: bool = False,
         variant: Optional[VariantConfig] = None,
+        observe_mode: bool = False,
+        observe_window_ms: int = 600_000,
     ) -> None:
         self._db_path         = db_path
         self._fc              = FeatureComputer(FeatureParams(**params.get("feature", {})))
@@ -124,6 +149,16 @@ class TickReplayEngine:
         self._starting_equity = starting_equity
         self._candle_minutes  = candle_minutes
         self._collect_features = collect_features
+
+        # Observer (measurement-only) state. When observe_mode, the engine runs detection
+        # on every event WITHOUT trading and records each signal's forward MAE/MFE over the
+        # next observe_window_ms (overlapping/concurrent windows). Trading variants leave
+        # observe_mode False, so the trading path is unchanged.
+        self._observe_mode      = observe_mode
+        self._observe_window_ms = observe_window_ms
+        self._observations: list[dict] = []                 # active windows
+        self._obs_results:  list[SignalObservation] = []    # retired windows
+        self._obs_max_concurrent = 0
 
         # Variant config — defaults reproduce legacy single-pass behaviour exactly.
         self._variant = variant or VariantConfig()
@@ -446,12 +481,16 @@ class TickReplayEngine:
         # Candle synthesis
         self._accumulate_candle(ts_ms, price, qty)
 
-        # SL/TP check always runs first
-        self._check_open_position(price, ts_ms)
-
-        # Skip signal scan while a position is open
-        if self._open_position is not None:
-            return
+        if self._observe_mode:
+            # Measurement-only: update/retire forward-excursion windows; never trade, and
+            # always run detection below (no single-position gate) so EVERY signal is seen.
+            self._update_observations(price, ts_ms)
+        else:
+            # SL/TP check always runs first
+            self._check_open_position(price, ts_ms)
+            # Skip signal scan while a position is open
+            if self._open_position is not None:
+                return
 
         price_move_pct = (
             (price - self._prev_mid) / self._prev_mid
@@ -502,7 +541,10 @@ class TickReplayEngine:
                 )
                 del self._wall_states[ws.price]
                 self._absorption_flags.pop(ws.price, None)
-                self._simulate_trade(signal, price, ts_ms)
+                if self._observe_mode:
+                    self._register_observation(info["direction"], price, ts_ms)
+                else:
+                    self._simulate_trade(signal, price, ts_ms)
                 break  # one signal per trade event
 
     # ── Candle synthesis ──────────────────────────────────────────────────────
@@ -613,22 +655,25 @@ class TickReplayEngine:
         # reflect the magnitude to the opposite side).
         sl_price = entry_price - sl_dist if effective_direction == "LONG" else entry_price + sl_dist
 
-        # Breakeven/edge filter: TP gross must exceed the larger of round-trip cost and
-        # the variant's min-edge floor (min_edge_bps=0 ⇒ identical to the legacy check).
+        # Target distance. Legacy (tp_atr_mult=0): tp = atr_mult_tp × stop, so R:R is locked.
+        # Decoupled (tp_atr_mult>0): tp = tp_atr_mult × ATR, independent of the stop — lets a
+        # wide-stop trade that dips and recovers bank a reachable target.
         rr = self._variant.atr_mult_tp
+        tp_dist = (
+            self._variant.tp_atr_mult * self._fc.current_atr
+            if self._variant.tp_atr_mult > 0.0 else rr * sl_dist
+        )
+        # Breakeven/edge filter: target must clear the larger of round-trip cost and the
+        # variant's min-edge floor (tp_atr_mult=0 & min_edge_bps=0 ⇒ legacy check exactly).
         edge_floor = max(self._cost_model.round_trip_pct, self._variant.min_edge_bps / 1e4)
-        if rr * sl_dist < entry_price * edge_floor:
+        if tp_dist < entry_price * edge_floor:
             return
 
         # Position sizing aligned with live: 1% equity risk × Kelly fraction.
         # (Confidence is not scored in backtest; Kelly fraction alone is applied.)
         risk_usd = self._equity * settings.RISK_PER_TRADE_PCT * settings.KELLY_FRACTION
         qty      = risk_usd / sl_dist
-        # TP at rr × sl_dist — mirrors live OCO bracket formula.
-        if effective_direction == "LONG":
-            tp_price = entry_price + rr * sl_dist
-        else:
-            tp_price = entry_price - rr * sl_dist
+        tp_price = entry_price + tp_dist if effective_direction == "LONG" else entry_price - tp_dist
 
         entry_cost    = self._cost_model.entry_cost(entry_price, qty)
         self._equity -= entry_cost
@@ -642,6 +687,8 @@ class TickReplayEngine:
             "entry_ts_ms":   ts_ms,
             "signal":        signal,
             "entry_cost_usd": entry_cost,
+            "mae":           0.0,   # running max adverse excursion (price units, positive)
+            "mfe":           0.0,   # running max favorable excursion (price units, positive)
         }
         self._equity_curve.append((ts_ms, self._equity))
 
@@ -650,8 +697,19 @@ class TickReplayEngine:
             return
         pos       = self._open_position
         direction = pos["direction"]
+        entry     = pos["entry_price"]
         sl        = pos["sl"]
         tp        = pos["tp"]
+
+        # Track max favorable / adverse excursion (price units, positive magnitudes).
+        # Observation-only — does not affect exits. MFE is print-granular (sampled at trade
+        # prints, not inter-print mids), so it is mildly conservative / understated.
+        if direction == "LONG":
+            fav, adv = trade_price - entry, entry - trade_price
+        else:
+            fav, adv = entry - trade_price, trade_price - entry
+        pos["mfe"] = max(pos.get("mfe", 0.0), fav)
+        pos["mae"] = max(pos.get("mae", 0.0), adv)
 
         if direction == "LONG":
             hit_sl = trade_price <= sl
@@ -666,6 +724,9 @@ class TickReplayEngine:
             self._close_position(trade_price, ts_ms, "SL")
         elif hit_tp:
             self._close_position(tp, ts_ms, "TP")
+        elif self._variant.max_hold_ms > 0.0 and (ts_ms - pos["entry_ts_ms"]) >= self._variant.max_hold_ms:
+            # Forced time exit at market on the current print.
+            self._close_position(trade_price, ts_ms, "TIME")
 
     def _close_position(
         self, exit_price: float, ts_ms: int, reason: str
@@ -683,12 +744,15 @@ class TickReplayEngine:
         else:
             gross_pnl = (entry_price - exit_price) * qty
 
+        # SL and forced TIME exits are taker (market-out); TP/EOD rest as maker.
         exit_cost      = self._cost_model.exit_cost(
-            exit_price, qty, is_market=(reason == "SL")
+            exit_price, qty, is_market=(reason in ("SL", "TIME"))
         )
         net_pnl        = gross_pnl - exit_cost
         self._equity  += net_pnl
 
+        mae_bps = (pos.get("mae", 0.0) / entry_price * 1e4) if entry_price > 0 else 0.0
+        mfe_bps = (pos.get("mfe", 0.0) / entry_price * 1e4) if entry_price > 0 else 0.0
         self._trades.append(ReplayTrade(
             entry_ts_ms  = pos["entry_ts_ms"],
             exit_ts_ms   = ts_ms,
@@ -699,6 +763,82 @@ class TickReplayEngine:
             pnl_usd      = gross_pnl - entry_cost_usd - exit_cost,
             exit_reason  = reason,
             signal       = pos["signal"],
+            mae_bps      = mae_bps,
+            mfe_bps      = mfe_bps,
         ))
         self._open_position = None
         self._equity_curve.append((ts_ms, self._equity))
+
+    # ── Forward-excursion observer (measurement-only; observe_mode) ──────────────
+
+    def _register_observation(self, direction: str, entry_price: float, ts_ms: int) -> None:
+        self._observations.append({
+            "ts":          ts_ms,
+            "direction":   direction,
+            "entry_price": entry_price,
+            "expiry_ts":   ts_ms + self._observe_window_ms,
+            "mae":         0.0,
+            "mfe":         0.0,
+        })
+        if len(self._observations) > self._obs_max_concurrent:
+            self._obs_max_concurrent = len(self._observations)
+
+    def _update_observations(self, price: float, ts_ms: int) -> None:
+        """Update every active window's MAE/MFE from this print; retire those past expiry."""
+        still_open: list[dict] = []
+        for o in self._observations:
+            entry = o["entry_price"]
+            if o["direction"] == "LONG":
+                fav, adv = price - entry, entry - price
+            else:
+                fav, adv = entry - price, price - entry
+            if fav > o["mfe"]:
+                o["mfe"] = fav
+            if adv > o["mae"]:
+                o["mae"] = adv
+            if ts_ms >= o["expiry_ts"]:
+                self._retire_observation(o, price, ts_ms)
+            else:
+                still_open.append(o)
+        self._observations = still_open
+
+    def _retire_observation(self, o: dict, exit_price: float, ts_ms: int) -> None:
+        entry = o["entry_price"]
+        sign  = 1.0 if o["direction"] == "LONG" else -1.0
+        self._obs_results.append(SignalObservation(
+            ts_ms          = o["ts"],
+            direction      = o["direction"],
+            entry_price    = entry,
+            mae_bps        = (o["mae"] / entry * 1e4) if entry > 0 else 0.0,
+            mfe_bps        = (o["mfe"] / entry * 1e4) if entry > 0 else 0.0,
+            end_return_bps = (sign * (exit_price - entry) / entry * 1e4) if entry > 0 else 0.0,
+        ))
+
+    def observe(self, start_ms: int, end_ms: int) -> list["SignalObservation"]:
+        """Measurement-only pass: record every signal's forward MAE/MFE over observe_window_ms.
+
+        Requires observe_mode=True. Call after replay_window(lo, warmup_end) so the
+        FeatureComputer/CVD stats are warm. Returns the retired observations; still-open
+        windows at end_ms are flushed at the last seen price. `_obs_max_concurrent` holds the
+        peak number of simultaneously-open windows after the call.
+        """
+        if not self._observe_mode:
+            raise RuntimeError("observe() requires observe_mode=True")
+        self._reset_for_oos(start_ms)   # preserve warm _fc/_cvd; reset wall/eval state
+        self._observations = []
+        self._obs_results = []
+        self._obs_max_concurrent = 0
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            for event in self._stream_events(conn, start_ms, end_ms):
+                if event.kind == "depth":
+                    self._process_depth(event)
+                else:
+                    self._process_trade(event)
+
+        flush_price = self._last_trade_price if self._last_trade_price > 0 else self._prev_mid
+        for o in self._observations:
+            self._retire_observation(o, flush_price, end_ms)
+        self._observations = []
+        return list(self._obs_results)

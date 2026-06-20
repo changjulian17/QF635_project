@@ -219,3 +219,93 @@ def test_bias_flip_inverts_counter_bias_trade():
     assert pos["direction"] == "LONG"               # flipped to the bias direction
     assert pos["sl"] < pos["entry_price"]           # LONG stop sits below entry
     assert pos["tp"] > pos["entry_price"]           # LONG target sits above entry
+
+
+# ── MAE/MFE instrumentation, decoupled TP, time exit ────────────────────────────
+
+def test_mae_mfe_recorded_on_closed_trade():
+    # Time-exit variant → deterministic close; MFE must capture the PEAK (50), not the
+    # exit level (40). Avoids float-fuzz on the legacy TP level.
+    eng = _engine(VariantConfig(name="te", max_hold_ms=1_000))   # LONG wall stop @99.8
+    eng._simulate_trade(_signal("LONG", 100.0, 20.0), 100.0, 2_000)
+    eng._check_open_position(100.50, 2_100)   # MFE peak 50 bps
+    eng._check_open_position(99.90,  2_200)   # MAE 10 bps (stop 99.8 not hit)
+    eng._check_open_position(100.40, 3_000)   # elapsed 1000ms → TIME exit at 100.40
+    assert eng._open_position is None
+    t = eng._trades[-1]
+    assert t.exit_reason == "TIME"
+    assert t.mfe_bps == pytest.approx(50.0, abs=0.05)   # peak, not exit level
+    assert t.mae_bps == pytest.approx(10.0, abs=0.05)
+
+
+def test_decoupled_tp_independent_of_stop():
+    eng = _engine(VariantConfig(name="dt", tp_atr_mult=2.0))   # TP = 2×ATR, not 3×stop
+    eng._fc._atr = 0.5                                         # → tp_dist = 1.0
+    eng._simulate_trade(_signal("LONG", 100.0, 20.0), 100.0, 2_000)
+    pos = eng._open_position
+    assert pos is not None
+    assert pos["sl"] == pytest.approx(99.8)        # stop still at the wall
+    assert pos["tp"] == pytest.approx(101.0)       # target = entry + 2×ATR, NOT 100.6
+
+
+def test_time_exit_fires_with_taker_cost():
+    eng = _engine(VariantConfig(name="te", max_hold_ms=1_000))
+    eng._simulate_trade(_signal("LONG", 100.0, 20.0), 100.0, 2_000)
+    eng._check_open_position(100.05, 2_500)        # 500ms elapsed, no exit
+    assert eng._open_position is not None
+    eng._check_open_position(100.05, 3_000)        # 1000ms elapsed → TIME exit
+    assert eng._open_position is None
+    assert eng._trades[-1].exit_reason == "TIME"
+
+
+def test_baseline_parity_no_time_exit_no_decoupled_tp():
+    # baseline (defaults) must never fire TIME and must keep the legacy 3×stop target.
+    eng = _engine(VariantConfig(name="baseline"))
+    eng._simulate_trade(_signal("LONG", 100.0, 20.0), 100.0, 2_000)
+    pos = eng._open_position
+    assert pos["tp"] == pytest.approx(100.6)       # 3 × 0.2 stop
+    eng._check_open_position(100.1, 9_999_999)     # huge elapsed, but max_hold_ms=0 → no TIME
+    assert eng._open_position is not None
+
+
+# ── observer (observe_mode) ─────────────────────────────────────────────────────
+
+def test_observer_concurrent_windows_and_excursion_math():
+    eng = TickReplayEngine(params={}, observe_mode=True, observe_window_ms=1_000)
+    eng._observations = []; eng._obs_results = []; eng._obs_max_concurrent = 0
+    eng._register_observation("LONG", 100.0, 0)      # window [0, 1000]
+    eng._register_observation("LONG", 100.0, 100)    # overlapping window [100, 1100]
+    assert eng._obs_max_concurrent == 2              # both tracked concurrently
+
+    eng._update_observations(100.5, 200)             # fav 0.5 → 50 bps
+    eng._update_observations(99.7,  400)             # adv 0.3 → 30 bps
+    eng._update_observations(100.2, 1000)            # first window expires (ts ≥ 1000)
+
+    first = [o for o in eng._obs_results if o.ts_ms == 0][0]
+    assert first.mfe_bps == pytest.approx(50.0)
+    assert first.mae_bps == pytest.approx(30.0)
+    assert first.end_return_bps == pytest.approx(20.0)   # (100.2-100)/100 × 1e4
+    assert len(eng._observations) == 1               # second window still open (not yet expired)
+
+
+def test_observe_requires_observe_mode():
+    eng = TickReplayEngine(params={})                # observe_mode defaults False
+    with pytest.raises(RuntimeError):
+        eng.observe(0, 1)
+
+
+# ── sweep excursion aggregation (loser_mfe_bps headline) ────────────────────────
+
+def test_excursion_stats_loser_mfe():
+    sweep = _load_sweep()
+
+    class _T:
+        def __init__(self, pnl, mae, mfe):
+            self.pnl_usd, self.mae_bps, self.mfe_bps = pnl, mae, mfe
+
+    trades = [_T(+5.0, 4.0, 30.0), _T(-2.0, 12.0, 25.0), _T(-1.0, 8.0, 15.0)]
+    s = sweep._excursion_stats(trades)   # values are rounded to 2dp by the helper
+    assert s["loser_mfe_bps"] == pytest.approx(20.0)                  # (25+15)/2, losers only
+    assert s["avg_mfe_bps"] == pytest.approx(round((30.0 + 25.0 + 15.0) / 3, 2))
+    assert s["avg_mae_bps"] == pytest.approx(round((4.0 + 12.0 + 8.0) / 3, 2))
+    assert sweep._excursion_stats([])["loser_mfe_bps"] == 0.0        # empty-safe
