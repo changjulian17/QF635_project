@@ -1,8 +1,8 @@
 # CLAUDE.md — CryptoSentinel project guidance
 
-Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on Binance USD-M Futures.
+Real-time granular LOB microstructure analysis and paper-trading system for the BTCUSDT USD-M perpetual on Binance Futures.
 
-**Current phase:** Phase 3 complete. All deliverables shipped.
+**Current phase:** Phase 3 complete (v3.1). All deliverables shipped. v3.1 migrated the venue from Binance Spot Testnet to **Binance USD-M Futures** (native SHORT + reduce-only TP/SL brackets), added a `TRADING_MODE` preset system (`testnet`/`demo`/`live`), hardened WS reconnect / LOB gap re-init, tightened the LOB bucket $25 → $1, and merged the dashboard's Backtest + Registry pages into `/strategies`.
 
 ## Project layout
 
@@ -12,9 +12,9 @@ config.py        — pydantic settings loaded from .env
 models.py        — shared dataclasses and enums
 
 core/
-  ws_consumer.py       — WebSocket consumer + HeartbeatMonitor
+  ws_consumer.py       — WebSocket consumer + HeartbeatMonitor (live engine runs two: price [bookTicker+aggTrade] and LOB [depth@500ms+kline])
   lob_engine.py        — Local Order Book + full state machine (UNINITIALISED → SYNCED)
-  lob_recorder.py      — Always-on LOB data collector (Binance USD-M Futures public stream)
+  lob_recorder.py      — Always-on LOB data collector (Binance Futures public stream, depth@100ms, $1 buckets)
   cvd.py               — Standalone CVD calculator (WelfordOnline std)
   signal_telemetry.py  — Async signal record writer (all gates, pass + fail)
   startup_reconciler.py — Exchange state reconciliation on startup + midnight reset
@@ -37,8 +37,8 @@ risk/
   sizing.py            — Position-sizing helpers (clamp_stop_bps)
 
 execution/
-  order_manager.py     — IOC aggressive limit orders + OCO brackets
-  orders.py            — Order domain classes (IOCLimitOrder, FuturesTPOrder, FuturesSLOrder)
+  order_manager.py     — IOC aggressive limit entries + reduce-only TP/SL bracket (Binance USD-M Futures)
+  orders.py            — Futures order classes (IOCLimitOrder, FuturesMarketOrder, FuturesTPOrder, FuturesSLOrder)
 
 engine/              — legacy shim directory + realtime infrastructure
   db_writer.py       — SQLite persistence + rolling cleanup + lob_snapshots writer
@@ -56,19 +56,24 @@ dashboard/           — Dash multi-page dashboard (Phase 3)
     live.py          — /live: portfolio metrics, signal funnel, kill switch
     lob.py           — /lob: LOB heatmap, OBI/CVD/Spread subplots
     walls.py         — /walls: 1s candlestick + rolling VWAP + liquidity wall heatmap
-    backtest.py      — /backtest: strategy leaderboard from backtest results
-    registry.py      — /registry: strategy lifecycle, decay monitoring, LIVE promotion
+    strategies.py    — /strategies: tabbed backtest leaderboard + registry lifecycle/decay/LIVE promotion (merged backtest + registry)
     config.py        — /config: settings reference, emergency stop, event log
 
 scripts/
-  test_connection.py     — verify Binance testnet connectivity and auth
+  test_connection.py     — verify Binance Futures testnet/demo connectivity and auth
   test_spot_connection.py — connectivity check for demo futures
-  test_futures_demo.py   — full round-trip demo futures connectivity test
+  test_futures_demo.py   — full round-trip demo futures connectivity test (start_demo.sh pre-flight)
   test_orders.py         — BUY + SELL round-trip execution test
+  test_oco_demo.py       — demo futures reduce-only TP/SL bracket smoke test
+  test_market_order_demo.py — demo futures market-order smoke test
+  test_ws_stability.py   — WebSocket reconnect / heartbeat soak test
+  test_heartbeat_cascade.py — heartbeat state-machine cascade verification
+  sweep_thresholds.py    — sweep/wall threshold-sweep harness over recorded LOB data
+  run_backtest.py        — CLI for tick-level walk-forward backtest
   backfill_agg_trades.py — one-time backfill of aggTrade history from Binance USDM Futures REST
-  signal_injector.py     — synthetic signal injection (start_test.sh only)
+  signal_injector.py     — synthetic signal injection (start_test.sh / start_demo.sh only)
 
-tests/               — pytest unit tests (549 tests across 40 files)
+tests/               — pytest unit tests (591 tests across 46 files)
 ```
 
 ## Quick actions
@@ -81,21 +86,21 @@ Install dependencies:
 
 	pip install -r requirements.txt
 
-Verify connectivity (after adding testnet keys to `.env`):
+Verify connectivity (after adding API keys to `.env`):
 
 	python scripts/test_connection.py
 
-Start LOB Recorder (terminal 1 — collects real Binance tick data, no API key needed):
+Launch the full stack via the mode wrapper scripts (each opens 3 macOS Terminal windows: LOB Recorder, Trading Engine, Dashboard):
 
-	python -m core.lob_recorder
+	./start.sh         # live    (TRADING_MODE=live, real money)
+	./start_demo.sh    # demo    (TRADING_MODE=demo, demo.binance.com; add --dry-run for synthetic fills)
+	./start_test.sh    # testnet (TRADING_MODE=testnet + signal injection)
 
-Start the trading engine (terminal 2):
+Or start components manually (set TRADING_MODE first, e.g. `export TRADING_MODE=demo`):
 
-	python main.py
-
-Start the Dash dashboard (terminal 3 — Phase 3):
-
-	python dashboard/app.py
+	python -m core.lob_recorder    # terminal 1 — Futures public stream, no API key needed
+	python main.py                 # terminal 2 — trading engine
+	python dashboard/app.py        # terminal 3 — dashboard at http://127.0.0.1:8050
 
 Run unit tests:
 
@@ -103,9 +108,10 @@ Run unit tests:
 
 ## Configuration notes
 
-- Put Binance USD-M Futures credentials in `.env` (gitignored). `TRADING_MODE` (`testnet`/`demo`/`live`) selects the endpoint preset (`WS_BASE`/`REST_BASE`). Use `.env.example` as a template.
-- `DRY_RUN=True` in config.py — set `DRY_RUN=False` in `.env` to enable live order execution.
-- `LOB_RECORDER_WS` / `LOB_RECORDER_REST` point at the Binance USD-M Futures stream + REST (`stream.binancefuture.com` / `testnet.binancefuture.com`) and must stay in sync; the recorder seeds via `/fapi/v1/depth` and needs no API key (public market data).
+- `TRADING_MODE` (`testnet`/`demo`/`live`) selects the venue and applies a preset of WS/REST endpoints, heartbeat thresholds, and safety defaults in `config.py::_apply_mode_presets`. **Any value explicitly set in `.env` always wins** — presets only fill unset fields.
+- Put Binance Futures credentials in `.env` (gitignored): `DEMO_BINANCE_API_KEY`/`DEMO_BINANCE_API_SECRET` for testnet/demo, `BINANCE_API_KEY`/`BINANCE_API_SECRET` for live. Use `.env.example` as a template.
+- `DRY_RUN=True` in config.py — the start scripts set `DRY_RUN=False`; `start_demo.sh --dry-run` forces synthetic fills.
+- `LOB_RECORDER_WS` points to the Binance Futures public stream (`fstream.binance.com` in demo/live; `stream.binancefuture.com` testnet), separate from the trading-account connection — this is intentional (Rule 4).
 - Never add API keys to source files.
 - Always use the `.venv` virtual environment in the project root.
 
@@ -135,5 +141,6 @@ Run unit tests:
 | 3A — REST API | ✅ | _api_server coroutine in main.py (aiohttp, /api/health, /api/portfolio, /api/session, /api/killswitch) |
 | 3B — LOB snapshot writer | ✅ | engine/lob_snapshot_writer.py + lob_snapshots table in db_writer.py |
 | 3C — RealtimeHub | ✅ | engine/realtime_hub.py — /ws/lob, /ws/portfolio, /ws/signals WebSocket fan-out |
-| 3D–3H — Dash dashboard | ✅ | dashboard/ app with 6 pages: live, lob, walls, backtest, registry, config |
-| 3I — Phase 3 tests | ✅ | test_rest_api.py (11), test_lob_snapshot_writer.py (9), test_realtime_hub.py (6), test_dashboard_live.py (10), test_dashboard_lob.py (16), test_dashboard_registry.py (4), test_dashboard_walls.py (6), test_portfolio_broadcast.py (7), test_signal_broadcast.py (9) |
+| 3D–3H — Dash dashboard | ✅ | dashboard/ app with 5 pages: live, lob, walls, strategies (merged backtest + registry), config |
+| 3I — Phase 3 tests | ✅ | test_rest_api.py (11), test_lob_snapshot_writer.py (9), test_realtime_hub.py (6), test_dashboard_live.py (10), test_dashboard_lob.py (16), test_dashboard_strategies.py (5), test_dashboard_registry.py (4), test_dashboard_walls.py (6), test_portfolio_broadcast.py (7), test_signal_broadcast.py (9) |
+| 3J — Futures migration (v3.1) | ✅ | Spot→USD-M Futures, TRADING_MODE presets (testnet/demo/live), reduce-only TP/SL brackets, two WS consumers (depth@500ms), WS reconnect + LOB gap re-init hardening, $1 LOB buckets; new suites: test_config (5), test_budget (6), test_killswitch (12), test_builder (4), test_spec (3) |

@@ -148,6 +148,8 @@ class OrderManager:
 
         # Counts consecutive emergency-close failures; reset on position open.
         self._close_retry_count: int = 0
+        # True when max retries blocked new signals; allows restoration on position close.
+        self._close_block_active: bool = False
 
         # Single lock guards all _open_position_* and placement-flag fields.
         self._position_lock = asyncio.Lock()
@@ -929,6 +931,8 @@ class OrderManager:
             )
             if self._close_retry_count >= _MAX_CLOSE_RETRIES:
                 self.accepting_new_signals = False
+                self._close_block_active = True
+            if self._close_retry_count == _MAX_CLOSE_RETRIES:
                 logger.critical(
                     "[Exec] Max close retries (%d) reached — blocking new signals until position resolves | signal_id=%s",
                     _MAX_CLOSE_RETRIES, signal_id[:8],
@@ -1256,6 +1260,9 @@ class OrderManager:
         self._cancel_oco_on_placement     = False
         self._entry_in_flight             = False
         self._emergency_close_in_progress = False
+        if self._close_block_active:
+            self.accepting_new_signals = True
+            self._close_block_active = False
         self._close_retry_count           = 0
 
     # ── Killswitch hard stop ──────────────────────────────────────────────────

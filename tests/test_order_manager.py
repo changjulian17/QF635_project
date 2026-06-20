@@ -1339,9 +1339,35 @@ async def test_watch_tp_sl_blocks_signals_after_max_retries():
 
     assert om.accepting_new_signals is False, "signals must be blocked after max retries"
     assert ks.is_active is False, "killswitch must NOT be permanently fired"
+    alert_dispatcher.notify_killswitch.assert_called_once(), (
+        "notify_killswitch must fire exactly once, not on every retry after max"
+    )
 
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_accepting_new_signals_restored_after_position_closes():
+    """After max-retry block, _reset_open_position() must restore accepting_new_signals
+    so that the engine can trade again once the stuck position resolves via on_execution_report."""
+    from execution.order_manager import _MAX_CLOSE_RETRIES
+
+    om, _, _, _ = _make_manager(book_fn=lambda: (64000.0, 64002.0))
+
+    # Simulate the state left by the max-retry path.
+    om.accepting_new_signals = False
+    om._close_block_active   = True
+    om._close_retry_count    = _MAX_CLOSE_RETRIES
+
+    # _reset_open_position is called under _position_lock in production; call it directly.
+    om._reset_open_position()
+
+    assert om.accepting_new_signals is True, (
+        "accepting_new_signals must be restored to True after position resolves"
+    )
+    assert om._close_block_active is False
+    assert om._close_retry_count == 0
