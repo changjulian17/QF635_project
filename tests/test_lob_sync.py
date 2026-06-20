@@ -1,9 +1,15 @@
 """Binance diff-depth seed bridge + contiguity predicates."""
+import asyncio
+
+import pytest
+
 from core.lob_sync import (
+    SeedDiscontinuity,
     seed_bridge_ok,
     is_contiguous,
     futures_seed_bridge_ok,
     futures_is_contiguous,
+    seed_futures_book,
 )
 
 
@@ -60,3 +66,93 @@ def test_futures_contiguous_true_when_pu_matches_prev_u():
 def test_futures_contiguous_false_when_pu_skips():
     assert futures_is_contiguous(prev_u=110, next_pu=111) is False   # gap: event began past prev_u
     assert futures_is_contiguous(prev_u=110, next_pu=108) is False   # overlap/rewind
+
+
+# ── seed_futures_book: wait + bridge + pu-chain orchestration ──────────────────
+# Shared by ws_consumer + lob_recorder. The wait gate is strict `u > lastUpdateId`
+# (matching the apply-loop skip `u <= lastUpdateId`), so a snapshot landing exactly on
+# an event boundary no longer passes the gate then gets skipped → spurious failure.
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_seed_returns_bridge_chain_and_applies_only_forward_events():
+    """Returns the last applied u; stale (u <= lastUpdateId) events are skipped, not applied."""
+    applied = []
+    pending = [
+        {"U": 900,  "u": 950,  "pu": 880,  "b": [], "a": []},   # behind snapshot → skipped
+        {"U": 951,  "u": 1050, "pu": 950,  "b": [], "a": []},   # bridge: 951 <= 1000 <= 1050
+        {"U": 1051, "u": 1100, "pu": 1050, "b": [], "a": []},   # chained: pu == prev u
+    ]
+    result = _run(seed_futures_book(
+        last_update_id=1000, pending=pending,
+        apply_diff=applied.append, bridge_wait_s=1.0, poll_s=0.0,
+    ))
+    assert result == 1100
+    assert [e["u"] for e in applied] == [1050, 1100]   # the stale 950 event never applied
+
+
+def test_seed_boundary_event_does_not_fail_spuriously():
+    """Regression: an event with u == lastUpdateId must NOT trigger 'no bridge event'.
+
+    With the old `>=` gate that event released the wait then got skipped (`u <= last`),
+    leaving no bridge → spurious failure. The strict `>` gate waits for the next event,
+    which still straddles lastUpdateId and bridges cleanly.
+    """
+    # Only a boundary event present → wait can't release (no u > 1000) → clean timeout,
+    # NOT a 'no bridge event' error.
+    boundary_only = [{"U": 951, "u": 1000, "pu": 950, "b": [], "a": []}]
+    with pytest.raises(SeedDiscontinuity, match="no diff reached"):
+        _run(seed_futures_book(
+            last_update_id=1000, pending=boundary_only,
+            apply_diff=lambda d: None, bridge_wait_s=0.0, poll_s=0.0,
+        ))
+
+    # Boundary event followed by a real forward event → bridges on the forward event,
+    # which must itself straddle lastUpdateId (U <= 1000 <= u).
+    applied = []
+    pending = [
+        {"U": 951, "u": 1000, "pu": 950, "b": [], "a": []},   # boundary, skipped (u <= 1000)
+        {"U": 990, "u": 1080, "pu": 950, "b": [], "a": []},   # bridge: 990 <= 1000 <= 1080
+    ]
+    result = _run(seed_futures_book(
+        last_update_id=1000, pending=pending,
+        apply_diff=applied.append, bridge_wait_s=1.0, poll_s=0.0,
+    ))
+    assert result == 1080
+    assert [e["u"] for e in applied] == [1080]
+
+
+def test_seed_raises_on_pu_gap():
+    pending = [
+        {"U": 951,  "u": 1050, "pu": 950,  "b": [], "a": []},   # bridge ok
+        {"U": 1060, "u": 1100, "pu": 1055, "b": [], "a": []},   # pu 1055 != prev u 1050 → gap
+    ]
+    with pytest.raises(SeedDiscontinuity, match="gap"):
+        _run(seed_futures_book(
+            last_update_id=1000, pending=pending,
+            apply_diff=lambda d: None, bridge_wait_s=1.0, poll_s=0.0,
+        ))
+
+
+def test_seed_raises_on_bridge_fail():
+    """First forward event starts after lastUpdateId (U > last) → missed events → bridge fail."""
+    pending = [{"U": 1005, "u": 1050, "pu": 1004, "b": [], "a": []}]   # U=1005 > 1000
+    with pytest.raises(SeedDiscontinuity, match="bridge fail"):
+        _run(seed_futures_book(
+            last_update_id=1000, pending=pending,
+            apply_diff=lambda d: None, bridge_wait_s=1.0, poll_s=0.0,
+        ))
+
+
+def test_seed_times_out_when_no_diff_reaches_snapshot():
+    pending = [
+        {"U": 900, "u": 950, "pu": 880, "b": [], "a": []},
+        {"U": 951, "u": 990, "pu": 950, "b": [], "a": []},
+    ]
+    with pytest.raises(SeedDiscontinuity, match="no diff reached"):
+        _run(seed_futures_book(
+            last_update_id=1000, pending=pending,
+            apply_diff=lambda d: None, bridge_wait_s=0.0, poll_s=0.0,
+        ))

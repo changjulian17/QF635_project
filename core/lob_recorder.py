@@ -25,7 +25,7 @@ import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from config import settings
-from core.lob_sync import SeedDiscontinuity, futures_is_contiguous, futures_seed_bridge_ok
+from core.lob_sync import SeedDiscontinuity, seed_futures_book
 
 logger = logging.getLogger(__name__)
 
@@ -153,66 +153,47 @@ class LOBRecorder:
             await asyncio.sleep(self._reconnect_delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, _MAX_RECONNECT_DELAY)
 
-    async def _sync_snapshot(self) -> None:
-        """Fetch a REST depth snapshot to seed the local LOB, then apply any buffered diffs."""
+    async def _fetch_rest_snapshot(self) -> dict:
+        """Fetch a futures REST depth snapshot (extracted for testability)."""
         url = f"{settings.LOB_RECORDER_REST}/fapi/v1/depth"
         params = {"symbol": settings.SYMBOL.upper(), "limit": 1000}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+
+    async def _sync_snapshot(self) -> None:
+        """Fetch a REST depth snapshot to seed the local LOB, bridging to the diff stream."""
         for attempt in range(1, _SEED_MAX_ATTEMPTS + 1):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        url, params=params, timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        resp.raise_for_status()
-                        snap = await resp.json()
-
+                snap = await self._fetch_rest_snapshot()
                 self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
                 self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
-                last_uid = int(snap["lastUpdateId"])
 
-                # Wait until a buffered diff reaches the snapshot (u >= lastUpdateId)
-                # so a real bridge event exists — never sync at the bare snapshot id.
-                deadline = time.monotonic() + _SEED_BRIDGE_WAIT_S
-                while not any(int(d.get("u", 0)) >= last_uid for d in self._pending_diffs):
-                    if time.monotonic() >= deadline:
-                        raise SeedDiscontinuity(
-                            f"no diff reached lastUpdateId={last_uid} within {_SEED_BRIDGE_WAIT_S}s"
-                        )
-                    await asyncio.sleep(_SEED_BRIDGE_POLL_S)
-
-                # Futures bridge/contiguity: first applied event straddles lastUpdateId
-                # (U <= lastUpdateId <= u); each later event's pu == previous u.
-                prev_u, bridged = last_uid, False
-                for event in self._pending_diffs:
-                    u = int(event["u"])
-                    if u <= last_uid:
-                        continue
-                    U = int(event.get("U", 0))
-                    if not bridged:
-                        if not futures_seed_bridge_ok(U, u, last_uid):
-                            raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
-                        bridged = True
-                    else:
-                        pu = int(event.get("pu", 0))
-                        if not futures_is_contiguous(prev_u, pu):
-                            raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
-                    self._apply_diff(event)
-                    prev_u = u
-
-                if not bridged:
-                    raise SeedDiscontinuity(f"no bridge event for lastUpdateId={last_uid}")
+                # Symmetry with ws_consumer; _apply_diff has no stale-skip so this is a
+                # no-op here, but keeps the seed self-consistent across retries.
+                self._last_update_id = 0
+                applied_u = await seed_futures_book(
+                    last_update_id=int(snap["lastUpdateId"]),
+                    pending=self._pending_diffs,
+                    apply_diff=self._apply_diff,
+                    bridge_wait_s=_SEED_BRIDGE_WAIT_S,
+                    poll_s=_SEED_BRIDGE_POLL_S,
+                )
 
                 self._pending_diffs.clear()
-                self._last_update_id = prev_u          # a real event u, not the snapshot id
+                self._last_update_id = applied_u       # a real event u, not the snapshot id
                 self._synced = True
                 logger.info(
                     "[LOBRec] LOB synced at updateId=%d  bids=%d  asks=%d",
-                    prev_u, len(self._bid_book), len(self._ask_book),
+                    self._last_update_id, len(self._bid_book), len(self._ask_book),
                 )
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError,
                     KeyError, ValueError, SeedDiscontinuity) as exc:
-                logger.error(
+                logger.warning(
                     "[LOBRec] Snapshot seed attempt %d/%d failed: %s",
                     attempt, _SEED_MAX_ATTEMPTS, exc,
                 )

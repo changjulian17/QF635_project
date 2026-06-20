@@ -11,7 +11,11 @@ import numpy as np
 import websockets
 
 from config import settings
-from core.lob_sync import SeedDiscontinuity, futures_is_contiguous, futures_seed_bridge_ok
+from core.lob_sync import (
+    SeedDiscontinuity,
+    futures_is_contiguous,
+    seed_futures_book,
+)
 from models import AggTrade, LOBLevel, LOBSnapshot, SharedState
 
 logger = logging.getLogger(__name__)
@@ -415,45 +419,24 @@ class BinanceWebSocketConsumer:
                 snap = await self._fetch_rest_snapshot()
                 self._bid_book = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
                 self._ask_book = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
-                last_uid = int(snap["lastUpdateId"])
 
-                # Wait until a buffered diff reaches the snapshot (u >= lastUpdateId);
-                # on the contiguous futures stream the first such event straddles it.
-                deadline = time.monotonic() + _SEED_BRIDGE_WAIT_S
-                while not any(int(d.get("u", 0)) >= last_uid for d in self._lob_pending):
-                    if time.monotonic() >= deadline:
-                        raise SeedDiscontinuity(
-                            f"no diff reached lastUpdateId={last_uid} within {_SEED_BRIDGE_WAIT_S}s"
-                        )
-                    await asyncio.sleep(_SEED_BRIDGE_POLL_S)
-
-                # Apply from the bridge: first event straddles lastUpdateId, rest pu-chain.
-                prev_u, bridged = last_uid, False
-                for diff in self._lob_pending:
-                    u = int(diff.get("u", 0))
-                    if u <= last_uid:
-                        continue
-                    U = int(diff.get("U", 0))
-                    if not bridged:
-                        if not futures_seed_bridge_ok(U, u, last_uid):
-                            raise SeedDiscontinuity(f"bridge fail U={U} u={u} lastUpdateId={last_uid}")
-                        bridged = True
-                    else:
-                        pu = int(diff.get("pu", 0))
-                        if not futures_is_contiguous(prev_u, pu):
-                            raise SeedDiscontinuity(f"gap pu={pu} != prev_u={prev_u}")
-                    self._apply_depth_diff(diff, validate=False)
-                    prev_u = u
-
-                if not bridged:
-                    raise SeedDiscontinuity(f"no bridge event for lastUpdateId={last_uid}")
+                # Clear any id carried from a failed attempt so _apply_depth_diff's
+                # stale-skip can't drop this attempt's bridge event (retry stale-skip).
+                self._lob_update_id = 0
+                applied_u = await seed_futures_book(
+                    last_update_id=int(snap["lastUpdateId"]),
+                    pending=self._lob_pending,
+                    apply_diff=lambda d: self._apply_depth_diff(d, validate=False),
+                    bridge_wait_s=_SEED_BRIDGE_WAIT_S,
+                    poll_s=_SEED_BRIDGE_POLL_S,
+                )
 
                 self._lob_pending.clear()
-                self._lob_update_id = prev_u          # a real event u — live `pu` chains from here
+                self._lob_update_id = applied_u       # a real event u — live `pu` chains from here
                 self._lob_synced = True
                 logger.info(
                     "[WS] LOB seeded at updateId=%d  bids=%d  asks=%d",
-                    prev_u, len(self._bid_book), len(self._ask_book),
+                    self._lob_update_id, len(self._bid_book), len(self._ask_book),
                 )
                 if self._bid_book and self._ask_book:
                     self._enqueue_latest_depth_snapshot(int(time.time() * 1000))

@@ -379,3 +379,27 @@ def test_live_diff_skips_stale_event_not_flagged_as_gap():
     stale = {"U": 4000, "u": 4500, "pu": 3990, "b": [], "a": []}   # u < 5000
     assert c._apply_depth_diff(stale) is True   # skipped, not False(gap)
     assert c._lob_update_id == 5000             # unchanged
+
+
+def test_seed_resets_carried_id_so_retry_bridge_is_not_stale_skipped():
+    """A seed must clear any _lob_update_id carried from a failed attempt before applying.
+
+    The seed applies via _apply_depth_diff(validate=False), whose stale-skip
+    (`u <= self._lob_update_id`) reads _lob_update_id. If a prior attempt left it advanced
+    above this attempt's bridge u, the bridge event would be silently skipped — the book
+    loses those levels while sync still reports success. The per-attempt reset prevents it.
+    """
+    import asyncio
+    c = _seed_consumer()
+    c._lob_update_id = 1050   # carried over from a hypothetical earlier failed attempt
+    snap = {"bids": [], "asks": [], "lastUpdateId": 1000}
+    c._lob_pending = [   # bridge u=1040 < carried 1050 → stale-skipped without the reset
+        {"U": 990, "u": 1040, "pu": 950, "b": [["100", "7"]], "a": []},
+    ]
+    async def _fetch():
+        return snap
+    with patch.object(c, "_fetch_rest_snapshot", new=_fetch):
+        asyncio.run(c._sync_lob_snapshot())
+    assert c._lob_synced is True
+    assert c._bid_book[100.0] == 7.0   # bridge level applied (missing without the reset)
+    assert c._lob_update_id == 1040
