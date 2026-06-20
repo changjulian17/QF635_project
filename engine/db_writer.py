@@ -122,8 +122,10 @@ class DBWriter:
             candle: Candle = await self._candle_queue.get()
             try:
                 await asyncio.to_thread(self._write_candle, candle)
-            except sqlite3.Error as e:
-                logger.warning("[DB] Write error (%s) — continuing", e)
+            except (sqlite3.Error, AttributeError, KeyError, TypeError, ValueError) as e:
+                # Defensive: a malformed queue item must never kill the writer task —
+                # an uncaught error here cancels the DBWriter TaskGroup (and the engine).
+                logger.warning("[DB] Candle write error (%s) — continuing", e)
 
     async def _ms_bar_loop(self) -> None:
         while True:

@@ -214,6 +214,59 @@ def test_depth_update_replaces_oldest_snapshot_when_queue_full():
     asyncio.run(_run())
 
 
+def test_kline_dispatch_parses_candle_and_persists_only_closed():
+    """A kline message must be parsed into a Candle dataclass (not forwarded as a raw
+    dict), and only closed bars reach the DB queue. Regression for the candle-write bug
+    that froze the candles table after the futures migration."""
+    import asyncio
+
+    from core.ws_consumer import BinanceWebSocketConsumer
+    from models import Candle
+
+    def _kline(is_closed: bool) -> dict:
+        return {
+            "e": "kline",
+            "E": 1234567890000,
+            "k": {
+                "t": 1234567800000,
+                "o": "100.0", "h": "110.0", "l": "95.0",
+                "c": "105.0", "v": "12.5", "x": is_closed,
+            },
+        }
+
+    async def _run() -> None:
+        candle_q = asyncio.Queue()
+        candle_db_q = asyncio.Queue()
+        consumer = BinanceWebSocketConsumer(
+            streams=["btcusdt@kline_1m"],
+            shared_state=SharedState(),
+            candle_queue=candle_q,
+            candle_db_queue=candle_db_q,
+        )
+
+        # In-progress bar → FeatureComputer queue only, never persisted.
+        await asyncio.wait_for(consumer._dispatch("btcusdt@kline_1m", _kline(False)), timeout=0.2)
+        assert candle_q.qsize() == 1
+        assert candle_db_q.qsize() == 0
+        partial = candle_q.get_nowait()
+        assert isinstance(partial, Candle)
+        assert partial.is_closed is False
+
+        # Closed bar → both queues, fully parsed into a Candle.
+        await asyncio.wait_for(consumer._dispatch("btcusdt@kline_1m", _kline(True)), timeout=0.2)
+        assert candle_q.qsize() == 1
+        assert candle_db_q.qsize() == 1
+        closed = candle_db_q.get_nowait()
+        assert isinstance(closed, Candle)
+        assert closed.is_closed is True
+        assert (closed.open, closed.high, closed.low, closed.close, closed.volume) == (
+            100.0, 110.0, 95.0, 105.0, 12.5,
+        )
+        assert closed.open_time.tzinfo is not None
+
+    asyncio.run(_run())
+
+
 def test_critical_triggers_immediate_break_in_receive_loop():
     """_receive_loop must return quickly on CRITICAL — not wait for 10s recv timeout."""
     import asyncio, json

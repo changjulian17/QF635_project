@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any, List, Optional
@@ -12,7 +13,7 @@ import websockets
 
 from config import settings
 from core.lob_sync import SeedDiscontinuity, futures_is_contiguous, futures_seed_bridge_ok
-from models import AggTrade, LOBLevel, LOBSnapshot, SharedState
+from models import AggTrade, Candle, LOBLevel, LOBSnapshot, SharedState
 
 logger = logging.getLogger(__name__)
 
@@ -306,10 +307,31 @@ class BinanceWebSocketConsumer:
                         )
 
         elif event_type == "kline":
-            if self._candle_queue is not None:
-                await self._candle_queue.put(msg)
-            if self._candle_db_queue is not None:
-                await self._candle_db_queue.put(msg)
+            # Binance delivers the OHLCV under "k". Parse it into a Candle here so the
+            # downstream consumers receive the dataclass they expect: FeatureComputer
+            # (update_candle) and DBWriter (_write_candle) both access .open_time /
+            # .is_closed. Forwarding the raw dict raises AttributeError on those
+            # consumers and silently starves the candles table.
+            k = msg.get("k") or {}
+            try:
+                candle = Candle(
+                    open_time=datetime.fromtimestamp(int(k["t"]) / 1000, tz=timezone.utc),
+                    open=float(k["o"]),
+                    high=float(k["h"]),
+                    low=float(k["l"]),
+                    close=float(k["c"]),
+                    volume=float(k["v"]),
+                    is_closed=bool(k.get("x", False)),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("[WS] Malformed kline payload — skipping: %s", exc)
+            else:
+                # FeatureComputer ignores in-progress bars itself; only persist closed
+                # candles so the candles table holds finalised OHLCV, not partial bars.
+                if self._candle_queue is not None:
+                    await self._candle_queue.put(candle)
+                if self._candle_db_queue is not None and candle.is_closed:
+                    await self._candle_db_queue.put(candle)
 
         elif event_type == "aggTrade":
             if self._trade_queue is not None:
