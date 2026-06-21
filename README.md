@@ -452,6 +452,8 @@ All settings live in `config.py` and can be overridden via `.env`.
 | `BINANCE_API_SECRET` | — | Testnet API secret (from `.env`) |
 | `BINANCE_TESTNET` | `True` | Always use testnet for execution |
 | `SYMBOL` | `BTCUSDT` | Trading pair |
+| `WS_BASE` | `wss://stream.testnet.binance.vision` | Testnet WebSocket endpoint (trading engine) |
+| `REST_BASE` | `https://testnet.binance.vision` | Testnet REST endpoint (trading engine) |
 | `LOB_RECORDER_WS` | `wss://stream.binance.com:9443` | Real Binance public stream (LOB Recorder only) |
 
 ### Strategy
@@ -511,6 +513,7 @@ All settings live in `config.py` and can be overridden via `.env`.
 ### Risk Engine
 | Setting | Default | Description |
 |---|---|---|
+| `STARTING_EQUITY` | `1_000_000.0` | Design account size (1M USDT testnet); overwritten by startup reconciler with actual Binance balance |
 | `MAX_DRAWDOWN_PCT` | `0.05` | 5% drawdown from peak → HALTED |
 | `DAILY_LOSS_LIMIT_PCT` | `0.02` | Legacy portfolio daily-loss hard stop (belt-and-suspenders) |
 | `TIER_REDUCED_PCT` | `0.005` | ≥ 0.5% DOV loss → REDUCED (50% size, min conf 0.65) |
