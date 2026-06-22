@@ -252,7 +252,7 @@ Gap severity tiering (keyed on update ID regression count, not time):
 
 ### LOB Recorder (`core/lob_recorder.py`)
 
-Connects to `wss://stream.binance.com` (real Binance public stream — no API key). Records raw tick data to `data/lob_tick.db` for backtesting Path A. Separate from the testnet trading connection per Rule 4.
+Connects to `wss://stream.binance.com:9443` (real Binance public stream — no API key). Records raw tick data to `data/lob_tick.db` for backtesting Path A. Separate from the testnet trading connection per Rule 4.
 
 ### HeartbeatMonitor (`core/ws_consumer.py`)
 
