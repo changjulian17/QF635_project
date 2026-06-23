@@ -2,7 +2,7 @@
 
 Real-time granular LOB microstructure analysis and paper-trading system for BTCUSDT on the Binance Spot Testnet.
 
-**Current phase:** Phase 3 in progress (REST API + LOB snapshot writer + Dash dashboard).
+**Current phase:** Phase 3 complete. All deliverables shipped.
 
 ## Project layout
 
@@ -17,6 +17,8 @@ core/
   lob_recorder.py      — Always-on LOB data collector (real Binance public stream)
   cvd.py               — Standalone CVD calculator (WelfordOnline std)
   signal_telemetry.py  — Async signal record writer (all gates, pass + fail)
+  startup_reconciler.py — Exchange state reconciliation on startup + midnight reset
+  alerting.py          — AlertDispatcher — optional webhook notifications for killswitch/tier events
 
 strategy/
   features.py          — FeatureComputer + WelfordOnline (15 features, no look-ahead)
@@ -34,27 +36,34 @@ risk/
 
 execution/
   order_manager.py     — IOC aggressive limit orders + OCO brackets
+  orders.py            — Order domain classes (IOCLimitOrder, FuturesTPOrder, FuturesSLOrder)
 
-engine/              — legacy shim directory (re-exports to new locations)
+engine/              — Shared persistence, snapshot, and hub components
   db_writer.py       — SQLite persistence + rolling cleanup + lob_snapshots writer
-  microstructure_engine.py — legacy (superseded by strategy/microstructure.py)
-  risk_engine.py     — re-exports risk.engine.RiskEngine
+  lob_snapshot_writer.py — LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
+  realtime_hub.py    — RealtimeHub — fan-out JSON pushes to /ws/lob WebSocket clients
+  microstructure_engine.py — Legacy MicrostructureEngine (NOT started in live path; used by backtesting tests only)
 
 dashboard/           — Dash multi-page dashboard (Phase 3)
   app.py             — entry point; dark theme, nav, engine status badge
   _db.py             — WAL-mode SQLite helpers shared by all pages
+  _logic.py          — shared business logic for dashboard pages
+  _utils.py          — shared Plotly utilities (empty_fig)
   pages/
     live.py          — /live: portfolio metrics, signal funnel, kill switch
     lob.py           — /lob: LOB heatmap, OBI/CVD/Spread subplots
+    walls.py         — /walls: 1s candlestick + rolling VWAP + liquidity wall heatmap
     backtest.py      — /backtest: strategy leaderboard from backtest results
     registry.py      — /registry: strategy lifecycle, decay monitoring, LIVE promotion
     config.py        — /config: settings reference, emergency stop, event log
 
 scripts/
-  test_connection.py — verify Binance testnet connectivity and auth
-  test_orders.py     — BUY + SELL round-trip execution test
+  test_connection.py     — verify Binance testnet connectivity and auth
+  test_orders.py         — BUY + SELL round-trip execution test
+  run_backtest.py        — CLI for tick-level walk-forward backtest (writes to backtest_results.db)
+  signal_injector.py     — Synthetic signal injection (start_test.sh only)
 
-tests/               — pytest unit tests (380 tests across 28 files)
+tests/               — pytest unit tests (510 tests across 37 files)
 ```
 
 ## Quick actions
@@ -89,7 +98,7 @@ Run unit tests:
 
 ## Configuration notes
 
-- Put Binance testnet credentials in `.env` (gitignored). Use `.env.example` as a template.
+- Put Binance Spot Testnet credentials in `.env` (gitignored). Use `.env.example` as a template.
 - `DRY_RUN=True` in config.py — set `DRY_RUN=False` in `.env` to enable live order execution.
 - `LOB_RECORDER_WS` points to real Binance public stream (`wss://stream.binance.com:9443`), not testnet — this is intentional (Rule 4).
 - Never add API keys to source files.
@@ -109,14 +118,16 @@ Run unit tests:
 | 1H — Microstructure Detector | ✅ | strategy/microstructure.py |
 | 1I — Signal Telemetry | ✅ | core/signal_telemetry.py |
 | 1J — 7-Gate Executor | ✅ | strategy/executor.py |
-| 1K — Risk Engine rewrite | ✅ | risk/ (engine, budget, pyramid, killswitch) |
-| 1L — IOC execution layer | ✅ | execution/order_manager.py rewrite |
+| 1K — Risk Engine rewrite | ✅ | risk/ (engine, budget, killswitch) |
+| 1L — IOC execution layer | ✅ | execution/order_manager.py + orders.py |
 | 1M — Startup reconciler | ✅ | core/startup_reconciler.py + main.py rewrite |
 | 1N — Integration test | ✅ | tests/test_integration.py |
+| 1P — Alerting | ✅ | core/alerting.py — AlertDispatcher webhook notifications |
 | 2G — Tick Replay Engine | ✅ | backtesting/tick_replay.py |
 | 2H — XGBoost Confidence Scorer | ✅ | strategy/scorer.py + ScorerFactory wired into Gate 2 |
 | 2I — Strategy Registry | ✅ | strategy/spec.py, registry.py, builder.py + tests/test_registry.py |
-| 3A — REST API | ✅ | _api_server coroutine in main.py (aiohttp, /api/health, /api/portfolio, /api/killswitch) |
-| 3B — LOB snapshot writer | ✅ | _lob_snapshot_writer in main.py + lob_snapshots table in db_writer.py |
-| 3C–3H — Dash dashboard | ✅ | dashboard/ app with 5 pages: live, lob, backtest, registry, config |
-| 3I — Phase 3 tests | ✅ | test_rest_api.py (10), test_lob_snapshot_writer.py (6), test_dashboard_live.py (5), test_dashboard_registry.py (4) |
+| 3A — REST API | ✅ | _api_server coroutine in main.py (aiohttp, /api/health, /api/portfolio, /api/session, /api/killswitch) |
+| 3B — LOB snapshot writer | ✅ | engine/lob_snapshot_writer.py + lob_snapshots table in db_writer.py |
+| 3C — RealtimeHub | ✅ | engine/realtime_hub.py — /ws/lob, /ws/portfolio, /ws/signals WebSocket fan-out |
+| 3D–3H — Dash dashboard | ✅ | dashboard/ app with 6 pages: live, lob, walls, backtest, registry, config |
+| 3I — Phase 3 tests | ✅ | test_rest_api.py (11), test_lob_snapshot_writer.py (9), test_realtime_hub.py (6), test_dashboard_live.py (10), test_dashboard_lob.py (15), test_dashboard_registry.py (4), test_dashboard_walls.py (6), test_portfolio_broadcast.py (7), test_signal_broadcast.py (9) |
