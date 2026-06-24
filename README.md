@@ -91,7 +91,7 @@ CryptoSentinel/
 │
 ├── backtesting/               # Offline strategy research
 │   ├── tick_replay.py         # Path A: event-driven replay of lob_tick.db through live stack
-│   ├── event_engine.py        # Path A: tick-level event replay engine
+│   ├── event_engine.py        # Path B: candle-by-candle OHLCV backtesting engine
 │   ├── signals.py             # Signal generation for backtesting
 │   ├── walk_forward.py        # Path B: OHLCV walk-forward (VectorBT + Optuna)
 │   ├── vectorbt_runner.py     # VectorBT execution wrapper
@@ -126,7 +126,7 @@ CryptoSentinel/
 │   ├── db_writer.py           # SQLite persistence + rolling cleanup + lob_snapshots table
 │   ├── lob_snapshot_writer.py # LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
 │   ├── realtime_hub.py        # RealtimeHub — fan-out JSON pushes to WebSocket clients
-│   └── microstructure_engine.py # Legacy MicrostructureEngine (NOT started in live path; used by backtesting tests only)
+│   └── microstructure_engine.py # Legacy MicrostructureEngine (NOT started in live path; unit tests only)
 │
 ├── scripts/
 │   ├── test_connection.py     # Connectivity + auth check
@@ -317,7 +317,7 @@ notional_hint = confidence × KELLY_FRACTION × RISK_PER_TRADE_PCT × tier_scala
 sl_distance   = signal_price × min(protection_wall_bps, PROTECTION_MAX_DISTANCE_BPS) / 10,000
 qty           = floor((equity × notional_hint / sl_distance) / QTY_STEP_SIZE) × QTY_STEP_SIZE
 ```
-`notional_hint` is computed in `StrategyExecutor` (Gate 2). Final qty is computed in `OrderManager._place_entry`.
+`notional_hint` is computed in `StrategyExecutor` (Gate 2). Final qty is computed in `OrderManager._submit_aggressive_limit`.
 
 **Circuit Breakers:**
 ```
@@ -634,7 +634,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 |------|--------|--------|
 | **1. Accumulate LOB data** | LOB Recorder is collecting at `btcusdt@depth@100ms` (incremental diff, 100 levels, $25-bucket aggregation). Keep `lob_recorder` running continuously. Target ≥30 days for statistically robust walk-forward splits. | ✅ Done (recorder operational) |
 | **2. Fetch OHLCV history** | Run `data/fetcher.py` to populate `ohlcv_cache.db` for Path B backtesting | 🔜 Pending |
-| **3. Run backtests** | Path A: `backtesting/event_engine.py` replay of `lob_tick.db`. Path B: `backtesting/walk_forward.py` OHLCV walk-forward via VectorBT + Optuna | 🔜 Pending |
+| **3. Run backtests** | Path A: `backtesting/tick_replay.py` replay of `lob_tick.db`. Path B: `backtesting/walk_forward.py` OHLCV walk-forward via VectorBT + Optuna | 🔜 Pending |
 | **4. Tune strategy config** | Optimise wall sigma (`LOB_WALL_SIGMA`), confidence threshold (`MIN_CONFIDENCE`), ATR multipliers via Optuna. Evaluate Sharpe, Sortino, MDD, PF across out-of-sample windows. | 🔜 Pending |
 | **5. Train XGBoost scorer** | `strategy/scorer.py` — `XGBoostScorer.train_from_registry()` trains on APPROVED `signal_records`; `ScorerFactory` auto-loads at startup, falls back to `RuleBasedScorer` if no pkl exists. AUC gate ≥ 0.62, ECE logged, staleness warning after 30 days. | ✅ Done |
 | **6. Freeze StrategySpec** | `strategy/spec.py` + `strategy/registry.py` + `strategy/builder.py` — `StrategyBuilder` produces BACKTEST-status specs; `StrategyRegistry` dual-stores to YAML + SQLite with 4-gate PAPER promotion (≥50 OOS trades, Sharpe ≥ 1.0, MDD ≤ 15%, PF ≥ 1.3) and 3-gate LIVE promotion. | ✅ Done |
