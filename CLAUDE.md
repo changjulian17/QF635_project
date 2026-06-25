@@ -36,7 +36,7 @@ risk/
 
 execution/
   order_manager.py     — IOC aggressive limit orders + OCO brackets
-  orders.py            — Order domain classes (IOCLimitOrder, FuturesTPOrder, FuturesSLOrder)
+  orders.py            — Order domain classes (IOCLimitOrder, OCOOrder)
 
 engine/              — Shared persistence, snapshot, and hub components
   db_writer.py       — SQLite persistence + rolling cleanup + lob_snapshots writer
@@ -130,4 +130,4 @@ Run unit tests:
 | 3B — LOB snapshot writer | ✅ | engine/lob_snapshot_writer.py + lob_snapshots table in db_writer.py |
 | 3C — RealtimeHub | ✅ | engine/realtime_hub.py — /ws/lob, /ws/portfolio, /ws/signals WebSocket fan-out |
 | 3D–3H — Dash dashboard | ✅ | dashboard/ app with 6 pages: live, lob, walls, backtest, registry, config |
-| 3I — Phase 3 tests | ✅ | test_rest_api.py (11), test_lob_snapshot_writer.py (9), test_realtime_hub.py (6), test_dashboard_live.py (10), test_dashboard_lob.py (15), test_dashboard_registry.py (4), test_dashboard_walls.py (6), test_portfolio_broadcast.py (7), test_signal_broadcast.py (9) |
+| 3I — Phase 3 tests | ✅ | test_rest_api.py (11), test_lob_snapshot_writer.py (9), test_realtime_hub.py (6), test_dashboard_live.py (10), test_dashboard_lob.py (15), test_dashboard_registry.py (4), test_dashboard_walls.py (6), test_portfolio_broadcast.py (7), test_signal_broadcast.py (9), test_alerting.py (3) |
