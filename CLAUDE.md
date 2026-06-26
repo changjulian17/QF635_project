@@ -8,6 +8,7 @@ Real-time granular LOB microstructure analysis and paper-trading system for BTCU
 
 ```
 main.py          — asyncio orchestrator (entry point)
+backtest.py      — CLI backtest runner (VectorBT + Optuna two-phase pipeline)
 config.py        — pydantic settings loaded from .env
 models.py        — shared dataclasses and enums
 
@@ -38,6 +39,19 @@ execution/
   order_manager.py     — IOC aggressive limit orders + OCO brackets
   orders.py            — Order domain classes (IOCLimitOrder, OCOOrder)
 
+backtesting/         — Offline strategy research
+  tick_replay.py     — Path A: event-driven replay of lob_tick.db through live stack
+  event_engine.py    — Path B: candle-by-candle OHLCV backtesting engine
+  signals.py         — Signal generation for backtesting
+  walk_forward.py    — Path B: OHLCV walk-forward (VectorBT + Optuna)
+  vectorbt_runner.py — VectorBT execution wrapper
+  metrics.py         — Sharpe, Sortino, Calmar, MDD, PF, WR
+  costs.py           — Transaction cost model
+
+data/
+  fetcher.py         — OHLCVFetcher (CCXT + SQLite cache)
+  validator.py       — 9-check data quality validator
+
 engine/              — Shared persistence, snapshot, and hub components
   db_writer.py       — SQLite persistence + rolling cleanup + lob_snapshots writer
   lob_snapshot_writer.py — LOB snapshot writer coroutine (~1 Hz, lob_snapshots table)
@@ -56,6 +70,10 @@ dashboard/           — Dash multi-page dashboard (Phase 3)
     backtest.py      — /backtest: strategy leaderboard from backtest results
     registry.py      — /registry: strategy lifecycle, decay monitoring, LIVE promotion
     config.py        — /config: settings reference, emergency stop, event log
+
+strategies/          — Strategy artifacts (generated at runtime)
+  registry.db        — SQLite: signal_records + system events
+  {name}_v{ver}.yaml — Frozen YAML strategy specs
 
 scripts/
   test_connection.py     — verify Binance testnet connectivity and auth

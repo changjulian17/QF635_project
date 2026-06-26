@@ -184,7 +184,7 @@ CryptoSentinel/
 
 ### Stream Selection
 
-The LOB Recorder subscribes to `btcusdt@depth@100ms` — the **incremental diff-depth stream** — and maintains a full local order book seeded from a REST `depth?limit=1000` snapshot on each connect. Buffered diffs received during the REST fetch are merged in sequence-ID order before the book is declared SYNCED. The top 100 levels per side are retained (`_DEPTH_LEVELS = 100`) and aggregated into $25 USD price buckets (`_BUCKET_WIDTH = 25.0`) before writing to `lob_tick.db`. At BTC prices (~$77k), 100 levels span ~$50–200 from mid — sufficient range to detect deep-book institutional walls above the transaction cost floor (~$115 at 30bps round-trip).
+The LOB Recorder subscribes to `btcusdt@depth@100ms` — the **incremental diff-depth stream** — and maintains a full local order book seeded from a REST `depth?limit=1000` snapshot on each connect. Buffered diffs received during the REST fetch are merged in sequence-ID order before the book is declared SYNCED. The top 100 levels per side are retained (`_DEPTH_LEVELS = 100`) and aggregated into $25 USD price buckets (`_BUCKET_WIDTH = 25.0`) before writing to `lob_tick.db`. At typical BTC prices, 100 levels span ~$50–200 from mid — sufficient range to detect deep-book institutional walls above the transaction cost floor (~$115 at 30bps round-trip).
 
 | Stream | Purpose | Update Rate |
 |--------|---------|-------------|
