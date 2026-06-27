@@ -3,6 +3,11 @@
 # Trades appear on demo.binance.com — visit the site to confirm fills.
 # Requires DEMO_BINANCE_API_KEY and DEMO_BINANCE_API_SECRET in .env.
 #
+# Launches a single-actor "Test Fire" window that fires a BUY->SELL round-trip
+# within the first minute and then every 2 min (scripts/demo_test_fire.py). The
+# engine runs with TEST_SIGNAL_INJECT=false so it never opens a competing
+# position. The test fire is skipped in --dry-run (the engine keeps its injector).
+#
 # Usage:
 #   ./start_demo.sh             — live demo orders on demo.binance.com
 #   ./start_demo.sh --dry-run   — synthetic fills only (no API key needed)
@@ -107,6 +112,14 @@ if [[ "$DRY_RUN" == "true" ]]; then
     ENV_PREFIX="$ENV_PREFIX DRY_RUN=true"
 fi
 
+# Single-actor demo: the standalone test fire is the sole order placer.
+# Disable the engine's own injector so it never opens a competing position.
+# Dry-run keeps the injector on (no test fire is launched there).
+ENGINE_ENV="$ENV_PREFIX"
+if [[ "$DRY_RUN" != "true" ]]; then
+    ENGINE_ENV="$ENGINE_ENV TEST_SIGNAL_INJECT=false"
+fi
+
 # --- Launch each component in a new Terminal window ---
 open_window() {
     local label="$1"
@@ -123,22 +136,27 @@ open_window() {
 if [[ "$DRY_RUN" == "true" ]]; then
     echo "Launching DEMO (DRY RUN) components (MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true, synthetic fills)..."
 else
-    echo "Launching DEMO components (BINANCE_DEMO=true, DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=true)..."
+    echo "Launching DEMO components (BINANCE_DEMO=true, DRY_RUN=false, MIN_CONFIDENCE=0.1, TEST_SIGNAL_INJECT=false, test fire every 2m)..."
 fi
 
 open_window "LOB Recorder"           "$ENV_PREFIX '$PYTHON' -m core.lob_recorder"
-open_window "Trading Engine (DEMO)"  "$ENV_PREFIX '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
+open_window "Trading Engine (DEMO)"  "$ENGINE_ENV '$PYTHON' main.py & echo \$! > /tmp/cs_engine.pid && wait"
 open_window "Dash Dashboard"         "$ENV_PREFIX '$PYTHON' dashboard/app.py"
 
-log_ok "All three components launched in separate Terminal windows."
+if [[ "$DRY_RUN" != "true" ]]; then
+    open_window "Test Fire (BUY/SELL 2m)" "$ENV_PREFIX '$PYTHON' scripts/demo_test_fire.py"
+fi
+
+log_ok "All components launched in separate Terminal windows."
 echo ""
 echo "  LOB Recorder          → $ENV_PREFIX python -m core.lob_recorder"
-echo "  Trading Engine (DEMO) → $ENV_PREFIX python main.py"
+echo "  Trading Engine (DEMO) → $ENGINE_ENV python main.py"
 echo "  Dash Dashboard        → http://127.0.0.1:8050"
 if [[ "$DRY_RUN" == "true" ]]; then
     echo ""
     echo "  DRY RUN: fills are synthetic — check dashboard at http://127.0.0.1:8050/live"
 else
+    echo "  Test Fire             → BUY->SELL round-trip ~10s after start, then every 2 min"
     echo ""
     echo "  View trades at        → https://demo.binance.com/en/futures/BTCUSDT"
 fi
