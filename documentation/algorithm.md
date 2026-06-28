@@ -17,8 +17,9 @@ The live algorithm is organized as an asyncio task graph:
 7. `OrderManager` resolves the current book, submits an IOC aggressive limit entry, places an OCO bracket after fill in live mode, and records fill/outcome telemetry.
 8. Gate 6 monitors the protection wall after fill and can trigger an early safety exit.
 
-In addition to the signal-processing coroutines, the live `TaskGroup` runs Phase 3 infrastructure tasks that do not participate in the trade decision path:
+In addition to the signal-processing coroutines, the live `TaskGroup` runs infrastructure tasks that do not participate in the trade decision path:
 
+- `lob_recorder` connects to the real Binance public stream (`wss://stream.binance.com:9443`) and records depth snapshots and aggregate trades to `data/lob_tick.db` for backtesting. Independent of the testnet trading connection (Rule 4).
 - `lob_snapshot_writer` polls `LocalOrderBook` at ~1 Hz, writes to `lob_snapshots` in SQLite, and broadcasts each snapshot to subscribed WebSocket clients via `RealtimeHub` (`/ws/lob`).
 - `_api_server` hosts the aiohttp REST API (`/api/health`, `/api/portfolio`, `/api/session`, `/api/killswitch`) and three WebSocket streams (`/ws/lob`, `/ws/portfolio`, `/ws/signals`) consumed by the Dash dashboard.
 - `_portfolio_mtm_loop` runs every 1 s to check KS-1 budget breach, synchronise the risk tier back into `StrategyExecutor`, and broadcast the portfolio state to `/ws/portfolio` via the `portfolio_hub` `RealtimeHub`.
