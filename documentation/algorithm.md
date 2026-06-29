@@ -25,6 +25,7 @@ In addition to the signal-processing coroutines, the live `TaskGroup` runs infra
 - `_portfolio_mtm_loop` runs every 1 s to check KS-1 budget breach, synchronise the risk tier back into `StrategyExecutor`, and broadcast the portfolio state to `/ws/portfolio` via the `portfolio_hub` `RealtimeHub`.
 - `midnight_reset_loop` sleeps until UTC midnight + 5 s and resets daily risk counters via `RiskEngine.reset_for_new_session()`.
 - `db_writer` persists candles and portfolio snapshots to SQLite.
+- `signal_telemetry` drains the `telemetry_queue`, batching `SignalRecord` objects and flushing them to `signal_records` in `registry.db`. It also broadcasts each signal event to `/ws/signals` via the `signal_hub` `RealtimeHub`.
 - `fill_processor` logs entry fill slippage from `FillDetail` objects on `fill_queue`.
 
 ```mermaid
