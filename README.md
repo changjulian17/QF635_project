@@ -360,7 +360,7 @@ Every signal evaluation — whether it passes all gates or is rejected at Gate 0
 
 ## Quick Start
 
-Requires **Python 3.13+**.
+Requires **Python 3.11+**.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -646,7 +646,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 
 | Layer | Technology | Version | Purpose |
 |-------|-----------|---------|---------|
-| Runtime | Python | 3.13+ | Async, type hints |
+| Runtime | Python | 3.11+ | Async, type hints |
 | Async | asyncio | stdlib | Event loop |
 | LOB Recorder WS | websockets | 10.4 | Real Binance public stream |
 | Exchange WS/REST | python-binance | 1.0.36 | Testnet execution |
@@ -661,7 +661,7 @@ The trading engine is fully operational on the Binance Spot Testnet. The remaini
 | Dashboard WS | dash-extensions | 1.0+ | Real-time WebSocket components (`/live`, `/lob`) |
 | Charts | plotly | 5.22.x | All visualisations |
 | Persistence | SQLite | stdlib | All databases |
-| Logging | Python stdlib logging | 3.13+ | RotatingFileHandler, INFO/DEBUG configurable via `LOG_LEVEL` |
+| Logging | Python stdlib logging | 3.11+ | RotatingFileHandler, INFO/DEBUG configurable via `LOG_LEVEL` |
 | Serialisation | PyYAML | 6.0+ | StrategySpec configs |
 
 ---
@@ -745,3 +745,4 @@ These rules are invariants. Any code that violates them is incorrect.
 - [ ] **Test coverage gap — risk/budget.py and risk/killswitch.py**: Neither `tests/test_budget.py` nor `tests/test_killswitch.py` exists. `DailyBudget.remaining`, `DailyBudget.loss_pct`, reset on midnight boundary, and `GlobalKillswitch` trigger conditions (KS-1 budget breach, KS-2 heartbeat, KS-3 slippage) are only tested indirectly through `test_risk_engine.py` fixtures. These are risk-critical code paths — add dedicated unit tests for each module (`risk/budget.py` and `risk/killswitch.py`).
 - [ ] **Test coverage gap — dashboard/pages/backtest.py and dashboard/pages/config.py**: Neither `tests/test_dashboard_backtest.py` nor `tests/test_dashboard_config.py` exists. The `/backtest` leaderboard page (`dashboard/pages/backtest.py`) and the `/config` settings-reference + emergency-stop page (`dashboard/pages/config.py`) have zero dedicated tests. The four other dashboard pages (`/live`, `/lob`, `/walls`, `/registry`) all have test files; add equivalent coverage for these two to close the gap.
 - [ ] **Test coverage gap — dashboard/_db.py, dashboard/_utils.py, dashboard/app.py**: 11 of `dashboard/_db.py`'s 17 functions (`main_db`, `backtest_db`, `lob_tick_db`, `fetch_agg_trades`, `fetch_cvd_series_24h`, `fetch_portfolio_history`, `fetch_strategies`, `fetch_session_stats`, `fetch_pnl_by_pattern`, `fetch_system_events`, `fetch_backtest_results`) have zero references anywhere in `tests/`; only `_connect`, `registry_db`, `fetch_lob_snapshots`, `fetch_signal_funnel`, `fetch_gate_funnel_drift`, and `fetch_candles` are exercised. `dashboard/_utils.py`'s sole function, `empty_fig`, has zero test references. `dashboard/app.py` has no dedicated test file and is not imported by any existing test. Add targeted unit tests for the untested `_db.py` fetchers, `empty_fig`, and basic `app.py` page-registration/layout smoke coverage.
+- [ ] **LOBRecorder double-start when using start.sh**: `start.sh` opens a dedicated "LOB Recorder" terminal window running `python -m core.lob_recorder`, while `main.py`'s TaskGroup also starts `LOBRecorder().start()` as the `"lob_recorder"` task (`main.py` line 564). When the full system is launched via `start.sh`, two independent `LOBRecorder` instances write concurrently to `data/lob_tick.db`; SQLite WAL mode serialises the writes without corruption but produces duplicate depth snapshots and aggTrade rows, inflating storage and distorting backtesting row counts. Either remove the standalone "LOB Recorder" window from `start.sh` (relying on `main.py`'s internal recorder) or remove the `lob_recorder` task from `main.py`'s TaskGroup (relying solely on the standalone process for continuous out-of-trading-hours recording).
