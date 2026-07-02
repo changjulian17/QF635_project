@@ -31,14 +31,14 @@ Absorption occurs when aggressive trades hit a persistent wall but price does no
 
 - A bid wall absorbs seller aggression when sell pressure hits the bid but the level holds.
 - An ask wall absorbs buyer aggression when buy pressure lifts the ask but the level holds.
-- The wall must remain persistent and retain or reload a substantial portion of its original quantity.
-- Price movement must remain below the price-move floor threshold (configurable via `MICRO_PRICE_MOVE_FLOOR_BPS`, default 0.03%). Note: the adaptive rolling-percentile threshold is used only for sweep detection, not for absorption.
+- The wall must have been visible for at least 500 ms (`WallState.is_persistent`, hardcoded in `models.py`) and its current quantity must be at or above 70% of its initial quantity (`reload_ratio ≥ 0.70`, checked in `detect_absorption()`).
+- Price movement must remain below the price-move floor threshold (configurable via `MICRO_PRICE_MOVE_FLOOR_BPS`, default 3.0 bps / 0.03%). Note: the adaptive rolling-percentile threshold is used only for sweep detection, not for absorption.
 
 Absorption does not trigger an entry. It arms the system by marking the wall as an important level where aggressive flow has already tested resting liquidity.
 
 ### Sweep With Protection
 
-The executable signal is `SWEEP_WITH_PROTECTION`. It fires when a previously tracked wall is consumed, price moves in the sweep direction, and a fresh protective wall appears behind the breakout.
+The executable signal is `SWEEP_WITH_PROTECTION`. It fires when a previously tracked wall is consumed (current quantity falls below 15% of initial, `_CONSUMED_RATIO = 0.15`), price moves in the sweep direction beyond the adaptive floor (`MICRO_PRICE_MOVE_FLOOR_BPS`, default 3.0 bps), and a fresh protective wall appears behind the breakout within 3 seconds (`LOB_FRESH_WALL_MS`, default 3000 ms).
 
 Direction is inferred from the side of the consumed wall:
 
