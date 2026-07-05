@@ -120,7 +120,9 @@ CryptoSentinel/
 │
 ├── strategies/                # Strategy artifacts
 │   ├── registry.db            # SQLite: signal_records + system events
-│   └── {name}_v{version}.yaml # Frozen YAML strategy specs (written directly to strategies/ by StrategyRegistry)
+│   ├── {name}_v{version}.yaml # Frozen YAML strategy specs (written directly to strategies/ by StrategyRegistry)
+│   └── models/
+│       └── scorer.pkl         # XGBoostScorer artifact (generated — written by XGBoostScorer.save(); read by ScorerFactory at startup)
 │
 ├── engine/                    # Shared persistence, snapshot, and hub components
 │   ├── db_writer.py           # SQLite persistence + rolling cleanup + lob_snapshots table
