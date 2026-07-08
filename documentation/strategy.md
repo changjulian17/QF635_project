@@ -87,7 +87,7 @@ flowchart LR
 
     LOB --> MS[MicrostructureDetector]
     TR --> MS
-    LOB --> FC[FeatureComputer]
+    MS --> FC[FeatureComputer]
     CND --> FC
     TR --> FC
 
