@@ -61,6 +61,7 @@ CryptoSentinel/
 ├── config.py                  # Pydantic V2 settings from .env
 ├── models.py                  # Shared dataclasses and enums
 ├── requirements.txt
+├── cryptosentinel.db          # Generated — SQLite: candles, portfolio snapshots, lob_snapshots; created by engine/db_writer.py at first startup (path hardcoded in db_writer.py, not configurable via .env)
 │
 ├── core/                      # Real-time data processing
 │   ├── ws_consumer.py         # WebSocket consumer + HeartbeatMonitor
@@ -119,7 +120,7 @@ CryptoSentinel/
 │       └── config.py          # /config   — Settings reference, emergency stop, event log
 │
 ├── strategies/                # Strategy artifacts
-│   ├── registry.db            # SQLite: signal_records + system events
+│   ├── registry.db            # SQLite: signal_records + system_events + strategies tables
 │   ├── {name}_v{version}.yaml # Frozen YAML strategy specs (written directly to strategies/ by StrategyRegistry)
 │   └── models/
 │       └── scorer.pkl         # XGBoostScorer artifact (generated — written by XGBoostScorer.save(); read by ScorerFactory at startup)
