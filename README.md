@@ -593,9 +593,9 @@ tests/test_lob_recorder.py           27 tests  — recorder flush, reconnect, st
 tests/test_features.py               14 tests  — Welford, no-lookahead, VWAP reset
 tests/test_cvd.py                    15 tests  — buy/sell CVD, 5-bar delta, std
 tests/test_db_writer.py               9 tests  — SQLite write, upsert, purge
-tests/test_signal_telemetry.py       23 tests  — flush, batch, timeout, outcome update, hub broadcast, tape management
+tests/test_signal_telemetry.py       23 tests  — flush, batch, timeout, outcome update, fill tracking, system events, features JSON
 tests/test_orders.py                 11 tests  — order domain classes and enums
-tests/test_ws_consumer.py            12 tests  — heartbeat states, rate thresholds, hysteresis
+tests/test_ws_consumer.py            12 tests  — heartbeat states, rate thresholds, hysteresis, sustained-degraded transition
 tests/test_models.py                  6 tests  — PortfolioState, WallState, FeatureVector
 tests/test_integration.py             2 tests  — end-to-end signal → execution pipeline
 
