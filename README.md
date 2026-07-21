@@ -137,7 +137,7 @@ CryptoSentinel/
 │   ├── run_backtest.py        # CLI for tick-level walk-forward backtest (writes to backtest_results.db)
 │   └── signal_injector.py     # Synthetic signal injection — dev/testnet only (start_test.sh)
 │
-├── tests/                     # pytest unit + integration tests (505 total)
+├── tests/                     # pytest unit + integration tests (510 total)
 │   │                          # Phase 1 — live trading engine
 │   ├── test_models.py
 │   ├── test_lob_engine.py
@@ -585,7 +585,7 @@ Phase 1 — Live trading engine
 tests/test_risk_engine.py            11 tests  — sync_tier transitions, tier callback, record_trade_result, mark_unrealised, session reset
 tests/test_microstructure_engine.py  30 tests  — legacy microstructure engine
 tests/test_executor.py               45 tests  — all 7 gates, telemetry emission
-tests/test_order_manager.py          36 tests  — IOC entry, OCO bracket, fill handling
+tests/test_order_manager.py          34 tests  — IOC entry, OCO bracket, fill handling
 tests/test_lob_engine.py             22 tests  — state machine, gap detection, wall scan
 tests/test_startup_reconciler.py     17 tests  — reconciliation, midnight reset
 tests/test_microstructure.py         26 tests  — wall identification, absorption, sweep
@@ -612,7 +612,7 @@ tests/test_signal_broadcast.py        9 tests  — /ws/signals payload shape, Si
 tests/test_portfolio_broadcast.py     7 tests  — /ws/portfolio payload shape, _portfolio_mtm_loop broadcast, killswitch guard
 
 Phase 2 — Backtesting + strategy lifecycle
-tests/test_bt_event_engine.py        17 tests  — event-driven engine: tiers, exits, full run
+tests/test_bt_event_engine.py        24 tests  — event-driven engine: tiers, exits, full run
 tests/test_registry.py               29 tests  — lifecycle gates, YAML roundtrip, promotion
 tests/test_bt_tick_replay.py         16 tests  — tick replay fidelity, streaming, CVD reset
 tests/test_bt_walk_forward.py         9 tests  — window splits, OOS isolation, leaderboard
@@ -624,7 +624,7 @@ tests/test_bt_signals.py              7 tests  — signal arrays, no-lookahead, 
 tests/test_bt_vectorbt.py             6 tests  — Optuna optimisation, sensitivity
 tests/test_bt_costs.py                5 tests  — round-trip cost, maker/taker, zero qty
 ──────────────────────────────────────────────────────────────────────────────
-Total                               505 tests
+Total                               510 tests
 ```
 
 ---
