@@ -358,4 +358,4 @@ ERROR tests/test_rest_api.py::test_killswitch_already_active
 ERROR tests/test_rest_api.py::test_killswitch_active_reflected_in_health
 ERROR tests/test_rest_api.py::test_health_risk_tier_reflects_circuit_breaker
 ERROR tests/test_rest_api.py::test_unknown_endpoint_returns_404
-71 failed, 427 passed, 67 warnings, 12 errors in 13.90s
+71 failed, 427 passed, 67 warnings, 12 errors in 11.02s
