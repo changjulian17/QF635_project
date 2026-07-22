@@ -71,7 +71,6 @@ class Settings(BaseSettings):
     LOB_OBI_DEPTH: int = 20
     LOB_HISTORY: int = 18000
     LOB_HEATMAP_BUCKET: float = 1.0
-    LOB_HEATMAP_BUCKET: float = 1.0
     LOB_WALL_SIGMA: float = 2.5        # σ threshold for Wall identification (§5)
     LOB_WALL_WINDOW: int = 5           # ticks each side for Wall median/std
     RELOAD_SIGMA: float = 3.0
@@ -231,37 +230,39 @@ class Settings(BaseSettings):
                 "BINANCE_API_KEY and BINANCE_API_SECRET must be set when DRY_RUN=False. "
                 "Add them to .env or set DRY_RUN=True for paper trading."
             )
-        assert self.TIER_REDUCED_PCT < self.TIER_MINIMAL_PCT, \
-            f"TIER_REDUCED_PCT ({self.TIER_REDUCED_PCT}) must be < TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT})"
-        assert self.TIER_MINIMAL_PCT < self.TIER_PASSIVE_PCT, \
-            f"TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT}) must be < TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT})"
-        assert self.TIER_PASSIVE_PCT < self.TIER_HALTED_PCT, \
-            f"TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT}) must be < TIER_HALTED_PCT ({self.TIER_HALTED_PCT})"
-        assert self.TIER_HALTED_PCT <= self.DAILY_LOSS_LIMIT_PCT, \
-            f"TIER_HALTED_PCT ({self.TIER_HALTED_PCT}) must be <= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"
-        assert self.MAX_DRAWDOWN_PCT >= self.DAILY_LOSS_LIMIT_PCT, \
-            f"MAX_DRAWDOWN_PCT ({self.MAX_DRAWDOWN_PCT}) must be >= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})"
-        assert 0.0 < self.KELLY_FRACTION <= 0.5, \
-            f"KELLY_FRACTION ({self.KELLY_FRACTION}) must be in (0.0, 0.5]"
-        assert self.ATR_MULTIPLIER_TP > self.ATR_MULTIPLIER_SL, \
-            f"ATR_MULTIPLIER_TP ({self.ATR_MULTIPLIER_TP}) must be > ATR_MULTIPLIER_SL ({self.ATR_MULTIPLIER_SL})"
-        assert self.MICRO_PRICE_MOVE_FLOOR_BPS > 0.0, \
-            "MICRO_PRICE_MOVE_FLOOR_BPS must be > 0"
-        assert self.MICRO_PRICE_MOVE_WINDOW > 0, \
-            "MICRO_PRICE_MOVE_WINDOW must be > 0"
-        assert 0.0 < self.MICRO_PRICE_MOVE_PERCENTILE < 1.0, \
-            "MICRO_PRICE_MOVE_PERCENTILE must be in (0, 1)"
-        assert 0 < self.MICRO_PRICE_MOVE_MIN_SAMPLES <= self.MICRO_PRICE_MOVE_WINDOW, \
-            "MICRO_PRICE_MOVE_MIN_SAMPLES must be in [1, MICRO_PRICE_MOVE_WINDOW]"
-        assert 0.0 < self.PROTECTION_MIN_DISTANCE_BPS < self.PROTECTION_MAX_DISTANCE_BPS, \
-            (f"PROTECTION_MIN_DISTANCE_BPS ({self.PROTECTION_MIN_DISTANCE_BPS}) must be in "
-             f"(0, PROTECTION_MAX_DISTANCE_BPS={self.PROTECTION_MAX_DISTANCE_BPS})")
-        assert self.MICRO_MAX_HOLD_MS > 0, \
-            "MICRO_MAX_HOLD_MS must be > 0"
-        assert self.MICRO_EXIT_SPREAD_HARD_CAP_BPS > 0.0, \
-            "MICRO_EXIT_SPREAD_HARD_CAP_BPS must be > 0"
-        if self.MIN_SIGNAL_INTERVAL_MS > 0:
-            assert self.MIN_SIGNAL_INTERVAL_MS < self.IOC_TIMEOUT_MS, (
+        if not self.TIER_REDUCED_PCT < self.TIER_MINIMAL_PCT:
+            raise ValueError(f"TIER_REDUCED_PCT ({self.TIER_REDUCED_PCT}) must be < TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT})")
+        if not self.TIER_MINIMAL_PCT < self.TIER_PASSIVE_PCT:
+            raise ValueError(f"TIER_MINIMAL_PCT ({self.TIER_MINIMAL_PCT}) must be < TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT})")
+        if not self.TIER_PASSIVE_PCT < self.TIER_HALTED_PCT:
+            raise ValueError(f"TIER_PASSIVE_PCT ({self.TIER_PASSIVE_PCT}) must be < TIER_HALTED_PCT ({self.TIER_HALTED_PCT})")
+        if not self.TIER_HALTED_PCT <= self.DAILY_LOSS_LIMIT_PCT:
+            raise ValueError(f"TIER_HALTED_PCT ({self.TIER_HALTED_PCT}) must be <= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})")
+        if not self.MAX_DRAWDOWN_PCT >= self.DAILY_LOSS_LIMIT_PCT:
+            raise ValueError(f"MAX_DRAWDOWN_PCT ({self.MAX_DRAWDOWN_PCT}) must be >= DAILY_LOSS_LIMIT_PCT ({self.DAILY_LOSS_LIMIT_PCT})")
+        if not 0.0 < self.KELLY_FRACTION <= 0.5:
+            raise ValueError(f"KELLY_FRACTION ({self.KELLY_FRACTION}) must be in (0.0, 0.5]")
+        if not self.ATR_MULTIPLIER_TP > self.ATR_MULTIPLIER_SL:
+            raise ValueError(f"ATR_MULTIPLIER_TP ({self.ATR_MULTIPLIER_TP}) must be > ATR_MULTIPLIER_SL ({self.ATR_MULTIPLIER_SL})")
+        if not self.MICRO_PRICE_MOVE_FLOOR_BPS > 0.0:
+            raise ValueError("MICRO_PRICE_MOVE_FLOOR_BPS must be > 0")
+        if not self.MICRO_PRICE_MOVE_WINDOW > 0:
+            raise ValueError("MICRO_PRICE_MOVE_WINDOW must be > 0")
+        if not 0.0 < self.MICRO_PRICE_MOVE_PERCENTILE < 1.0:
+            raise ValueError("MICRO_PRICE_MOVE_PERCENTILE must be in (0, 1)")
+        if not 0 < self.MICRO_PRICE_MOVE_MIN_SAMPLES <= self.MICRO_PRICE_MOVE_WINDOW:
+            raise ValueError("MICRO_PRICE_MOVE_MIN_SAMPLES must be in [1, MICRO_PRICE_MOVE_WINDOW]")
+        if not 0.0 < self.PROTECTION_MIN_DISTANCE_BPS < self.PROTECTION_MAX_DISTANCE_BPS:
+            raise ValueError(
+                f"PROTECTION_MIN_DISTANCE_BPS ({self.PROTECTION_MIN_DISTANCE_BPS}) must be in "
+                f"(0, PROTECTION_MAX_DISTANCE_BPS={self.PROTECTION_MAX_DISTANCE_BPS})"
+            )
+        if not self.MICRO_MAX_HOLD_MS > 0:
+            raise ValueError("MICRO_MAX_HOLD_MS must be > 0")
+        if not self.MICRO_EXIT_SPREAD_HARD_CAP_BPS > 0.0:
+            raise ValueError("MICRO_EXIT_SPREAD_HARD_CAP_BPS must be > 0")
+        if self.MIN_SIGNAL_INTERVAL_MS > 0 and not self.MIN_SIGNAL_INTERVAL_MS < self.IOC_TIMEOUT_MS:
+            raise ValueError(
                 f"MIN_SIGNAL_INTERVAL_MS ({self.MIN_SIGNAL_INTERVAL_MS}ms) must be < "
                 f"IOC_TIMEOUT_MS ({self.IOC_TIMEOUT_MS}ms) — otherwise approved signals "
                 f"expire before the next approval window opens"

@@ -5,6 +5,7 @@ All errors are suppressed with a warning log so the dispatcher never crashes the
 Set ALERT_WEBHOOK_URL in .env to enable; leave empty to disable.
 """
 
+import asyncio
 import datetime
 import logging
 
@@ -32,7 +33,7 @@ class AlertDispatcher:
             timeout = aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession() as session:
                 await session.post(self._url, json=body, timeout=timeout)
-        except Exception:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             logger.warning("[Alert] Webhook dispatch failed — suppressed")
 
     async def notify_killswitch(self, reason: str, equity: float) -> None:
