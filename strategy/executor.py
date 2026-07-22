@@ -18,6 +18,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from config import settings
 from core.cvd import WelfordOnline
@@ -25,6 +26,14 @@ from core.signal_telemetry import SignalRecord
 from models import FeatureVector, MicroOrderRequest, MicroSignal, SharedState
 from risk.engine import TIER_MIN_CONFIDENCE, TIER_SCALARS
 from strategy.spec import EntryRules
+
+if TYPE_CHECKING:
+    from core.cvd import CVDCalculator
+    from core.lob_engine import LocalOrderBook
+    from execution.order_manager import OrderManager
+    from risk.budget import DailyBudget
+    from strategy.features import FeatureComputer
+    from strategy.scorer import BaseScorer
 
 logger = logging.getLogger(__name__)
 
@@ -263,13 +272,13 @@ class StrategyExecutor:
         micro_signal_queue: asyncio.Queue,
         signal_queue: asyncio.Queue,
         telemetry_queue: asyncio.Queue,
-        feature_computer,
+        feature_computer: "FeatureComputer",
         shared_state: SharedState,
-        budget=None,
-        rule_scorer=None,
-        cvd_calculator=None,
-        lob_engine=None,
-        order_manager=None,
+        budget: "DailyBudget | None" = None,
+        rule_scorer: "BaseScorer | None" = None,
+        cvd_calculator: "CVDCalculator | None" = None,
+        lob_engine: "LocalOrderBook | None" = None,
+        order_manager: "OrderManager | None" = None,
         gate6_check_interval_ms: int = 200,
         strategy_id: str = "v3.0",
         equity_fn: Callable[[], float] | None = None,

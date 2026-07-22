@@ -13,10 +13,15 @@ import statistics
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from config import settings
 from models import AggTrade, LOBLevel, LOBSnapshot, MicroSignal, WallState
+
+if TYPE_CHECKING:
+    from core.cvd import CVDCalculator
+    from engine.realtime_hub import RealtimeHub
+    from strategy.features import FeatureComputer
 
 logger = logging.getLogger(__name__)
 
@@ -233,11 +238,11 @@ class MicrostructureDetector:
         depth_queue: asyncio.Queue,
         trade_queue: asyncio.Queue,
         signal_queue: asyncio.Queue,
-        cvd_calculator,
+        cvd_calculator: "CVDCalculator",
         sigma_threshold: float = 2.5,
         window: int = 5,
-        feature_computer=None,
-        hub=None,
+        feature_computer: "FeatureComputer | None" = None,
+        hub: "RealtimeHub | None" = None,
     ) -> None:
         self._depth_queue  = depth_queue
         self._trade_queue  = trade_queue

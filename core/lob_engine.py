@@ -1,9 +1,9 @@
 import asyncio
 import logging
-import statistics
 from datetime import datetime, timezone
 
 from models import LOBLevel, LOBSnapshot, LOBStateMachineState, SharedState
+from strategy.microstructure import identify_walls
 
 logger = logging.getLogger(__name__)
 
@@ -146,27 +146,7 @@ class LocalOrderBook:
         sigma: float,
         window: int,
     ) -> list[dict]:
-        if len(levels) < window * 2 + 1:
-            return []
-        qtys = [q for _, q in levels]
-        walls: list[dict] = []
-        for i, (price, qty) in enumerate(levels):
-            lo = max(0, i - window)
-            hi = min(len(levels), i + window + 1)
-            surrounding = [qtys[j] for j in range(lo, hi) if j != i]
-            if len(surrounding) < 3:
-                continue
-            med = statistics.median(surrounding)
-            try:
-                std = statistics.stdev(surrounding)
-            except statistics.StatisticsError:
-                continue
-            if std < 1e-9:
-                continue
-            z = (qty - med) / std
-            if z >= sigma:
-                walls.append({"price": price, "qty": qty, "sigma": round(z, 3), "side": side})
-        return walls
+        return identify_walls(levels, side, sigma_threshold=sigma, window=window)
 
     # ── Legacy diff-depth interface (backward compat) ─────────────────────────
 

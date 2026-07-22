@@ -105,9 +105,6 @@ class HeartbeatMonitor:
     def avg_delta_ms(self) -> float:
         return float(np.mean(self._deltas)) if self._deltas else 0.0
 
-    @property
-    def max_delta_ms(self) -> float:
-        return float(max(self._deltas)) if self._deltas else 0.0
 
 
 class BinanceWebSocketConsumer:
@@ -156,9 +153,6 @@ class BinanceWebSocketConsumer:
     async def start(self) -> None:
         self._running = True
         await self._connect_loop()
-
-    async def stop(self) -> None:
-        self._running = False
 
     async def _connect_loop(self) -> None:
         stream_path = "/".join(self.STREAMS)

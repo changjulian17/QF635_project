@@ -15,12 +15,7 @@ class Settings(BaseSettings):
 
     # Strategy
     SYMBOL: str = "BTCUSDT"
-    CANDLE_INTERVAL: str = "1s"   # legacy — ws_consumer uses this
     TIMEFRAME: str = "5m"          # kline interval for pattern detection (master arch §4)
-    PATTERN_LOOKBACK: int = 50
-    SWING_WINDOW: int = 5
-    BREAKOUT_VOL_MULT: float = 1.5
-    MIN_R2: float = 0.80
     MIN_CONFIDENCE: float = 0.58   # Gate 2 confidence threshold
 
     # Risk
@@ -58,7 +53,6 @@ class Settings(BaseSettings):
     LOB_WALL_SIGMA: float = 2.5        # σ threshold for Wall identification (§5)
     LOB_WALL_WINDOW: int = 5           # ticks each side for Wall median/std
     RELOAD_SIGMA: float = 3.0
-    ICEBERG_WINDOW_MS: int = 500
     ICEBERG_MIN_REPLENISH: float = 0.80
     ICEBERG_MIN_QTY: float = 0.5
     ICEBERG_PRICE_TOL: float = 0.10

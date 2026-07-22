@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
-from core.cvd import WelfordOnline
+from core.cvd import CVDCalculator, WelfordOnline
 from models import Candle, FeatureVector, LOBSnapshot, SharedState
 
 __all__ = ["WelfordOnline", "FeatureParams", "FeatureComputer"]
@@ -258,7 +258,7 @@ class FeatureComputer:
 
     def compute(
         self,
-        cvd_calculator,
+        cvd_calculator: CVDCalculator,
         shared_state: SharedState,
         pattern_r2: float = 0.0,
         protection_wall_present: int = 0,

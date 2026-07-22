@@ -92,12 +92,6 @@ class LOBRecorder:
             except asyncio.CancelledError:
                 pass
 
-    async def stop(self) -> None:
-        self._running = False
-        if self._conn:
-            await self._flush()
-            self._conn.close()
-
     # ── WebSocket ─────────────────────────────────────────────────────────────
 
     async def _connect_loop(self) -> None:
