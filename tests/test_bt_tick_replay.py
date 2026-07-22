@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from backtesting.tick_replay import ReplayEvent, ReplayTrade, TickReplayEngine
+from backtesting.tick_replay import ReplayEvent, TickReplayEngine
 from core.cvd import CVDCalculator
 from models import FeatureVector, WallState
 from strategy.features import FeatureComputer, FeatureParams

@@ -1,67 +1,81 @@
 # CryptoSentinel Cleanup Plan
 
-Run date: 2026-05-31 UTC
-Baseline tests passing: 443
+Run date: 2026-07-21 UTC
+Baseline tests passing: 427
 Rebase fallback: false
+
+## Prior run (2026-05-31) completed items (already on branch)
+- [x] Deleted 4 engine shims: risk_engine.py, lob_engine.py, order_manager.py, websocket_consumer.py
+- [x] models.py: Optional[X] -> X | None
+- [x] 7 except-Exception narrowings in db_writer.py, ws_consumer.py, lob_recorder.py, _logic.py, scorer.py
 
 ---
 
 ## F. Legacy Shims (engine/ directory)
 
-- [x] `engine/risk_engine.py` — pure re-export shim (`from risk.engine import *`); callers found by grep: none; action: delete file
-- [x] `engine/lob_engine.py` — pure re-export shim (`from core.lob_engine import *`); callers found by grep: none; action: delete file
-- [x] `engine/order_manager.py` — pure re-export shim (`from execution.order_manager import *`); callers found by grep: none; action: delete file
-- [x] `engine/websocket_consumer.py` — pure re-export shim (`from core.ws_consumer import *`); callers found by grep: none; action: delete file
-- NOTE: engine/microstructure_engine.py import fixed (`from .lob_engine` → `from core.lob_engine`) as collateral fix from shim deletion
+- DEFERRED: engine/microstructure_engine.py -- only importer is tests/test_microstructure_engine.py (30 passing tests); deleting would drop baseline 427->~397, violating -3 threshold. Needs coordinated test rewrite first.
 
 ## A. Dead Code & Duplicates
 
-No items — production dead code beyond the engine shims above was not found after grepping all symbol references.
+No new items.
 
 ## E. Consolidation Opportunities
 
-No items — LOB sync pattern in ws_consumer/_lob_recorder and wall detection logic are similar but diverge in interface and error recovery behaviour; consolidation would risk regressions.
+- DEFERRED: strategy/builder.py:200-203 and backtesting/metrics.py:238-245 -- Sharpe near-identical but edge-cases differ; consolidating risks subtle numeric drift.
 
 ## B. Type Safety Gaps
 
-- [x] `models.py:5,181,182,197` — `Optional[WallState]` and `Optional[float]` are legacy typing-module forms; Python 3.11 supports the `X | None` union syntax natively; proposed: replace `Optional[WallState]` → `WallState | None` (lines 181–182), `Optional[float]` → `float | None` (line 197), then remove the now-unused `from typing import Optional` import (line 5)
+No new items.
 
 ## C. Error Handling Defects
 
-- [x] `engine/db_writer.py:101` (`_candle_loop`) — `except Exception as e` wraps `asyncio.to_thread(self._write_candle, …)`; the worker calls `sqlite3.connect()` so the only expected failure type is `sqlite3.Error`; proposed: `except sqlite3.Error as e`
-- [x] `engine/db_writer.py:109` (`_ms_bar_loop`) — same pattern as C1; proposed: `except sqlite3.Error as e`
-- [x] `engine/db_writer.py:117` (`_portfolio_loop`) — same pattern as C1; proposed: `except sqlite3.Error as e`
-- [x] `engine/db_writer.py:125` (`_cleanup_loop`) — same pattern as C1; proposed: `except sqlite3.Error as e`
-- [x] `core/ws_consumer.py:299` (`_sync_lob_snapshot`) — `except Exception as exc` wraps `aiohttp.ClientSession().get()`, `resp.raise_for_status()`, `resp.json()`, and dict/float parsing; all expected failure types: `aiohttp.ClientError` (includes `ClientResponseError`), `asyncio.TimeoutError`, `json.JSONDecodeError`, `KeyError`, `ValueError`; proposed: `except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc`
-- [x] `core/lob_recorder.py:184` (`_sync_snapshot`) — identical aiohttp REST pattern to C5; proposed: `except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError, ValueError) as exc`
-- [x] `dashboard/_logic.py:15` (`fire_killswitch`) — `except Exception` wraps `requests.post(…)`; library raises `requests.RequestException`; also fixed `tests/test_dashboard_live.py:102` mock (was using builtin `ConnectionError`, now uses `requests.RequestException`)
-- [x] `strategy/scorer.py:184` (`ScorerFactory.load_or_fallback`) — `except Exception as exc` wraps `joblib.load(path)` + model-quality checks; expected failures: `OSError`, `EOFError`, `KeyError`, `ValueError`, `RuntimeError`; proposed: `except (OSError, EOFError, KeyError, ValueError, RuntimeError) as exc`
+- [x] engine/lob_snapshot_writer.py:85 -- added import sqlite3; except Exception -> except (sqlite3.Error, OSError)
+- [x] strategy/executor.py:620 -- except Exception -> except RuntimeError
+- [x] core/signal_telemetry.py:136 -- except Exception -> except (TypeError, RuntimeError)
 
 ## D. Test Hygiene Issues
 
-No actionable items — test_microstructure_engine.py tests a live module and removing it would breach the −3 regression threshold (see Deferred).
-
----
+- [x] tests/test_bt_tick_replay.py:22 -- removed ReplayTrade from import
+- [x] tests/test_bt_vectorbt.py:19 -- removed OptimisationResult from import
+- [x] tests/test_bt_walk_forward.py:22 -- removed WalkForwardWindow from import
+- [x] tests/test_features.py:6 -- removed WelfordOnline from import
+- [x] tests/test_executor.py:4 -- removed unused patch import
+- [x] tests/test_executor.py:8 -- removed unused settings module-level import
+- [x] tests/test_order_manager.py:10 -- removed call from import tuple
+- [x] tests/test_registry.py:18 -- removed EntryRules and StatisticalValidity from import
 
 ## Risk Assessment
 
-- `engine/realtime_hub.py:46` — `except Exception` in `broadcast()` is intentionally broad: we want to catch every possible send failure to drop dead WebSocket connections without leaving stale handles; narrowing to specific aiohttp types would miss `RuntimeError`/`ConnectionResetError` variants. KEEP AS-IS.
-- `core/startup_reconciler.py:59,79,89,110,176` — broad `except Exception` blocks are deliberate per design ("never raises"); tightening would undermine the safety guarantee. KEEP AS-IS.
-- `core/ws_consumer.py:203` and `core/lob_recorder.py:140` — outer `except Exception` in the reconnection loop is the fallback after WS-specific exceptions are caught first; intentionally broad to guarantee reconnect. KEEP AS-IS.
+- engine/realtime_hub.py:46 -- except Exception in broadcast() intentionally broad. KEEP AS-IS.
+- core/startup_reconciler.py and core/ws_consumer.py:197 -- intentional reconnect safety nets. KEEP AS-IS.
+- execution/order_manager.py:180 -- silent pass on best-effort close_connection(). KEEP AS-IS.
 
 ## Deferred Items
 
-- DEFERRED: `engine/microstructure_engine.py` — 30 tests in `tests/test_microstructure_engine.py` import and exercise this file; deleting it would drop passing tests below the −3 threshold (443 → ~413); needs a coordinated rewrite of 30 tests to point to `strategy/microstructure.MicrostructureDetector` before removal is safe.
-
-## Rebase Note
-
-*(omitted — REBASE_FALLBACK=false)*
+- DEFERRED: engine/microstructure_engine.py -- see F above
+- DEFERRED: Sharpe consolidation -- see E above
 
 ---
 
-## Review Pass 1 — 0 removed, 1 corrected, 0 added
+## Review Pass 1 -- 0 removed, 0 corrected, 0 added
 
-C8 scorer exception tuple updated to include `KeyError` (from `data["model"]` in XGBoostScorer.load). All F, B, C items re-grepped and verified. No __all__ entries, no @validator decorators, no getattr string dispatch in affected symbols. Risk entries for realtime_hub.py:46 and startup_reconciler.py are mitigated (intentional design).
+All C items re-grepped and verified:
+- C1 lob_snapshot_writer: db_writer.write_lob_snapshot uses sqlite3.connect (db_writer.py:184); hub.broadcast swallows per-ws errors internally at realtime_hub.py:46
+- C3 executor: asyncio.create_task only raises RuntimeError on no-running-loop; TypeError impossible (coroutine type fixed at call site)
+- C4 signal_telemetry: hub.broadcast propagates only TypeError (json.dumps) or RuntimeError; per-ws send errors caught inside broadcast()
+All D items grepped: symbols appear only on import lines, not in test bodies
+No __all__ entries, no @validator, no getattr string dispatch for any affected symbol
+Risk items verified as intentional design decisions
 
 ## STATUS: APPROVED
 
+---
+
+## Reverted Changes
+
+None
+
+## Final Test Results
+
+Baseline: 427 passing
+Final: 427 passing

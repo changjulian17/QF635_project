@@ -133,7 +133,7 @@ class SignalTelemetry:
                 if self._hub is not None:
                     try:
                         await self._hub.broadcast(_record_to_event_payload(record))
-                    except Exception:
+                    except (TypeError, RuntimeError):
                         logger.exception("[Telemetry] hub broadcast failed — continuing")
                 self._buf.append(record)
                 if len(self._buf) >= _FLUSH_BATCH or record.gate_passed == "APPROVED":

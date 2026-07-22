@@ -1,11 +1,8 @@
 """Tests for the 7-gate StrategyExecutor in strategy/executor.py."""
 import asyncio
 import time
-from unittest.mock import patch
 
 import pytest
-
-from config import settings
 
 from strategy.executor import (
     PersistenceMonitor,

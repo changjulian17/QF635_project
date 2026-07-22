@@ -19,7 +19,6 @@ import pytest
 
 from backtesting.event_engine import SimulatedTrade
 from backtesting.walk_forward import (
-    WalkForwardWindow,
     _chain_equity_curves,
     _compute_buy_and_hold,
     _save_results,

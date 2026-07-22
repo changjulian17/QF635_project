@@ -266,7 +266,7 @@ backtesting/vectorbt_runner.py:281: in _run_vectorbt
 E   ModuleNotFoundError: No module named 'vectorbt'
 
 During handling of the above exception, another exception occurred:
-tests/test_bt_vectorbt.py:65: in test_optimisation_returns_valid_params
+tests/test_bt_vectorbt.py:64: in test_optimisation_returns_valid_params
     result = run_phase1_optimisation(
 backtesting/vectorbt_runner.py:153: in run_phase1_optimisation
     top_metrics = _run_vectorbt(strategy, train_df, best_params, starting_equity)
@@ -280,7 +280,7 @@ backtesting/vectorbt_runner.py:281: in _run_vectorbt
 E   ModuleNotFoundError: No module named 'vectorbt'
 
 During handling of the above exception, another exception occurred:
-tests/test_bt_vectorbt.py:87: in test_best_score_is_finite
+tests/test_bt_vectorbt.py:86: in test_best_score_is_finite
     result = run_phase1_optimisation(
 backtesting/vectorbt_runner.py:153: in run_phase1_optimisation
     top_metrics = _run_vectorbt(strategy, train_df, best_params, starting_equity)
@@ -294,7 +294,7 @@ backtesting/vectorbt_runner.py:281: in _run_vectorbt
 E   ModuleNotFoundError: No module named 'vectorbt'
 
 During handling of the above exception, another exception occurred:
-tests/test_bt_vectorbt.py:103: in test_study_has_correct_n_trials
+tests/test_bt_vectorbt.py:102: in test_study_has_correct_n_trials
     result = run_phase1_optimisation(
 backtesting/vectorbt_runner.py:153: in run_phase1_optimisation
     top_metrics = _run_vectorbt(strategy, train_df, best_params, starting_equity)
@@ -308,7 +308,7 @@ backtesting/vectorbt_runner.py:281: in _run_vectorbt
 E   ModuleNotFoundError: No module named 'vectorbt'
 
 During handling of the above exception, another exception occurred:
-tests/test_bt_vectorbt.py:144: in test_run_vectorbt_returns_metrics
+tests/test_bt_vectorbt.py:143: in test_run_vectorbt_returns_metrics
     metrics = _run_vectorbt("Support / Resistance Breakout", synthetic_df, params)
               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 backtesting/vectorbt_runner.py:283: in _run_vectorbt
@@ -320,7 +320,7 @@ backtesting/vectorbt_runner.py:281: in _run_vectorbt
 E   ModuleNotFoundError: No module named 'vectorbt'
 
 During handling of the above exception, another exception occurred:
-tests/test_bt_vectorbt.py:183: in test_valid_mask_filters_inverted_sl_tp
+tests/test_bt_vectorbt.py:182: in test_valid_mask_filters_inverted_sl_tp
     metrics = _run_vectorbt("Support / Resistance Breakout", synthetic_df, params)
               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 backtesting/vectorbt_runner.py:283: in _run_vectorbt
@@ -1198,4 +1198,4 @@ ERROR tests/test_rest_api.py::test_killswitch_already_active
 ERROR tests/test_rest_api.py::test_killswitch_active_reflected_in_health
 ERROR tests/test_rest_api.py::test_health_risk_tier_reflects_circuit_breaker
 ERROR tests/test_rest_api.py::test_unknown_endpoint_returns_404
-71 failed, 427 passed, 67 warnings, 12 errors in 12.65s
+71 failed, 427 passed, 67 warnings, 12 errors in 11.59s

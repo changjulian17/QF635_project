@@ -617,7 +617,7 @@ class StrategyExecutor:
             )
             mon.add_done_callback(self._on_gate6_task_done)
             self._gate6_tasks.add(mon)
-        except Exception:
+        except RuntimeError:
             logger.exception(
                 "[Gate6] Failed to start persistence monitor for %s — "
                 "triggering wall-removed alert as safety fallback",
