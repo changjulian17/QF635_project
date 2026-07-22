@@ -5,8 +5,6 @@ All tests are synchronous — HeartbeatMonitor.record() is a pure function.
 import time
 from unittest.mock import patch
 
-import pytest
-
 from config import settings
 from core.ws_consumer import HeartbeatMonitor
 

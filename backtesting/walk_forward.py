@@ -67,12 +67,12 @@ import json
 import logging
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pandas as pd
 
 from backtesting.event_engine import EventDrivenEngine, SimulatedTrade
-from backtesting.metrics      import BacktestMetrics, calculate_metrics, sensitivity_test
+from backtesting.metrics      import calculate_metrics, sensitivity_test
 from backtesting.signals      import ALL_STRATEGIES
 from backtesting.vectorbt_runner import run_phase1_optimisation
 from data.fetcher             import OHLCVFetcher, TIMEFRAME_MS

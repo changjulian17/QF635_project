@@ -10,8 +10,6 @@ import tempfile
 import time
 from unittest.mock import patch
 
-import pytest
-
 from core.lob_recorder import (
     LOBRecorder,
     _BUCKET_WIDTH,

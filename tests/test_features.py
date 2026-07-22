@@ -1,8 +1,6 @@
 """Tests for FeatureComputer in strategy/features.py."""
 from datetime import datetime, timezone, timedelta
 
-import pytest
-
 from strategy.features import FeatureComputer, FeatureParams
 from models import Candle, FeatureVector, LOBLevel, LOBSnapshot, SharedState
 from core.cvd import CVDCalculator

@@ -5,7 +5,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
-import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from dashboard._logic import add_event_markers, update_event_buffer, update_lob_buffer

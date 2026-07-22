@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 import sqlite3
 from collections import deque
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ from strategy.microstructure import (
     identify_walls,
     rolling_abs_move_threshold,
 )
+
+logger = logging.getLogger(__name__)
 
 _CONSUMED_RATIO = 0.15      # pre-filter: skip walls still intact (mirrors live code)
 _STALE_WALL_MS  = 30_000    # prune wall states absent > 30 s

@@ -10,7 +10,6 @@ required. test_pre_requisite_data_available is the sole exception.
 from __future__ import annotations
 
 import json
-import math
 import os
 import sqlite3
 from datetime import datetime, timezone
