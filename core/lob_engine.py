@@ -264,10 +264,6 @@ class LocalOrderBook:
     def is_ready(self) -> bool:
         return self._ready
 
-    def armament(self) -> str:
-        # Compatibility method if needed
-        return ""
-
     def best_bid_ask(self) -> tuple[float, float] | None:
         if not self._ready or not self._bids or not self._asks:
             return None

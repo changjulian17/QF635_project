@@ -204,6 +204,7 @@ class LOBRecorder:
         # All attempts failed — stay unsynced so nothing is recorded until a reseed.
         self._pending_diffs.clear()
         self._synced = False
+        self._seed_failed = True
         logger.critical(
             "[LOBRec] LOB seed failed after %d attempts — not recording until reseed",
             _SEED_MAX_ATTEMPTS,

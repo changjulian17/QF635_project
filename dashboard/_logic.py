@@ -199,7 +199,7 @@ def add_event_markers(fig, events, ts_labels, hm_ts_snap):
         for ev in events:
             try:
                 ev_ms = int(pd.Timestamp(ev["ts"]).timestamp() * 1000)
-            except Exception:
+            except (ValueError, KeyError, TypeError):
                 continue
             if ev_ms < win_start or ev_ms > win_end:
                 continue
@@ -304,12 +304,12 @@ def build_walls_figure(candles, snapshots, window_min, half_range, contrast_pcti
     try:
         raw_bids = json.loads(latest["bid_levels_json"] or "[]")
         bid_walls = identify_walls(sorted(raw_bids, key=lambda x: -x[0]), side="bid")
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         pass
     try:
         raw_asks = json.loads(latest["ask_levels_json"] or "[]")
         ask_walls = identify_walls(sorted(raw_asks, key=lambda x: x[0]), side="ask")
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
     all_walls = bid_walls + ask_walls
@@ -367,7 +367,7 @@ def build_walls_figure(candles, snapshots, window_min, half_range, contrast_pcti
                         if 0 <= ri < n_prices:
                             matrix[ri, col_idx] += q
                     col_ok = True
-            except Exception:
+            except (json.JSONDecodeError, ValueError, IndexError):
                 pass
         valid_cols.append(col_ok)
 

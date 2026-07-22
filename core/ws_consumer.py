@@ -31,7 +31,7 @@ class HeartbeatMonitor:
       any -> HEALTHY when <30% of window exceeds WARN_MS (hysteresis, single log on exit)
     """
 
-    def __init__(self, warn_ms: int = None, critical_ms: int | None = None, consec_limit: int = None) -> None:
+    def __init__(self, warn_ms: int | None = None, critical_ms: int | None = None, consec_limit: int | None = None) -> None:
         self.WARN_MS = warn_ms if warn_ms is not None else settings.HEARTBEAT_WARN_MS
         self.CONSEC_LIMIT = consec_limit if consec_limit is not None else settings.HEARTBEAT_CONSEC_LIMIT
         self.CRITICAL_MS = (
@@ -134,8 +134,8 @@ class BinanceWebSocketConsumer:
     """
     def __init__(
         self,
-        streams: list[str] = None,
-        shared_state: SharedState = None,
+        streams: list[str] | None = None,
+        shared_state: SharedState | None = None,
         trade_queue: asyncio.Queue | None = None,
         candle_queue: asyncio.Queue | None = None,
         candle_db_queue: asyncio.Queue | None = None,
@@ -166,7 +166,6 @@ class BinanceWebSocketConsumer:
         self._ask_book: dict[float, float] = {}
         self._lob_update_id: int = 0
         self._lob_synced = False
-        self._seed_failed:    bool = False
         self._lob_pending: list[dict] = []
         self._consecutive_lob_gaps: int = 0
 
@@ -201,7 +200,6 @@ class BinanceWebSocketConsumer:
                     self._ask_book.clear()
                     self._lob_update_id       = 0
                     self._lob_synced          = False
-                    self._seed_failed   = False
                     self._lob_pending         = []
                     self._consecutive_lob_gaps = 0
 
