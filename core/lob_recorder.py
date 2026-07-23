@@ -37,12 +37,6 @@ _MAX_BUFFER_SIZE     = 10_000
 _RETENTION_DAYS      = 7
 _CLEANUP_INTERVAL    = 86_400.0
 
-_STREAMS = (
-    f"{settings.SYMBOL.lower()}@depth@100ms",
-    f"{settings.SYMBOL.lower()}@aggTrade",
-)
-
-
 class LOBRecorder:
     """
     Buffers depth snapshots (derived from the incremental diff stream) and

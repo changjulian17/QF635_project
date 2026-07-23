@@ -13,7 +13,7 @@ import statistics
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from config import settings
 from models import AggTrade, LOBLevel, LOBSnapshot, MicroSignal, WallState
@@ -169,10 +169,10 @@ def detect_sweep_with_protection(
     price_move_pct: float,
     cvd_spike_std: float,
     fresh_walls_behind: list[WallState],
-    now_ms: Optional[int] = None,
-    mid_price: Optional[float] = None,
-    price_move_threshold: Optional[float] = None,
-    max_protection_distance_bps: Optional[float] = None,
+    now_ms: int | None = None,
+    mid_price: float | None = None,
+    price_move_threshold: float | None = None,
+    max_protection_distance_bps: float | None = None,
 ) -> tuple[bool, dict]:
     """
     Return (True, signal_info) when all sweep+protection conditions are met:

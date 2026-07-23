@@ -21,7 +21,6 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 import yaml
 
@@ -181,7 +180,7 @@ class StrategyRegistry:
         self,
         strategy_id: str,
         new_status: str,
-        paper_metrics: Optional[dict] = None,
+        paper_metrics: dict | None = None,
     ) -> None:
         """
         Update status in DB (commits first) then rewrites YAML.
@@ -241,7 +240,7 @@ class StrategyRegistry:
             )
         self._write_yaml(dataclasses.replace(spec, status=new_status))
 
-    def get_active_strategy(self) -> Optional[StrategySpec]:
+    def get_active_strategy(self) -> StrategySpec | None:
         """Return highest-status spec. Ties broken by most-recent created_at."""
         with self._conn() as conn:
             rows = conn.execute(
@@ -265,7 +264,7 @@ class StrategyRegistry:
             reverse=True,
         )
 
-    def _max_version(self, name: str) -> Optional[int]:
+    def _max_version(self, name: str) -> int | None:
         """Return the highest registered version for a given name, or None."""
         with self._conn() as conn:
             row = conn.execute(

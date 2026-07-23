@@ -18,7 +18,7 @@ import sqlite3
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterator, Literal, Optional
+from typing import Iterator, Literal
 
 import pandas as pd
 
@@ -110,7 +110,7 @@ class TickReplayEngine:
         self._equity:           float                  = starting_equity
         self._wall_states:      dict[float, WallState] = {}
         self._absorption_flags: dict[float, bool]      = {}
-        self._open_position:    Optional[dict]          = None
+        self._open_position:    dict | None              = None
         self._equity_curve:     list[tuple[int, float]] = []
         self._trades:           list[ReplayTrade]       = []
         self._cost_model        = TransactionCostModel()

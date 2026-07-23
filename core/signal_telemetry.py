@@ -15,7 +15,6 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from config import settings
 
@@ -94,7 +93,7 @@ class SignalTelemetry:
         self._queue   = telemetry_queue
         self._db_path = db_path
         self._hub     = hub
-        self._conn: Optional[sqlite3.Connection] = None
+        self._conn: sqlite3.Connection | None = None
         self._buf: list[SignalRecord] = []
         self._last_flush: float = time.monotonic()
         self._db_lock = asyncio.Lock()
