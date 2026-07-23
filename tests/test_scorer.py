@@ -4,7 +4,6 @@ import json
 import sqlite3
 
 import numpy as np
-import pytest
 
 from models import FeatureVector, MicroSignal
 from strategy.scorer import FEATURE_ORDER, XGBoostScorer, ScorerFactory

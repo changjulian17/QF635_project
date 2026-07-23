@@ -72,15 +72,14 @@ Usage
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 from config import settings
 from backtesting.costs import TransactionCostModel
-from backtesting.metrics import calculate_metrics, BacktestMetrics
 from backtesting.signals import (
     generate_signals, SignalArrays, ALL_STRATEGIES
 )

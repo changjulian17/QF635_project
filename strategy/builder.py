@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -37,14 +37,14 @@ class StrategyBuilder:
 
     Parameters
     ----------
-    registry : Optional[StrategyRegistry]
+    registry : StrategyRegistry | None
         If supplied, build() registers the spec automatically.
         If None, the caller is responsible for registration.
     """
 
     MIN_OOS_TRADES = 10  # hard floor; promotion gate in StrategyRegistry enforces 50
 
-    def __init__(self, registry: Optional["StrategyRegistry"] = None) -> None:
+    def __init__(self, registry: StrategyRegistry | None = None) -> None:
         self._registry = registry
 
     def build(
@@ -52,8 +52,8 @@ class StrategyBuilder:
         strategy_name: str,
         timeframe: str,
         metrics: dict,
-        entry_rules: Optional[EntryRules] = None,
-        backtest_results_path: Optional[str] = None,
+        entry_rules: EntryRules | None = None,
+        backtest_results_path: str | None = None,
     ) -> StrategySpec:
         """
         Build and optionally register a BACKTEST-status StrategySpec.
@@ -73,9 +73,9 @@ class StrategyBuilder:
               profit_factor    (float)
               win_rate_pct     (float)
               composite_score  (float)
-        entry_rules : Optional[EntryRules]
+        entry_rules : EntryRules | None
             Optimised entry rule parameters. Defaults to EntryRules() if None.
-        backtest_results_path : Optional[str]
+        backtest_results_path : str | None
             Path to the backtest results DB/CSV for audit trail.
 
         Returns

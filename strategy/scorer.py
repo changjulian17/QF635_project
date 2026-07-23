@@ -5,7 +5,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import joblib
 import numpy as np
@@ -40,7 +40,7 @@ class XGBoostScorer:
     """
 
     def __init__(self) -> None:
-        self._model: Optional[XGBClassifier] = None
+        self._model: XGBClassifier | None = None
         self._auc: float = 0.0
         self._calibration_error: float = 0.0
         self._trained_at: float = 0.0

@@ -10,6 +10,7 @@ WebSocket clients so the dashboard can stream updates instead of polling the DB.
 """
 import asyncio
 import logging
+import sqlite3
 
 from config import settings
 from core.cvd import CVDCalculator
@@ -82,5 +83,5 @@ async def lob_snapshot_writer(
                     "ask_levels": _trim_levels(snapshot.asks, mid),
                 }
                 await hub.broadcast(payload)
-        except Exception:
+        except (sqlite3.Error, OSError):
             logger.exception("[LOBSnapshot] Transient error — continuing")

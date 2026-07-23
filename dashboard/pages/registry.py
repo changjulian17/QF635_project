@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 import dash
@@ -250,8 +251,7 @@ def handle_promote_modal(promote_clicks, cancel, confirm, strategies_data, curre
     trigger = ctx.triggered[0]["prop_id"]
 
     if "promote-btn" in trigger:
-        import json as _json
-        triggered_id = _json.loads(trigger.split(".")[0])
+        triggered_id = json.loads(trigger.split(".")[0])
         sid = triggered_id["index"]
         s = (strategies_data or {}).get(sid, {})
         label = f"{s.get('name', sid)} v{s.get('version', '?')}"

@@ -1,0 +1,361 @@
+.............................................................F...FFF.FF. [ 14%]
+........................................................................ [ 28%]
+..............................................................F...FFFFFF [ 42%]
+F...FFFF.FFF...........................FFFFFFFFF........................ [ 56%]
+......................................FFFFFFFFFFFFFFFFFFF...FFFFFFFFFFFF [ 70%]
+...............FFFFFF.EE.............................EEEEEEEEEE......... [ 84%]
+............FFF.............F........................................... [ 98%]
+......                                                                   [100%]
+=============================== warnings summary ===============================
+../../../usr/local/lib/python3.11/dist-packages/_pytest/config/__init__.py:1464
+  /usr/local/lib/python3.11/dist-packages/_pytest/config/__init__.py:1464: PytestConfigWarning: Unknown config option: asyncio_mode
+  
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../usr/local/lib/python3.11/dist-packages/binance/ws/websocket_api.py:4
+../../../usr/local/lib/python3.11/dist-packages/binance/ws/websocket_api.py:4
+  /usr/local/lib/python3.11/dist-packages/binance/ws/websocket_api.py:4: DeprecationWarning: websockets.WebSocketClientProtocol is deprecated
+    from websockets import WebSocketClientProtocol  # type: ignore
+
+../../../usr/local/lib/python3.11/dist-packages/websockets/legacy/__init__.py:6
+  /usr/local/lib/python3.11/dist-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/test_lob_snapshot_writer.py:55
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:55: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:69
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:69: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:84
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:84: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:102
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:102: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:130
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:130: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:157
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:157: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:190
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:190: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:228
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:228: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_lob_snapshot_writer.py:257
+  /home/user/QF635_project/tests/test_lob_snapshot_writer.py:257: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:92
+  /home/user/QF635_project/tests/test_order_manager.py:92: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:131
+  /home/user/QF635_project/tests/test_order_manager.py:131: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:159
+  /home/user/QF635_project/tests/test_order_manager.py:159: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:176
+  /home/user/QF635_project/tests/test_order_manager.py:176: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:193
+  /home/user/QF635_project/tests/test_order_manager.py:193: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:214
+  /home/user/QF635_project/tests/test_order_manager.py:214: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:237
+  /home/user/QF635_project/tests/test_order_manager.py:237: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:255
+  /home/user/QF635_project/tests/test_order_manager.py:255: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:276
+  /home/user/QF635_project/tests/test_order_manager.py:276: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:300
+  /home/user/QF635_project/tests/test_order_manager.py:300: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:318
+  /home/user/QF635_project/tests/test_order_manager.py:318: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:340
+  /home/user/QF635_project/tests/test_order_manager.py:340: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:358
+  /home/user/QF635_project/tests/test_order_manager.py:358: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:391
+  /home/user/QF635_project/tests/test_order_manager.py:391: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:409
+  /home/user/QF635_project/tests/test_order_manager.py:409: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:425
+  /home/user/QF635_project/tests/test_order_manager.py:425: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:448
+  /home/user/QF635_project/tests/test_order_manager.py:448: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:472
+  /home/user/QF635_project/tests/test_order_manager.py:472: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:491
+  /home/user/QF635_project/tests/test_order_manager.py:491: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:534
+  /home/user/QF635_project/tests/test_order_manager.py:534: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:565
+  /home/user/QF635_project/tests/test_order_manager.py:565: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:601
+  /home/user/QF635_project/tests/test_order_manager.py:601: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:639
+  /home/user/QF635_project/tests/test_order_manager.py:639: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:686
+  /home/user/QF635_project/tests/test_order_manager.py:686: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:712
+  /home/user/QF635_project/tests/test_order_manager.py:712: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:749
+  /home/user/QF635_project/tests/test_order_manager.py:749: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:764
+  /home/user/QF635_project/tests/test_order_manager.py:764: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:779
+  /home/user/QF635_project/tests/test_order_manager.py:779: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:811
+  /home/user/QF635_project/tests/test_order_manager.py:811: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:842
+  /home/user/QF635_project/tests/test_order_manager.py:842: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:890
+  /home/user/QF635_project/tests/test_order_manager.py:890: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:945
+  /home/user/QF635_project/tests/test_order_manager.py:945: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_order_manager.py:971
+  /home/user/QF635_project/tests/test_order_manager.py:971: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_portfolio_broadcast.py:103
+  /home/user/QF635_project/tests/test_portfolio_broadcast.py:103: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_portfolio_broadcast.py:138
+  /home/user/QF635_project/tests/test_portfolio_broadcast.py:138: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_portfolio_broadcast.py:165
+  /home/user/QF635_project/tests/test_portfolio_broadcast.py:165: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_realtime_hub.py:18
+  /home/user/QF635_project/tests/test_realtime_hub.py:18: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_realtime_hub.py:32
+  /home/user/QF635_project/tests/test_realtime_hub.py:32: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_realtime_hub.py:40
+  /home/user/QF635_project/tests/test_realtime_hub.py:40: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_realtime_hub.py:94
+  /home/user/QF635_project/tests/test_realtime_hub.py:94: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_realtime_hub.py:112
+  /home/user/QF635_project/tests/test_realtime_hub.py:112: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:90
+  /home/user/QF635_project/tests/test_rest_api.py:90: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:102
+  /home/user/QF635_project/tests/test_rest_api.py:102: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:112
+  /home/user/QF635_project/tests/test_rest_api.py:112: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:124
+  /home/user/QF635_project/tests/test_rest_api.py:124: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:134
+  /home/user/QF635_project/tests/test_rest_api.py:134: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:153
+  /home/user/QF635_project/tests/test_rest_api.py:153: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:163
+  /home/user/QF635_project/tests/test_rest_api.py:163: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:172
+  /home/user/QF635_project/tests/test_rest_api.py:172: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:180
+  /home/user/QF635_project/tests/test_rest_api.py:180: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_rest_api.py:188
+  /home/user/QF635_project/tests/test_rest_api.py:188: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_signal_broadcast.py:55
+  /home/user/QF635_project/tests/test_signal_broadcast.py:55: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_signal_broadcast.py:91
+  /home/user/QF635_project/tests/test_signal_broadcast.py:91: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+tests/test_signal_broadcast.py:117
+  /home/user/QF635_project/tests/test_signal_broadcast.py:117: PytestUnknownMarkWarning: Unknown pytest.mark.asyncio - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.asyncio
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_bt_tick_replay.py::test_pre_requisite_data_available - Fail...
+FAILED tests/test_bt_vectorbt.py::test_optimisation_returns_valid_params - Im...
+FAILED tests/test_bt_vectorbt.py::test_best_score_is_finite - ImportError: ve...
+FAILED tests/test_bt_vectorbt.py::test_study_has_correct_n_trials - ImportErr...
+FAILED tests/test_bt_vectorbt.py::test_run_vectorbt_returns_metrics - ImportE...
+FAILED tests/test_bt_vectorbt.py::test_valid_mask_filters_inverted_sl_tp - Im...
+FAILED tests/test_lob_engine.py::test_not_ready_before_snapshot - Failed: asy...
+FAILED tests/test_lob_engine.py::test_snapshot_populates_bids_and_asks - Fail...
+FAILED tests/test_lob_engine.py::test_bids_sorted_descending - Failed: async ...
+FAILED tests/test_lob_engine.py::test_asks_sorted_ascending - Failed: async d...
+FAILED tests/test_lob_engine.py::test_get_snapshot_respects_depth - Failed: a...
+FAILED tests/test_lob_engine.py::test_apply_diff_adds_new_bid_level - Failed:...
+FAILED tests/test_lob_engine.py::test_apply_diff_updates_existing_level - Fai...
+FAILED tests/test_lob_engine.py::test_apply_diff_removes_zero_qty_level - Fai...
+FAILED tests/test_lob_engine.py::test_reset_clears_state - Failed: async def ...
+FAILED tests/test_lob_engine.py::test_state_machine_transition_to_synced - Fa...
+FAILED tests/test_lob_engine.py::test_gap_detected_sets_stale - Failed: async...
+FAILED tests/test_lob_engine.py::test_reinitialise_on_gap - Failed: async def...
+FAILED tests/test_lob_engine.py::test_shared_state_updated_on_transition - Fa...
+FAILED tests/test_lob_engine.py::test_get_current_walls_identifies_outlier - ...
+FAILED tests/test_lob_engine.py::test_reset_returns_to_uninitialised - Failed...
+FAILED tests/test_lob_snapshot_writer.py::test_write_lob_snapshot_inserts_row
+FAILED tests/test_lob_snapshot_writer.py::test_bid_ask_json_format - Failed: ...
+FAILED tests/test_lob_snapshot_writer.py::test_rolling_retention_enforced - F...
+FAILED tests/test_lob_snapshot_writer.py::test_lob_snapshot_writer_skips_when_not_synced
+FAILED tests/test_lob_snapshot_writer.py::test_lob_snapshot_writer_skips_when_snapshot_none
+FAILED tests/test_lob_snapshot_writer.py::test_lob_snapshot_writer_writes_when_synced
+FAILED tests/test_lob_snapshot_writer.py::test_lob_snapshot_writer_broadcasts_when_hub_given
+FAILED tests/test_lob_snapshot_writer.py::test_lob_snapshot_writer_no_broadcast_without_hub
+FAILED tests/test_lob_snapshot_writer.py::test_lob_snapshot_writer_tolerates_exception
+FAILED tests/test_order_manager.py::test_btc_fee_deducted_from_oco_and_position_qty
+FAILED tests/test_order_manager.py::test_short_skipped_when_insufficient_btc
+FAILED tests/test_order_manager.py::test_long_limit_price_formula - Failed: a...
+FAILED tests/test_order_manager.py::test_short_limit_price_formula - Failed: ...
+FAILED tests/test_order_manager.py::test_ioc_expired_returns_none - Failed: a...
+FAILED tests/test_order_manager.py::test_fill_emits_to_fill_queue - Failed: a...
+FAILED tests/test_order_manager.py::test_fill_sets_fill_event - Failed: async...
+FAILED tests/test_order_manager.py::test_slippage_recorded_to_killswitch - Fa...
+FAILED tests/test_order_manager.py::test_accepting_false_discards_signals - F...
+FAILED tests/test_order_manager.py::test_dry_run_no_api_call - Failed: async ...
+FAILED tests/test_order_manager.py::test_handle_wall_removed_dry_run - Failed...
+FAILED tests/test_order_manager.py::test_stale_signal_rejected_at_submission
+FAILED tests/test_order_manager.py::test_oco_failure_triggers_emergency_close
+FAILED tests/test_order_manager.py::test_position_lock_used_on_fill - Failed:...
+FAILED tests/test_order_manager.py::test_book_fn_used_in_dry_run - Failed: as...
+FAILED tests/test_order_manager.py::test_entry_qty_floor_quantized_to_step - ...
+FAILED tests/test_order_manager.py::test_fill_queue_full_drops_without_blocking
+FAILED tests/test_order_manager.py::test_oco_list_id_stored_as_int - Failed: ...
+FAILED tests/test_order_manager.py::test_s2_closed_event_not_set_on_unfilled_exit
+FAILED tests/test_order_manager.py::test_s1_placing_oco_defers_wall_removed_handler
+FAILED tests/test_order_manager.py::test_s1_deferred_cancel_executed_after_oco_placed
+FAILED tests/test_order_manager.py::test_s2_state_reset_after_oco_failed_and_closed
+FAILED tests/test_order_manager.py::test_watch_oco_win_records_outcome_and_sets_event
+FAILED tests/test_order_manager.py::test_watch_oco_exits_cleanly_on_external_close
+FAILED tests/test_order_manager.py::test_watch_oco_continues_polling_while_executing
+FAILED tests/test_order_manager.py::test_active_exposure_blocks_second_submit
+FAILED tests/test_order_manager.py::test_entry_in_flight_clears_after_unfilled_entry
+FAILED tests/test_order_manager.py::test_natural_oco_close_clears_active_exposure
+FAILED tests/test_order_manager.py::test_safety_exit_cancels_oco_and_emergency_closes
+FAILED tests/test_order_manager.py::test_sl_distance_capped_when_venues_diverge
+FAILED tests/test_order_manager.py::test_oco_sl_price_anchored_to_fill_price
+FAILED tests/test_portfolio_broadcast.py::test_portfolio_mtm_loop_broadcasts_typed_payload
+FAILED tests/test_portfolio_broadcast.py::test_portfolio_mtm_loop_no_hub_runs_normally
+FAILED tests/test_portfolio_broadcast.py::test_portfolio_mtm_loop_skips_broadcast_when_killswitch_active
+FAILED tests/test_realtime_hub.py::test_broadcast_sends_json_to_all_connections
+FAILED tests/test_realtime_hub.py::test_broadcast_with_no_subscribers_is_noop
+FAILED tests/test_realtime_hub.py::test_failed_connection_is_dropped - Failed...
+FAILED tests/test_signal_broadcast.py::test_telemetry_broadcasts_on_dequeue
+FAILED tests/test_signal_broadcast.py::test_telemetry_no_hub_runs_normally - ...
+FAILED tests/test_signal_broadcast.py::test_telemetry_hub_failure_does_not_stop_persistence
+FAILED tests/test_signal_telemetry.py::test_graceful_shutdown_flushes_remaining_records
+ERROR tests/test_realtime_hub.py::test_ws_endpoint_delivers_broadcast
+ERROR tests/test_realtime_hub.py::test_ws_endpoint_unregisters_on_disconnect
+ERROR tests/test_rest_api.py::test_health_returns_correct_fields
+ERROR tests/test_rest_api.py::test_health_reflects_shared_state
+ERROR tests/test_rest_api.py::test_portfolio_returns_correct_fields
+ERROR tests/test_rest_api.py::test_portfolio_reflects_portfolio_state
+ERROR tests/test_rest_api.py::test_portfolio_includes_positions
+ERROR tests/test_rest_api.py::test_killswitch_fires
+ERROR tests/test_rest_api.py::test_killswitch_already_active
+ERROR tests/test_rest_api.py::test_killswitch_active_reflected_in_health
+ERROR tests/test_rest_api.py::test_health_risk_tier_reflects_circuit_breaker
+ERROR tests/test_rest_api.py::test_unknown_endpoint_returns_404
+71 failed, 427 passed, 67 warnings, 12 errors in 11.02s

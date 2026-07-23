@@ -10,7 +10,6 @@ required. test_pre_requisite_data_available is the sole exception.
 from __future__ import annotations
 
 import json
-import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -19,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from backtesting.tick_replay import ReplayEvent, ReplayTrade, TickReplayEngine
+from backtesting.tick_replay import ReplayEvent, TickReplayEngine
 from core.cvd import CVDCalculator
 from models import FeatureVector, WallState
 from strategy.features import FeatureComputer, FeatureParams

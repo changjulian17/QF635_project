@@ -10,12 +10,6 @@ from dashboard._db import fetch_backtest_results, DBOffline
 
 dash.register_page(__name__, path="/backtest", name="Backtest")
 
-_LEADERBOARD_COLS = [
-    "strategy", "timeframe", "sharpe_ratio", "max_drawdown_pct",
-    "profit_factor", "win_rate_pct", "total_trades", "composite_score",
-    "passes_minimum_bar",
-]
-
 layout = html.Div([
     dcc.Interval(id="bt-interval", interval=30000),
     dcc.Store(id="bt-results-store"),

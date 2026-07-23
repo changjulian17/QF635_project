@@ -7,7 +7,7 @@ DRY_RUN is patched per-test to control code paths.
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 

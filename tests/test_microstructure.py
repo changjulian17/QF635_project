@@ -257,7 +257,7 @@ def test_dynamic_threshold_floor_and_warmed_percentile():
 
 def test_update_orderbook_called_when_feature_computer_injected():
     import asyncio
-    from unittest.mock import MagicMock, AsyncMock, patch
+    from unittest.mock import MagicMock, AsyncMock
 
     fc = MagicMock()
     detector = _make_detector(feature_computer=fc)

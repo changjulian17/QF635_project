@@ -9,9 +9,8 @@ No rolling-window NaN-fill, no look-ahead.
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
 
-from core.cvd import WelfordOnline
+from core.cvd import CVDCalculator, WelfordOnline
 from models import Candle, FeatureVector, LOBSnapshot, SharedState
 
 __all__ = ["WelfordOnline", "FeatureParams", "FeatureComputer"]
@@ -258,11 +257,11 @@ class FeatureComputer:
 
     def compute(
         self,
-        cvd_calculator,
+        cvd_calculator: CVDCalculator,
         shared_state: SharedState,
         pattern_r2: float = 0.0,
         protection_wall_present: int = 0,
-    ) -> Optional[FeatureVector]:
+    ) -> FeatureVector | None:
         """
         Return a FeatureVector assembled from the latest stored values.
         Returns None until at least rsi_period candles have been seen.

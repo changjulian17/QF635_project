@@ -177,8 +177,8 @@ class OrderManager:
                 if self._client:
                     try:
                         await self._client.close_connection()
-                    except Exception:
-                        pass
+                    except Exception as _close_exc:
+                        logger.debug("[Exec] close_connection error (ignored): %s", _close_exc)
                 self._client = await AsyncClient.create(
                     api_key    = settings.BINANCE_API_KEY,
                     api_secret = settings.BINANCE_API_SECRET,
@@ -962,7 +962,7 @@ class OrderManager:
             self._record_outcome(sig_id, side or "", ep, close_p, qty, et, sl)
             if event:
                 event.set()
-        elif not closed:
+        else:
             logger.critical(
                 "[Exec] force_close_all: emergency close unfilled — manual intervention required"
             )

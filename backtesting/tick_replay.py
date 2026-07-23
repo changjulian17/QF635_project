@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 import sqlite3
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterator, Literal, Optional
+from typing import Iterator, Literal
 
 import pandas as pd
 
@@ -41,6 +42,8 @@ from strategy.microstructure import (
     identify_walls,
     rolling_abs_move_threshold,
 )
+
+logger = logging.getLogger(__name__)
 
 _CONSUMED_RATIO = 0.15      # pre-filter: skip walls still intact (mirrors live code)
 _STALE_WALL_MS  = 30_000    # prune wall states absent > 30 s
@@ -107,7 +110,7 @@ class TickReplayEngine:
         self._equity:           float                  = starting_equity
         self._wall_states:      dict[float, WallState] = {}
         self._absorption_flags: dict[float, bool]      = {}
-        self._open_position:    Optional[dict]          = None
+        self._open_position:    dict | None              = None
         self._equity_curve:     list[tuple[int, float]] = []
         self._trades:           list[ReplayTrade]       = []
         self._cost_model        = TransactionCostModel()

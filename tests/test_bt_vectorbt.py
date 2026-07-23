@@ -16,7 +16,6 @@ import pandas as pd
 import pytest
 
 from backtesting.vectorbt_runner import (
-    OptimisationResult,
     run_phase1_optimisation,
     _run_vectorbt,
     _sample_params,

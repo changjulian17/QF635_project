@@ -104,7 +104,12 @@ def update_lob_buffer(buffer: list[dict], msg: dict, max_points: int) -> list[di
     return new_buffer
 
 
-def add_event_markers(fig, events, ts_labels, hm_ts_snap):
+def add_event_markers(
+    fig: go.Figure,
+    events: list[dict],
+    ts_labels: list[str],
+    hm_ts_snap,
+) -> tuple[int, int]:
     """Render absorption/sweep markers on the heatmap (row 1), snapped to snapshot ts.
 
     Markers outside the heatmap window are dropped. Two traces are always added

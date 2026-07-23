@@ -13,10 +13,15 @@ import statistics
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from config import settings
 from models import AggTrade, LOBLevel, LOBSnapshot, MicroSignal, WallState
+
+if TYPE_CHECKING:
+    from core.cvd import CVDCalculator
+    from engine.realtime_hub import RealtimeHub
+    from strategy.features import FeatureComputer
 
 logger = logging.getLogger(__name__)
 
@@ -164,10 +169,10 @@ def detect_sweep_with_protection(
     price_move_pct: float,
     cvd_spike_std: float,
     fresh_walls_behind: list[WallState],
-    now_ms: Optional[int] = None,
-    mid_price: Optional[float] = None,
-    price_move_threshold: Optional[float] = None,
-    max_protection_distance_bps: Optional[float] = None,
+    now_ms: int | None = None,
+    mid_price: float | None = None,
+    price_move_threshold: float | None = None,
+    max_protection_distance_bps: float | None = None,
 ) -> tuple[bool, dict]:
     """
     Return (True, signal_info) when all sweep+protection conditions are met:
@@ -233,11 +238,11 @@ class MicrostructureDetector:
         depth_queue: asyncio.Queue,
         trade_queue: asyncio.Queue,
         signal_queue: asyncio.Queue,
-        cvd_calculator,
+        cvd_calculator: "CVDCalculator",
         sigma_threshold: float = 2.5,
         window: int = 5,
-        feature_computer=None,
-        hub=None,
+        feature_computer: "FeatureComputer | None" = None,
+        hub: "RealtimeHub | None" = None,
     ) -> None:
         self._depth_queue  = depth_queue
         self._trade_queue  = trade_queue

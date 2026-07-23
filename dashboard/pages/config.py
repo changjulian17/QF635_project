@@ -1,5 +1,3 @@
-import requests
-
 import dash
 from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
@@ -35,9 +33,6 @@ _SETTINGS_DESCRIPTIONS = {
     "REGISTRY_DB": "Strategy registry database path",
     "LOB_TICK_DB": "LOB tick data database path",
 }
-
-_HIGHLIGHT_FIELDS = {"LOB_DEPTH", "DRY_RUN"}
-
 
 def _build_settings_table():
     rows = []

@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Literal
 
 from config import settings
 
@@ -109,7 +109,7 @@ class StrategySpec:
     created_at:            str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    backtest_results_path: Optional[str] = None
+    backtest_results_path: str | None = None
 
     def to_dict(self) -> dict:
         """Serialise to a flat dict suitable for YAML / SQLite storage."""

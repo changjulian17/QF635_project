@@ -15,7 +15,7 @@ import yaml
 
 from strategy.builder import StrategyBuilder
 from strategy.registry import StrategyRegistry
-from strategy.spec import EntryRules, StatisticalValidity, StrategySpec
+from strategy.spec import StrategySpec
 
 
 # ─────────────────────────────────────────────────────────────────────────────
